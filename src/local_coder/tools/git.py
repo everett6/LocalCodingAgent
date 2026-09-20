@@ -1,0 +1,165 @@
+"""Git tools for the coding agent."""
+import asyncio
+from pathlib import Path
+from typing import Any
+import subprocess
+import time
+
+from local_coder.tools.base import Tool
+from local_coder.types import ToolName, ToolResult
+
+
+class GitStatusTool(Tool):
+    name = ToolName.GIT_STATUS
+    description = "Run git status."
+    parameters = {"type": "object", "properties": {}}
+    
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "-s",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+            )
+            stdout, stderr = await proc.communicate()
+            res = stdout.decode().strip() or "No changes (working tree clean)."
+            return ToolResult(success=proc.returncode == 0, output=res, duration_ms=int((time.time()-start_t)*1000))
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+
+
+class GitDiffTool(Tool):
+    name = ToolName.GIT_DIFF
+    description = "Run git diff."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "staged": {"type": "boolean", "description": "Diff staged files"},
+            "path": {"type": "string", "description": "Optional path"}
+        }
+    }
+    
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        
+    async def execute(self, staged: bool = False, path: str | None = None, **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            cmd = ["git", "diff"]
+            if staged:
+                cmd.append("--staged")
+            if path:
+                cmd.extend(["--", path])
+                
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+            )
+            stdout, stderr = await proc.communicate()
+            res = stdout.decode().strip() or "No diff."
+            return ToolResult(success=proc.returncode == 0, output=res, duration_ms=int((time.time()-start_t)*1000))
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+
+
+class GitLogTool(Tool):
+    name = ToolName.GIT_LOG
+    description = "Run git log."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer", "description": "Number of commits"},
+            "path": {"type": "string", "description": "Optional path"}
+        }
+    }
+    
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        
+    async def execute(self, count: int = 10, path: str | None = None, **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            cmd = ["git", "log", f"-n{count}", "--oneline"]
+            if path:
+                cmd.extend(["--", path])
+                
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+            )
+            stdout, stderr = await proc.communicate()
+            res = stdout.decode().strip() or "No commits."
+            return ToolResult(success=proc.returncode == 0, output=res, duration_ms=int((time.time()-start_t)*1000))
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+
+
+class GitCommitTool(Tool):
+    name = ToolName.GIT_COMMIT
+    description = "Create a commit."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "message": {"type": "string", "description": "Commit message"},
+            "files": {"type": "array", "items": {"type": "string"}, "description": "Files to stage"}
+        },
+        "required": ["message"]
+    }
+    
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        
+    async def execute(self, message: str, files: list[str] | None = None, **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            if files:
+                add_cmd = ["git", "add"] + files
+                proc_add = await asyncio.create_subprocess_exec(
+                    *add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+                )
+                await proc_add.communicate()
+                
+            proc = await asyncio.create_subprocess_exec(
+                "git", "commit", "-m", message,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+            )
+            stdout, stderr = await proc.communicate()
+            res = stdout.decode().strip()
+            if stderr:
+                res += f"\n{stderr.decode().strip()}"
+            return ToolResult(success=proc.returncode == 0, output=res, duration_ms=int((time.time()-start_t)*1000))
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+
+
+class GitCheckoutTool(Tool):
+    name = ToolName.GIT_CHECKOUT
+    description = "Checkout a branch."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "branch": {"type": "string", "description": "Branch name"},
+            "create": {"type": "boolean", "description": "Create if not exists"}
+        },
+        "required": ["branch"]
+    }
+    
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        
+    async def execute(self, branch: str, create: bool = False, **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            cmd = ["git", "checkout"]
+            if create:
+                cmd.append("-b")
+            cmd.append(branch)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
+            )
+            stdout, stderr = await proc.communicate()
+            res = stdout.decode().strip() or stderr.decode().strip()
+            return ToolResult(success=proc.returncode == 0, output=res, duration_ms=int((time.time()-start_t)*1000))
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))

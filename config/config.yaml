@@ -1,0 +1,82 @@
+# Local Coding Agent Configuration
+# =================================
+
+# Model configurations
+models:
+  # Primary orchestrator model - used for planning and coordination
+  orchestrator:
+    name: orchestrator
+    backend: openai_compatible
+    model_id: "Qwen3-30B-A3B-Instruct-2507"
+    base_url: "http://localhost:8090/v1"
+    context_length: 8192
+    temperature: 0.3
+    max_tokens: 4096
+    estimated_vram_mb: 9000
+
+  # Coding agent model
+  coder:
+    name: coder
+    backend: openai_compatible
+    model_id: "Qwen3-30B-A3B-Instruct-2507"
+    base_url: "http://localhost:8090/v1"
+    context_length: 8192
+    temperature: 0.2
+    max_tokens: 4096
+    estimated_vram_mb: 5000
+
+  # Review/debug/test agent model (can share with coder)
+  reviewer:
+    name: reviewer
+    backend: openai_compatible
+    model_id: "Qwen3-30B-A3B-Instruct-2507"
+    base_url: "http://localhost:8090/v1"
+    context_length: 8192
+    temperature: 0.1
+    max_tokens: 4096
+    estimated_vram_mb: 5000
+
+  # Small draft model for predictive drafting
+  drafter:
+    name: drafter
+    backend: openai_compatible
+    model_id: "Qwen3-30B-A3B-Instruct-2507"
+    base_url: "http://localhost:8090/v1"
+    context_length: 4096
+    temperature: 0.4
+    max_tokens: 2048
+    estimated_vram_mb: 500
+
+# Resource management
+resources:
+  max_concurrent_gpu_agents: 1
+  max_concurrent_cpu_agents: 4
+  gpu_memory_target_percent: 85.0
+  model_unload_timeout_seconds: 300
+
+# Agent tool permissions (defaults are built-in, override here)
+# permissions:
+#   - role: coder
+#     allowed_tools:
+#       - read_file
+#       - write_file
+#       - ...
+
+# Operations requiring human approval
+approval:
+  destructive_shell_commands: true
+  dependency_changes: true
+  database_migrations: true
+  large_file_deletions: true
+  git_push: true
+
+# Verification loop settings
+verification:
+  max_fix_iterations: 3
+  run_tests_after_changes: true
+  require_review: true
+
+# Logging
+log_level: INFO
+log_dir: .local-coder/logs
+state_dir: .local-coder/state
