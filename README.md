@@ -36,6 +36,8 @@ Agent runs are bounded by iteration, tool-call, and test-run limits. Verificatio
 
 The speculative drafter is an application-level latency optimization. `DeltaAttention` prioritizes changed and task-relevant lines in the predictor prompt, while `PredictionPolicy` learns online from accepted and rejected drafts and disables prediction types that stop paying for their own latency. This is intentionally distinct from native transformer DeltaNet/Delta-attention kernels or inference-engine speculative decoding; those require model and backend support and are not emulated by the agent runtime.
 
+Repeated speculative prompts use a bounded model-aware TTL/LRU cache. Mutable coding-agent tool responses are never cached, so edits and test results cannot become stale. Backend-native KV or prefix caching can be added later behind the provider interface when a local inference server exposes a stable API for it.
+
 ## Architecture
 
 - `src/local_coder/agents/`: role-specific agents and the bounded tool loop

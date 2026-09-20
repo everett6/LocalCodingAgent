@@ -6,6 +6,7 @@ from typing import Optional, List, Any
 from pydantic import BaseModel
 
 from local_coder.types import Message
+from local_coder.models.cache import PromptCache, prompt_cache_key
 
 class DraftPrediction(BaseModel):
     prediction_id: str
@@ -22,6 +23,7 @@ class DraftStats(BaseModel):
     rejected: int = 0
     total_latency_ms: float = 0.0
     total_reward: float = 0.0
+    cache_hits: int = 0
     
     @property
     def acceptance_rate(self) -> float:
@@ -87,7 +89,13 @@ class SpeculativeDrafter:
     The main agent validates and accepts/rejects predictions.
     """
     
-    def __init__(self, model: Any, enabled: bool = True, min_confidence: float = 0.5):
+    def __init__(
+        self,
+        model: Any,
+        enabled: bool = True,
+        min_confidence: float = 0.5,
+        prompt_cache: PromptCache | None = None,
+    ):
         # model is typically a LocalModel or an adapter representing the small fast model
         self._model = model
         self._enabled = enabled
@@ -96,6 +104,7 @@ class SpeculativeDrafter:
         self._policy = PredictionPolicy()
         self._attention = DeltaAttention()
         self._pending: dict[str, str] = {}
+        self._prompt_cache = prompt_cache or PromptCache()
     
     async def predict_edit(
         self,
@@ -112,9 +121,17 @@ class SpeculativeDrafter:
         
         focused = self._attention.focus(objective, f"{context}\n{file_content}")
         prompt = f"Objective: {objective}\nFile: {file_path}\nDelta-focused context:\n{focused}\n\nProvide the required patch or edit:"
+        messages = [Message(role="user", content=prompt)]
+        cache_key = prompt_cache_key(self._model.config, messages) if hasattr(self._model, "config") else None
         
         try:
-            response = await self._model.generate([Message(role="user", content=prompt)])
+            response = self._prompt_cache.get(cache_key) if cache_key else None
+            if response is not None:
+                self._stats.cache_hits += 1
+            else:
+                response = await self._model.generate(messages)
+                if cache_key:
+                    self._prompt_cache.set(cache_key, response)
             content = response.content if hasattr(response, 'content') else str(response)
             
             latency = (time.time() - start_time) * 1000
@@ -152,7 +169,15 @@ class SpeculativeDrafter:
         
         try:
             prompt = f"History: {conversation_history}\nTools: {available_tools}\nPredict next tool:"
-            response = await self._model.generate([Message(role="user", content=prompt)])
+            messages = [Message(role="user", content=prompt)]
+            cache_key = prompt_cache_key(self._model.config, messages) if hasattr(self._model, "config") else None
+            response = self._prompt_cache.get(cache_key) if cache_key else None
+            if response is not None:
+                self._stats.cache_hits += 1
+            else:
+                response = await self._model.generate(messages)
+                if cache_key:
+                    self._prompt_cache.set(cache_key, response)
             content = response.content if hasattr(response, 'content') else str(response)
             
             latency = (time.time() - start_time) * 1000
@@ -189,7 +214,6 @@ class SpeculativeDrafter:
         self._stats.total_reward -= max(cost_ms, 0.1)
         self._policy.record(prediction_type, -max(cost_ms, 0.1))
     
-    @property
     def should_predict(self, prediction_type: str = "edit") -> bool:
         """Whether prediction is worth doing based on hit rate."""
         if not self._enabled:
