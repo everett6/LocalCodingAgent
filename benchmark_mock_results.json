@@ -1,0 +1,36 @@
+{
+  "timestamp": "2026-09-20 00:54:41",
+  "kind": "mock_model_benchmark",
+  "benchmarks": {
+    "e2e_coordinator_run": {
+      "iterations": 10,
+      "mean_ms": 0.446,
+      "p50_ms": 0.175,
+      "min_ms": 0.163,
+      "max_ms": 2.828
+    },
+    "dag_scheduling": {
+      "task_count": 25,
+      "status": "completed",
+      "total_ms": 0.686,
+      "ms_per_task": 0.027
+    },
+    "malformed_plan_fail_fast": {
+      "status": "failed",
+      "elapsed_ms": 0.039,
+      "hung": false
+    },
+    "safety_classifier": {
+      "iterations": 20000,
+      "total_ms": 40.197,
+      "classifications_per_second": 497550.0
+    },
+    "drafter_cache": {
+      "iterations": 50,
+      "model_calls": 1,
+      "cache_hits": 49,
+      "total_ms": 11.075,
+      "ms_per_call": 0.221
+    }
+  }
+}

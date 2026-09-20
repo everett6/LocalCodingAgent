@@ -1,10 +1,9 @@
 """Abstract base for local model backends."""
 from __future__ import annotations
 import abc
-import time
 from typing import AsyncIterator, Protocol, runtime_checkable
 
-from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
+from local_coder.types import Message, ModelResponse, ModelConfig
 
 
 @runtime_checkable

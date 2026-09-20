@@ -2,6 +2,17 @@
 
 Local Coding Agent is a Python coding agent for local model backends. It combines repository context, role-specific tools, and a bounded model/tool loop that can inspect files, apply edits, run tests, and feed results back into the model.
 
+## Install
+
+Install the command into your Python environment:
+
+```bash
+pip install -e "."
+```
+
+This provides both `local-coder` and the shorter `lc` command. It can also be
+run without an installed script with `python -m local_coder`.
+
 ## Requirements
 
 - Python 3.12+
@@ -10,7 +21,15 @@ Local Coding Agent is a Python coding agent for local model backends. It combine
 
 ## Run
 
-Configure models in [config/config.yaml](config/config.yaml), then run:
+From the project you want the agent to work on, create a local configuration:
+
+```bash
+cd your-project
+local-coder init
+```
+
+Edit `.local-coder/config.yaml` with the URL and model ID for your local model
+server, then run:
 
 ```bash
 local-coder "Fix the failing tests"
@@ -20,7 +39,54 @@ local-coder review
 local-coder checkpoint
 local-coder checkpoints
 local-coder rollback <checkpoint-id>
+local-coder --version
 ```
+
+Running `local-coder` with no arguments opens the interactive terminal mode.
+The root command also accepts a direct request, so `lc "Fix the failing tests"`
+is equivalent to `local-coder run "Fix the failing tests"`.
+
+## Agentic workflow
+
+The framework follows a plan, execute, review, verify loop. A planner can
+assign smaller tasks to coder, tester, debugger, or reviewer agents through the
+task DAG, and each task may select a different configured model with
+`model_name`. Role defaults can be configured in `.local-coder/config.yaml`:
+
+```yaml
+agentic:
+	role_models:
+		planner: reasoning-model
+		coder: coding-model
+		reviewer: review-model
+	context_window_chars: 24000
+	compact_context_chars: 12000
+```
+
+Long tool histories are compacted automatically while the system and task
+context remain available. Use `local-coder --model coding-model "..."` to route
+one run to a selected model.
+
+For remote control from another terminal or machine on a trusted network,
+start the explicitly opt-in loopback server:
+
+```bash
+local-coder serve --host 127.0.0.1 --port 8787
+curl http://127.0.0.1:8787/status
+curl -X POST http://127.0.0.1:8787/plan \
+	-H 'Content-Type: application/json' \
+	-d '{"request":"Add authentication","session_id":"auth-plan"}'
+curl -X POST http://127.0.0.1:8787/run \
+	-H 'Content-Type: application/json' \
+	-d '{"request":"Implement the plan","session_id":"auth-run"}'
+curl http://127.0.0.1:8787/events
+local-coder sessions
+local-coder resume auth-run
+```
+
+The remote server binds to `127.0.0.1` by default and does not expose a public
+authentication layer, so put it behind an authenticated tunnel or reverse
+proxy before binding to a non-loopback interface.
 
 The default configuration expects an OpenAI-compatible server at `http://localhost:8090/v1`. Change the endpoint and model ID to match your local server.
 

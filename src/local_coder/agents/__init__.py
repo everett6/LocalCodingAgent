@@ -16,7 +16,8 @@ def create_agent(
     role: AgentRole, 
     model, 
     tool_registry, 
-    event_callback: Callable[[AgentEvent], None] | None = None
+    event_callback: Callable[[AgentEvent], None] | None = None,
+    **kwargs,
 ) -> BaseAgent:
     """Factory function to create an agent instance based on role."""
     
@@ -33,7 +34,7 @@ def create_agent(
     if not agent_cls:
         raise ValueError(f"Unknown agent role: {role}")
         
-    return agent_cls(model, tool_registry, event_callback)
+    return agent_cls(model, tool_registry, event_callback, **kwargs)
 
 __all__ = [
     "BaseAgent",

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "local-coder"
 version = "0.1.0"
-description = "Local coding agent system"
+description = "A local-first coding agent for terminal-based software work"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 local-coder = "local_coder.cli.main:cli"
+lc = "local_coder.cli.main:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/local_coder"]

@@ -1,8 +1,7 @@
 """Model manager for loading and handling backends."""
 from __future__ import annotations
 import asyncio
-import subprocess
-from typing import Dict, Optional
+from typing import Dict
 
 from local_coder.types import ProjectConfig, ModelConfig, AgentRole, ModelBackend, GPUStatus
 from local_coder.models.base import LocalModel
@@ -41,17 +40,19 @@ class ModelManager:
         else:
             raise ValueError(f"Unsupported backend type: {config.backend}")
 
-    async def get_model(self, role: AgentRole | str) -> LocalModel:
+    async def get_model(self, role: AgentRole | str, model_name: str | None = None) -> LocalModel:
         """Get the appropriate model for an agent role."""
         if not self._models:
             await self.initialize()
 
         async with self._lock:
             # Map role to model name if possible, else fallback to 'default' or first available
+            # Explicit task routing wins, followed by configured role routing.
             role_name = role.value if isinstance(role, AgentRole) else role
-            
-            # Very basic routing:
-            if role_name in self.config.models:
+            selected_name = model_name or self.config.agentic.role_models.get(role_name)
+            if selected_name in self.config.models:
+                model_name = selected_name
+            elif role_name in self.config.models:
                 model_name = role_name
             elif "default" in self.config.models:
                 model_name = "default"

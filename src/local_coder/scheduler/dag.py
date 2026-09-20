@@ -65,6 +65,10 @@ class TaskDAG:
     
     def get_node(self, task_id: str) -> Optional[TaskNode]:
         return self._nodes.get(task_id)
+
+    def get_pending_task_ids(self) -> List[str]:
+        """Task ids still waiting on a dependency (or stalled)."""
+        return [tid for tid, node in self._nodes.items() if node.status == TaskStatus.PENDING]
     
     def get_all_results(self) -> List[AgentResponse]:
         return [n.result for n in self._nodes.values() if n.result is not None]

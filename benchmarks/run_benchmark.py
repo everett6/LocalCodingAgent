@@ -82,7 +82,7 @@ async def benchmark_agent_tasks(coordinator: Coordinator) -> Dict[str, Any]:
         AgentRole.PLANNER,
         await coordinator.model_manager.get_model(AgentRole.PLANNER),
         coordinator.tool_registry,
-        coordinator._emit,
+        coordinator._dispatch,
     )
     start = time.time()
     plan_task = AgentTask(
@@ -103,7 +103,7 @@ async def benchmark_agent_tasks(coordinator: Coordinator) -> Dict[str, Any]:
         AgentRole.CODER,
         await coordinator.model_manager.get_model(AgentRole.CODER),
         coordinator.tool_registry,
-        coordinator._emit,
+        coordinator._dispatch,
     )
     start = time.time()
     coder_task = AgentTask(

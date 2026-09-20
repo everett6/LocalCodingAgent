@@ -1,7 +1,6 @@
 import asyncio
 import subprocess
 import time
-from typing import Optional
 
 from local_coder.types import GPUStatus, ResourceConfig
 

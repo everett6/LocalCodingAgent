@@ -1,7 +1,5 @@
 """Explorer agent for discovering codebase context."""
 from __future__ import annotations
-from typing import Any
-
 from local_coder.types import AgentRole
 from local_coder.agents.base import BaseAgent
 

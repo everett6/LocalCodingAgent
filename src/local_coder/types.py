@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -138,6 +138,7 @@ class AgentTask(BaseModel):
     priority: int = 0  # Higher = more important
     max_retries: int = 3
     timeout_seconds: int = 300
+    model_name: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -286,6 +287,14 @@ class VerificationConfig(BaseModel):
     require_review: bool = True
 
 
+class AgenticConfig(BaseModel):
+    """Controls routing, context compaction, and resumable sessions."""
+    role_models: dict[str, str] = Field(default_factory=dict)
+    context_window_chars: int = 24000
+    compact_context_chars: int = 12000
+    max_parallel_agents: int = 1
+
+
 class ProjectConfig(BaseModel):
     """Top-level project configuration."""
     models: dict[str, ModelConfig] = Field(default_factory=dict)
@@ -293,6 +302,7 @@ class ProjectConfig(BaseModel):
     permissions: list[AgentPermissions] = Field(default_factory=list)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
+    agentic: AgenticConfig = Field(default_factory=AgenticConfig)
     project_root: str = "."
     log_level: str = "INFO"
     log_dir: str = ".local-coder/logs"

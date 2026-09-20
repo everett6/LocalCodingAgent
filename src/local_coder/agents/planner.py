@@ -21,14 +21,16 @@ Return your plan as a structured JSON response wrapped in a markdown code block:
 
 ```json
 {
-  "subtasks": [
+  "tasks": [
     {
-      "id": "1",
-      "description": "Clear description of the task",
+      "task_id": "1",
+      "objective": "Clear description of the task",
       "role": "coder",
       "files": ["files", "involved"],
+      "constraints": ["any constraints specific to this task"],
+      "success_criteria": ["how to tell this task is done"],
       "depends_on": [],
-      "estimated_complexity": "low|medium|high"
+      "model_name": "optional configured model name"
     }
   ],
   "risks": ["list", "of", "potential", "risks", "or", "gotchas"],
@@ -36,6 +38,9 @@ Return your plan as a structured JSON response wrapped in a markdown code block:
 }
 ```
 
-Subtask roles should typically be 'coder', 'tester', or 'reviewer'.
-Make the tasks granular enough to be easily implemented one at a time.
+Every task MUST use these field names: "task_id", "objective", "role", "files",
+"constraints", "success_criteria", "depends_on", and optionally "model_name". Task roles should typically be
+'coder', 'tester', or 'reviewer'. Make the tasks granular enough to be easily
+implemented one at a time, and give each one its own specific "objective" rather
+than repeating the overall request.
 """

@@ -1,15 +1,15 @@
 """Base agent with tool-calling loop."""
 from __future__ import annotations
-import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any, Callable
+from typing import Callable
 
 from local_coder.types import (
-    AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus, TaskContext,
-    Message, ToolCall, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
+    AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus,
+    Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
 )
+from local_coder.context.compression import compress_messages
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,8 @@ class BaseAgent:
         model,  # LocalModel protocol
         tool_registry,  # ToolRegistry
         event_callback: Callable[[AgentEvent], None] | None = None,
+        context_window_chars: int = 24000,
+        compact_context_chars: int = 12000,
     ):
         self.model = model
         self.tool_registry = tool_registry
@@ -38,6 +40,8 @@ class BaseAgent:
         self._tests_run: list[str] = []
         self._tests_passed = True
         self.state: AgentState | None = None
+        self.context_window_chars = context_window_chars
+        self.compact_context_chars = compact_context_chars
     
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop."""
@@ -59,6 +63,9 @@ class BaseAgent:
         self.state.messages = list(messages)
         
         for iteration in range(self.max_iterations):
+            if sum(len(message.content) for message in messages) > self.context_window_chars:
+                messages = compress_messages(messages, self.compact_context_chars)
+                self.state.messages = list(messages)
             self.state.iteration = iteration + 1
             self._emit_event(
                 "iteration_started",

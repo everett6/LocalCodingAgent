@@ -1,16 +1,35 @@
 """CLI for the local coding agent."""
 import asyncio
 import os
-import sys
+import uuid
+from pathlib import Path
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.live import Live
 from rich.table import Table
 from rich.markdown import Markdown
-from rich import print as rprint
+from local_coder import __version__
 
 console = Console()
+
+_DEFAULT_CONFIG = """# Local Coder project configuration
+models:
+    coder:
+        name: coder
+        backend: openai_compatible
+        model_id: your-model-name
+        base_url: http://localhost:8090/v1
+        context_length: 8192
+        temperature: 0.2
+        max_tokens: 4096
+verification:
+    run_tests_after_changes: true
+    max_fix_iterations: 3
+approval:
+    require_approval_for_commands: false
+    require_approval_for_commits: false
+state_dir: .local-coder
+"""
 
 
 def _get_project_root() -> str:
@@ -26,7 +45,6 @@ def _get_project_root() -> str:
 
 def _event_handler(event):
     """Handle agent events for display."""
-    from rich.text import Text
     timestamp = event.timestamp.strftime("%H:%M:%S")
     source_colors = {
         "ORCHESTRATOR": "bold cyan",
@@ -41,13 +59,14 @@ def _event_handler(event):
     console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
 
 
-@click.group(invoke_without_command=True)
-@click.argument("request", nargs=-1, required=False)
+@click.group(invoke_without_command=True, context_settings={"allow_extra_args": True})
 @click.option("--config", "-c", type=click.Path(), help="Config file path")
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
+@click.option("--model", help="Use this configured model for every agent in the run")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.version_option(version=__version__, prog_name="local-coder")
 @click.pass_context
-def cli(ctx, request, config, project, debug):
+def cli(ctx, config, project, model, debug):
     """Local Coding Agent - AI-powered local code assistant.
     
     Run with a request to execute it:
@@ -64,11 +83,12 @@ def cli(ctx, request, config, project, debug):
     ctx.obj["config_path"] = config
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
+    ctx.obj["model"] = model
     
     if ctx.invoked_subcommand is None:
-        if request:
+        if ctx.args:
             # Direct execution: local-coder "Add OAuth login"
-            request_str = " ".join(request)
+            request_str = " ".join(ctx.args)
             _run_request(request_str, ctx.obj)
         else:
             # Interactive mode
@@ -129,6 +149,54 @@ def models(ctx):
 
 
 @cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8787, show_default=True, type=int)
+@click.pass_context
+def serve(ctx, host, port):
+    """Start the local HTTP control plane for remote sessions."""
+    from local_coder.remote import RemoteControlServer
+
+    console.print(f"Remote control listening on http://{host}:{port}")
+    RemoteControlServer(ctx.obj["project_root"], ctx.obj["config_path"], ctx.obj.get("model")).serve(host, port)
+
+
+@cli.command(name="sessions")
+@click.pass_context
+def sessions(ctx):
+    """List resumable agent sessions."""
+    from local_coder.orchestrator.sessions import SessionStore
+
+    for session in SessionStore(ctx.obj["project_root"]).list():
+        console.print(f"{session['session_id']}  {session.get('phase', 'unknown')}  {session.get('updated_at', '')}")
+
+
+@cli.command()
+@click.argument("session_id")
+@click.pass_context
+def resume(ctx, session_id):
+    """Resume a session's request from the local journal."""
+    from local_coder.orchestrator.sessions import SessionStore
+
+    session = SessionStore(ctx.obj["project_root"]).get(session_id)
+    if not session or not session.get("request"):
+        raise click.ClickException(f"Session not found or has no request: {session_id}")
+    _run_request(session["request"], ctx.obj)
+
+
+@cli.command()
+@click.pass_context
+def init(ctx):
+    """Create a .local-coder project configuration."""
+    config_path = Path(ctx.obj["project_root"]) / ".local-coder" / "config.yaml"
+    if config_path.exists():
+        raise click.ClickException(f"Configuration already exists: {config_path}")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
+    console.print(f"Created [bold]{config_path}[/bold]")
+    console.print("Edit the model_id and base_url, then run [bold]local-coder[/bold].")
+
+
+@cli.command()
 @click.pass_context
 def checkpoint(ctx):
     """Create a local checkpoint of the current working tree."""
@@ -175,10 +243,14 @@ def rollback(ctx, checkpoint_id):
 def _run_request(request: str, ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.coordinator import Coordinator
+    from local_coder.orchestrator.sessions import SessionStore
     
     console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
     
-    config = load_config(ctx_obj["config_path"])
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+    if ctx_obj.get("model"):
+        from local_coder.types import AgentRole
+        config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
@@ -186,6 +258,9 @@ def _run_request(request: str, ctx_obj: dict):
         
         try:
             result = await coordinator.run(request)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="run", result=result
+            )
             console.print(Panel(Markdown(result), title="Result", border_style="green"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
@@ -258,10 +333,11 @@ Available commands:
 def _run_plan(request: str, ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.coordinator import Coordinator
+    from local_coder.orchestrator.sessions import SessionStore
     
     console.print(Panel(f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan", border_style="yellow"))
     
-    config = load_config(ctx_obj["config_path"])
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
@@ -269,6 +345,9 @@ def _run_plan(request: str, ctx_obj: dict):
         
         try:
             result = await coordinator.run(f"Create a detailed plan for: {request}")
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="plan", result=result
+            )
             console.print(Panel(Markdown(result), title="Plan", border_style="yellow"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
@@ -279,6 +358,7 @@ def _run_plan(request: str, ctx_obj: dict):
 def _run_review(ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.coordinator import Coordinator
+    from local_coder.orchestrator.sessions import SessionStore
     
     console.print(Panel("Reviewing current changes", title="Local Coder - Review", border_style="white"))
     
@@ -289,6 +369,9 @@ def _run_review(ctx_obj: dict):
         coordinator.on_event(_event_handler)
         try:
             result = await coordinator.run("Review current uncommitted changes")
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request="Review current uncommitted changes", phase="review", result=result
+            )
             console.print(Panel(Markdown(result), title="Review", border_style="white"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")

@@ -1,6 +1,5 @@
 """Git tools for the coding agent."""
 import asyncio
-from pathlib import Path
 from typing import Any
 import subprocess
 import time

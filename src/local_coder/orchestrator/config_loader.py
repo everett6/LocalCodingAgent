@@ -1,9 +1,8 @@
-import os
 import yaml
 from pathlib import Path
 from typing import Optional
 
-from local_coder.types import ProjectConfig, ModelConfig, ModelBackend, ResourceConfig, VerificationConfig, ApprovalConfig
+from local_coder.types import ProjectConfig, ModelConfig, ModelBackend, ResourceConfig, VerificationConfig, ApprovalConfig, AgenticConfig
 
 def load_config(config_path: Optional[str] = None, project_root: str = ".") -> ProjectConfig:
     """Load configuration from YAML file.
@@ -79,11 +78,20 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
         require_approval_for_commands=approval_data.get("require_approval_for_commands", False),
         require_approval_for_commits=approval_data.get("require_approval_for_commits", False)
     )
+
+    agentic_data = data.get("agentic", {})
+    agentic = AgenticConfig(
+        role_models=agentic_data.get("role_models", {}),
+        context_window_chars=agentic_data.get("context_window_chars", 24000),
+        compact_context_chars=agentic_data.get("compact_context_chars", 12000),
+        max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
+    )
     
     return ProjectConfig(
         models=models,
         resources=resources,
         verification=verification,
         approval=approval,
+        agentic=agentic,
         state_dir=data.get("state_dir", ".local-coder")
     )

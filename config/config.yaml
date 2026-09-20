@@ -76,6 +76,18 @@ verification:
   run_tests_after_changes: true
   require_review: true
 
+# Agentic routing and bounded context
+agentic:
+  role_models:
+    planner: orchestrator
+    coder: coder
+    reviewer: reviewer
+    tester: reviewer
+    debugger: coder
+  context_window_chars: 24000
+  compact_context_chars: 12000
+  max_parallel_agents: 1
+
 # Logging
 log_level: INFO
 log_dir: .local-coder/logs
