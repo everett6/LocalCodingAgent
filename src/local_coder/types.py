@@ -74,7 +74,7 @@ class ToolCall(BaseModel):
 
 class ToolResult(BaseModel):
     """Result from executing a tool."""
-    tool_call_id: str
+    tool_call_id: str = ""
     success: bool
     output: str = ""
     error: str | None = None

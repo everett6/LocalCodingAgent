@@ -252,7 +252,16 @@ class Coordinator:
     async def _fix_failures(self, test_result: AgentResponse) -> AgentResponse:
         debugger = create_agent(AgentRole.DEBUGGER, await self.model_manager.get_model(AgentRole.DEBUGGER), self.tool_registry, self._emit)
         if debugger:
-            task = AgentTask(role=AgentRole.DEBUGGER, objective=f"Fix these issues: {test_result.issues}")
+            task = AgentTask(
+                role=AgentRole.DEBUGGER,
+                objective=(
+                    "Fix the failing tests and verify the fix.\n"
+                    f"Test summary: {test_result.summary}\n"
+                    f"Tests run: {test_result.tests_run}\n"
+                    f"Issues: {test_result.issues}"
+                ),
+                context=TaskContext(error_context=test_result.summary),
+            )
             response = await debugger.execute(task)
             return response
         return AgentResponse(

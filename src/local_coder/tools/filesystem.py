@@ -85,7 +85,12 @@ class WriteFileTool(Tool):
                     f.write(content)
                     
             await asyncio.to_thread(_write)
-            return ToolResult(success=True, output=f"Wrote to {path}", duration_ms=int((time.time()-start_t)*1000))
+            return ToolResult(
+                success=True,
+                output=f"Wrote to {path}",
+                files_changed=[path],
+                duration_ms=int((time.time()-start_t)*1000),
+            )
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
 

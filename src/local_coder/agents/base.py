@@ -32,21 +32,40 @@ class BaseAgent:
         self._metrics = AgentMetrics()
         # Keep track of files changed during this agent's execution
         self._files_changed: set[str] = set()
+        self._tests_run: list[str] = []
+        self._tests_passed = True
     
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop."""
         # Build initial messages
         messages = self._build_messages(task)
         self._files_changed.clear()
+        self._metrics = AgentMetrics()
+        self._tests_run = []
+        self._tests_passed = True
         
         for iteration in range(self.max_iterations):
-            # Get model response
-            response = await self.model.generate(
-                messages,
-                temperature=self.model.config.temperature if hasattr(self.model, 'config') else 0.2,
-                max_tokens=self.model.config.max_tokens if hasattr(self.model, 'config') else 4096,
-                tools=self.tool_registry.get_schemas_for_role(self.role),
+            self._emit_event(
+                "iteration_started",
+                f"Starting tool loop iteration {iteration + 1}/{self.max_iterations}",
+                task_id=task.task_id,
             )
+
+            try:
+                response = await self.model.generate(
+                    messages,
+                    temperature=self.model.config.temperature if hasattr(self.model, "config") else 0.2,
+                    max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
+                    tools=self.tool_registry.get_schemas_for_role(self.role),
+                )
+            except Exception as exc:
+                self._emit_event("model_error", str(exc), task_id=task.task_id)
+                return self._build_response(
+                    task,
+                    ModelResponse(content="Model generation failed."),
+                    TaskStatus.FAILED,
+                    issues=[f"Model generation failed: {exc}"],
+                )
             
             # Track metrics
             self._metrics.model_calls += 1
@@ -73,22 +92,41 @@ class BaseAgent:
                     task_id=task.task_id,
                 )
                 
-                result = await self.tool_registry.execute_tool(
-                    self.role, tc.name, tc.arguments
-                )
+                try:
+                    result = await self.tool_registry.execute_tool(
+                        self.role, tc.name, tc.arguments
+                    )
+                except Exception as exc:
+                    result = ToolResult(
+                        tool_call_id=tc.id,
+                        success=False,
+                        output=f"Tool execution failed: {exc}",
+                    )
                 
                 self._metrics.tool_calls += 1
                 if result.files_changed:
                     self._metrics.files_written += len(result.files_changed)
                     self._files_changed.update(result.files_changed)
+                if tc.name == "run_tests":
+                    self._tests_run.append(tc.arguments.get("test_path") or "project tests")
+                    self._tests_passed = self._tests_passed and result.success
                 
                 # Add tool result as message
+                tool_output = result.output
+                if not result.success and result.error:
+                    tool_output = f"{tool_output}\nError: {result.error}".strip()
+
                 messages.append(Message(
                     role="tool",
-                    content=result.output if result.success else f"Error: {result.error}",
+                    content=tool_output or "Tool completed without output.",
                     tool_call_id=tc.id,
                     name=tc.name,
                 ))
+                self._emit_event(
+                    "tool_result",
+                    f"{tc.name}: {'succeeded' if result.success else 'failed'}",
+                    task_id=task.task_id,
+                )
         
         # Max iterations reached
         return self._build_response(
@@ -146,6 +184,9 @@ class BaseAgent:
             task_id=task.task_id,
             status=status,
             summary=model_response.content,
+            files_changed=sorted(self._files_changed),
+            tests_run=self._tests_run,
+            tests_passed=self._tests_passed,
             issues=issues or [],
             metrics=self._metrics,
         )
