@@ -5,15 +5,13 @@ from typing import Any
 import time
 
 from local_coder.tools.base import Tool
+from local_coder.safety import CommandPolicy, CommandRisk
 from local_coder.types import ToolName, ToolResult
+from local_coder.workspace import Workspace
 
 
 def _resolve_and_check_path(project_root: str, path: str) -> Path:
-    root = Path(project_root).resolve()
-    target = (Path(project_root) / path).resolve()
-    if not target.is_relative_to(root):
-        raise ValueError(f"Path traversal detected: {path} is outside project root")
-    return target
+    return Workspace(project_root).resolve(path)
 
 
 class RunCommandTool(Tool):
@@ -29,22 +27,18 @@ class RunCommandTool(Tool):
         "required": ["command"]
     }
     
-    # Very basic deny list for destructive commands
-    DENY_LIST = ["rm -rf /", "sudo", "mkfs", "dd if=", ":(){ :|:& };:"]
-    
     def __init__(self, project_root: str):
         self.project_root = project_root
+        self.policy = CommandPolicy()
         
     async def execute(self, command: str, working_dir: str | None = None, timeout: int = 60, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
-            for bad in self.DENY_LIST:
-                if bad in command:
-                    return ToolResult(
-                        success=False, 
-                        output=f"Command rejected by security policy: matches '{bad}'",
-                        duration_ms=int((time.time()-start_t)*1000)
-                    )
+            risk = self.policy.classify(command)
+            if risk == CommandRisk.BLOCK:
+                return ToolResult(success=False, output="Command blocked by security policy.", duration_ms=int((time.time()-start_t)*1000))
+            if risk == CommandRisk.ASK:
+                return ToolResult(success=False, output="Command requires approval before execution.", duration_ms=int((time.time()-start_t)*1000))
                     
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
             

@@ -138,7 +138,7 @@ def _run_request(request: str, ctx_obj: dict):
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.add_event_listener(_event_handler)
+        coordinator.on_event(_event_handler)
         
         try:
             result = await coordinator.run(request)
@@ -208,7 +208,7 @@ def _run_plan(request: str, ctx_obj: dict):
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.add_event_listener(_event_handler)
+        coordinator.on_event(_event_handler)
         
         try:
             result = await coordinator.run(f"Create a detailed plan for: {request}")
@@ -229,7 +229,7 @@ def _run_review(ctx_obj: dict):
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.add_event_listener(_event_handler)
+        coordinator.on_event(_event_handler)
         try:
             result = await coordinator.run("Review current uncommitted changes")
             console.print(Panel(Markdown(result), title="Review", border_style="white"))
@@ -249,7 +249,7 @@ def _run_tests(ctx_obj: dict):
     
     async def _run():
         coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.add_event_listener(_event_handler)
+        coordinator.on_event(_event_handler)
         try:
             result = await coordinator.run("Run project tests and report results")
             console.print(Panel(Markdown(result), title="Test Results", border_style="magenta"))

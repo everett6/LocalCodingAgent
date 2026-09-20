@@ -7,6 +7,12 @@ import time
 
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
+from local_coder.workspace import Workspace
+
+
+def _safe_relative_path(project_root: str, path: str) -> str:
+    """Validate a Git path against the workspace boundary."""
+    return Workspace(project_root).relative_path(path)
 
 
 class GitStatusTool(Tool):
@@ -52,7 +58,7 @@ class GitDiffTool(Tool):
             if staged:
                 cmd.append("--staged")
             if path:
-                cmd.extend(["--", path])
+                cmd.extend(["--", _safe_relative_path(self.project_root, path)])
                 
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
@@ -83,7 +89,7 @@ class GitLogTool(Tool):
         try:
             cmd = ["git", "log", f"-n{count}", "--oneline"]
             if path:
-                cmd.extend(["--", path])
+                cmd.extend(["--", _safe_relative_path(self.project_root, path)])
                 
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
@@ -114,7 +120,8 @@ class GitCommitTool(Tool):
         start_t = time.time()
         try:
             if files:
-                add_cmd = ["git", "add"] + files
+                safe_files = [_safe_relative_path(self.project_root, path) for path in files]
+                add_cmd = ["git", "add"] + safe_files
                 proc_add = await asyncio.create_subprocess_exec(
                     *add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
                 )

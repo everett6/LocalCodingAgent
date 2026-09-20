@@ -8,14 +8,11 @@ import time
 
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
+from local_coder.workspace import Workspace
 
 
 def _resolve_and_check_path(project_root: str, path: str) -> Path:
-    root = Path(project_root).resolve()
-    target = (Path(project_root) / path).resolve()
-    if not target.is_relative_to(root):
-        raise ValueError(f"Path traversal detected: {path} is outside project root")
-    return target
+    return Workspace(project_root).resolve(path)
 
 
 class SearchFilesTool(Tool):

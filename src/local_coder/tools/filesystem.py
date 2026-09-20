@@ -5,17 +5,13 @@ import subprocess
 import time
 from typing import Any
 
+from local_coder.workspace import Workspace
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
 
 
 def _resolve_and_check_path(project_root: str, path: str) -> Path:
-    """Resolve a path and ensure it remains within the project root."""
-    root = Path(project_root).resolve()
-    target = (Path(project_root) / path).resolve()
-    if not target.is_relative_to(root):
-        raise ValueError(f"Path traversal detected: {path} is outside project root")
-    return target
+    return Workspace(project_root).resolve(path)
 
 
 class ReadFileTool(Tool):
