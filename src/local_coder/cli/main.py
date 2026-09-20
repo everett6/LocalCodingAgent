@@ -128,6 +128,50 @@ def models(ctx):
     _show_models(ctx.obj)
 
 
+@cli.command()
+@click.pass_context
+def checkpoint(ctx):
+    """Create a local checkpoint of the current working tree."""
+    from local_coder.git import CheckpointManager
+
+    try:
+        saved = CheckpointManager(ctx.obj["project_root"]).create()
+        console.print(f"Created checkpoint [bold]{saved.checkpoint_id}[/bold]")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="checkpoints")
+@click.pass_context
+def checkpoints(ctx):
+    """List local working-tree checkpoints."""
+    from local_coder.git import CheckpointManager
+
+    try:
+        saved = CheckpointManager(ctx.obj["project_root"]).list()
+        if not saved:
+            console.print("No checkpoints found.")
+            return
+        for item in saved:
+            console.print(f"{item.checkpoint_id}  {item.created_at}")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command()
+@click.argument("checkpoint_id")
+@click.pass_context
+def rollback(ctx, checkpoint_id):
+    """Restore a local checkpoint by ID."""
+    from local_coder.git import CheckpointManager
+
+    try:
+        restored = CheckpointManager(ctx.obj["project_root"]).rollback(checkpoint_id)
+        console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _run_request(request: str, ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.coordinator import Coordinator
@@ -177,6 +221,16 @@ def _interactive_mode(ctx_obj: dict):
                     _run_review(ctx_obj)
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
+                elif cmd == "/checkpoint":
+                    _run_checkpoint(ctx_obj)
+                elif cmd == "/checkpoints":
+                    _run_checkpoints(ctx_obj)
+                elif cmd == "/rollback":
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) == 2:
+                        _run_rollback(parts[1], ctx_obj)
+                    else:
+                        console.print("[red]Please provide a checkpoint ID.[/red]")
                 elif cmd == "/help":
                     console.print("""
 Available commands:
@@ -185,6 +239,9 @@ Available commands:
   /plan <request>  : Create a plan without executing
   /review          : Review current uncommitted changes
   /test            : Run tests and report results
+    /checkpoint      : Save the current working tree
+    /checkpoints     : List saved checkpoints
+    /rollback <id>   : Restore a checkpoint
   /help            : Show this help message
                     """)
                 else:
@@ -257,6 +314,39 @@ def _run_tests(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
 
     asyncio.run(_run())
+
+
+def _run_checkpoint(ctx_obj: dict):
+    from local_coder.git import CheckpointManager
+
+    try:
+        saved = CheckpointManager(ctx_obj["project_root"]).create()
+        console.print(f"Created checkpoint [bold]{saved.checkpoint_id}[/bold]")
+    except Exception as exc:
+        console.print(f"[red]Checkpoint failed:[/red] {exc}")
+
+
+def _run_checkpoints(ctx_obj: dict):
+    from local_coder.git import CheckpointManager
+
+    try:
+        saved = CheckpointManager(ctx_obj["project_root"]).list()
+        for item in saved:
+            console.print(f"{item.checkpoint_id}  {item.created_at}")
+        if not saved:
+            console.print("No checkpoints found.")
+    except Exception as exc:
+        console.print(f"[red]Could not list checkpoints:[/red] {exc}")
+
+
+def _run_rollback(checkpoint_id: str, ctx_obj: dict):
+    from local_coder.git import CheckpointManager
+
+    try:
+        restored = CheckpointManager(ctx_obj["project_root"]).rollback(checkpoint_id)
+        console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
+    except Exception as exc:
+        console.print(f"[red]Rollback failed:[/red] {exc}")
 
 
 def _run_status(ctx_obj: dict):

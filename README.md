@@ -17,9 +17,14 @@ local-coder "Fix the failing tests"
 local-coder plan "Add authentication"
 local-coder test
 local-coder review
+local-coder checkpoint
+local-coder checkpoints
+local-coder rollback <checkpoint-id>
 ```
 
 The default configuration expects an OpenAI-compatible server at `http://localhost:8090/v1`. Change the endpoint and model ID to match your local server.
+
+Checkpoints save the current Git working tree locally under `.local-coder/checkpoints/`. They do not create commits or push anything. Use them before autonomous edits, then restore one with `local-coder rollback <checkpoint-id>` if needed.
 
 ## Safety
 
