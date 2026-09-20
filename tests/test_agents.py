@@ -138,3 +138,41 @@ def test_failed_test_tool_marks_state_failed():
     assert agent.state.phase == AgentPhase.FAILED
     assert agent.state.test_results[0].passed is False
     assert "AssertionError" in agent.state.errors[0]
+
+
+def test_agent_stops_at_tool_call_budget():
+    model = FakeModel([
+        ModelResponse(tool_calls=[ToolCall(name="read_file")]),
+        ModelResponse(tool_calls=[ToolCall(name="read_file")]),
+    ])
+    agent = LoopAgent(model, FakeRegistry([
+        ToolResult(success=True, output="one"),
+        ToolResult(success=True, output="two"),
+    ]))
+    agent.max_tool_calls = 1
+
+    response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Inspect")))
+
+    assert response.status == TaskStatus.FAILED
+    assert "tool-call limit" in response.issues[0]
+    assert agent.state is not None
+    assert agent.state.tool_calls_used == 1
+
+
+def test_agent_stops_at_test_run_budget():
+    model = FakeModel([
+        ModelResponse(tool_calls=[ToolCall(name="run_tests")]),
+        ModelResponse(tool_calls=[ToolCall(name="run_tests")]),
+    ])
+    agent = LoopAgent(model, FakeRegistry([
+        ToolResult(success=False, output="first failure"),
+        ToolResult(success=False, output="second failure"),
+    ]))
+    agent.max_test_runs = 1
+
+    response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Test")))
+
+    assert response.status == TaskStatus.FAILED
+    assert "test-run limit" in response.issues[0]
+    assert agent.state is not None
+    assert agent.state.test_runs == 1

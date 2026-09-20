@@ -30,6 +30,8 @@ Checkpoints save the current Git working tree locally under `.local-coder/checkp
 
 All filesystem paths are resolved relative to the selected project workspace. Parent traversal and symlink escapes are rejected. Shell commands are classified as safe, approval-required, or blocked; tests and read-only inspection commands are safe by default, while package installation, Git mutation, privilege escalation, and destructive commands are restricted.
 
+Agent runs are bounded by iteration, tool-call, and test-run limits. Verification failures are summarized before being passed to the debugger, and the final report records whether verification passed or exhausted its retry budget.
+
 ## Architecture
 
 - `src/local_coder/agents/`: role-specific agents and the bounded tool loop

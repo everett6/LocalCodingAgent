@@ -12,6 +12,7 @@ from local_coder.memory.store import MemoryStore
 from local_coder.context.repository import RepositoryContext
 from local_coder.scheduler.dag import TaskDAG
 from local_coder.scheduler.resources import ResourceManager
+from local_coder.verification.failures import summarize_failures
 
 
 class Coordinator:
@@ -70,6 +71,7 @@ class Coordinator:
         review = await self._review(result)
         
         # Step 5: Test
+        test_result = None
         if self.config.verification.run_tests_after_changes:
             self._emit("ORCHESTRATOR", "phase", "Running tests...")
             test_result = await self._run_tests()
@@ -83,8 +85,11 @@ class Coordinator:
                 fix_iterations += 1
         
         # Step 7: Final report
-        report = await self._generate_report(result, review)
-        self._emit("ORCHESTRATOR", "task_completed", "Done")
+        report = await self._generate_report(result, review, test_result)
+        if test_result is None or test_result.tests_passed:
+            self._emit("ORCHESTRATOR", "task_completed", "Done")
+        else:
+            self._emit("ORCHESTRATOR", "task_failed", "Verification did not pass within the retry limit")
         return report
     
     async def _explore(self, request: str) -> str:
@@ -252,11 +257,12 @@ class Coordinator:
     async def _fix_failures(self, test_result: AgentResponse) -> AgentResponse:
         debugger = create_agent(AgentRole.DEBUGGER, await self.model_manager.get_model(AgentRole.DEBUGGER), self.tool_registry, self._emit)
         if debugger:
+            failure_context = summarize_failures(test_result.summary)
             task = AgentTask(
                 role=AgentRole.DEBUGGER,
                 objective=(
                     "Fix the failing tests and verify the fix.\n"
-                    f"Test summary: {test_result.summary}\n"
+                    f"Relevant failures:\n{failure_context}\n"
                     f"Tests run: {test_result.tests_run}\n"
                     f"Issues: {test_result.issues}"
                 ),
@@ -275,8 +281,21 @@ class Coordinator:
             follow_up_required=False
         )
         
-    async def _generate_report(self, result: AgentResponse, review: str) -> str:
-        return f"Final Report\n\nExecution Result:\n{result.summary}\n\nReview:\n{review}"
+    async def _generate_report(
+        self,
+        result: AgentResponse,
+        review: str,
+        test_result: AgentResponse | None = None,
+    ) -> str:
+        report = f"Final Report\n\nExecution Result:\n{result.summary}\n\nReview:\n{review}"
+        if test_result is not None:
+            status = "passed" if test_result.tests_passed else "failed"
+            report += (
+                f"\n\nVerification: {status}\n"
+                f"Tests: {', '.join(test_result.tests_run) or 'project tests'}\n"
+                f"Details: {test_result.summary}"
+            )
+        return report
         
     async def plan_only(self, request: str) -> str:
         """Plan without executing."""

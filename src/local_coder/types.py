@@ -207,6 +207,10 @@ class AgentState(BaseModel):
     phase: AgentPhase = AgentPhase.IDLE
     iteration: int = 0
     max_iterations: int = 15
+    tool_calls_used: int = 0
+    max_tool_calls: int = 100
+    test_runs: int = 0
+    max_test_runs: int = 20
     messages: list[Message] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     files_read: set[str] = Field(default_factory=set)

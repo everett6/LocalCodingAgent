@@ -20,6 +20,8 @@ class BaseAgent:
     role: AgentRole
     system_prompt: str
     max_iterations: int = 15  # Max tool-calling rounds
+    max_tool_calls: int = 100
+    max_test_runs: int = 20
     
     def __init__(
         self,
@@ -49,6 +51,8 @@ class BaseAgent:
             task_id=task.task_id,
             objective=task.objective,
             max_iterations=self.max_iterations,
+            max_tool_calls=self.max_tool_calls,
+            max_test_runs=self.max_test_runs,
             started_at=datetime.now(),
         )
         self.state.phase = AgentPhase.EXECUTING
@@ -109,6 +113,26 @@ class BaseAgent:
             
             # Execute tool calls
             for tc in response.tool_calls:
+                if self.state.tool_calls_used >= self.max_tool_calls:
+                    self.state.phase = AgentPhase.FAILED
+                    self.state.errors.append("Exceeded maximum tool-call limit")
+                    self.state.finished_at = datetime.now()
+                    return self._build_response(
+                        task,
+                        ModelResponse(content="Tool-call limit reached."),
+                        TaskStatus.FAILED,
+                        issues=["Exceeded maximum tool-call limit"],
+                    )
+                if tc.name == "run_tests" and self.state.test_runs >= self.max_test_runs:
+                    self.state.phase = AgentPhase.FAILED
+                    self.state.errors.append("Exceeded maximum test-run limit")
+                    self.state.finished_at = datetime.now()
+                    return self._build_response(
+                        task,
+                        ModelResponse(content="Test-run limit reached."),
+                        TaskStatus.FAILED,
+                        issues=["Exceeded maximum test-run limit"],
+                    )
                 self._emit_event(
                     "tool_call",
                     f"Calling {tc.name}({json.dumps(tc.arguments)[:100]})",
@@ -127,6 +151,7 @@ class BaseAgent:
                     )
                 
                 self._metrics.tool_calls += 1
+                self.state.tool_calls_used += 1
                 if tc.name in {"read_file", "search_files", "grep"}:
                     path = tc.arguments.get("path")
                     if path:
@@ -136,8 +161,12 @@ class BaseAgent:
                     self._files_changed.update(result.files_changed)
                     self.state.files_changed.update(result.files_changed)
                 if tc.name == "run_tests":
+                    self.state.phase = AgentPhase.VERIFYING
+                    self.state.test_runs += 1
                     self._tests_run.append(tc.arguments.get("test_path") or "project tests")
                     self._tests_passed = self._tests_passed and result.success
+                    if not result.success:
+                        self.state.phase = AgentPhase.REFLECTING
                     self.state.test_results.append(TestResult(
                         test_name=tc.arguments.get("test_path") or "project tests",
                         passed=result.success,
