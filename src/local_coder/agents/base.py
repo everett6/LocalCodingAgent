@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Any, Callable
 
 from local_coder.types import (
-    AgentRole, AgentTask, AgentResponse, TaskStatus, TaskContext,
-    Message, ToolCall, ToolResult, ModelResponse, AgentMetrics, AgentEvent,
+    AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus, TaskContext,
+    Message, ToolCall, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class BaseAgent:
         self._files_changed: set[str] = set()
         self._tests_run: list[str] = []
         self._tests_passed = True
+        self.state: AgentState | None = None
     
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop."""
@@ -43,8 +45,17 @@ class BaseAgent:
         self._metrics = AgentMetrics()
         self._tests_run = []
         self._tests_passed = True
+        self.state = AgentState(
+            task_id=task.task_id,
+            objective=task.objective,
+            max_iterations=self.max_iterations,
+            started_at=datetime.now(),
+        )
+        self.state.phase = AgentPhase.EXECUTING
+        self.state.messages = list(messages)
         
         for iteration in range(self.max_iterations):
+            self.state.iteration = iteration + 1
             self._emit_event(
                 "iteration_started",
                 f"Starting tool loop iteration {iteration + 1}/{self.max_iterations}",
@@ -59,6 +70,9 @@ class BaseAgent:
                     tools=self.tool_registry.get_schemas_for_role(self.role),
                 )
             except Exception as exc:
+                self.state.phase = AgentPhase.FAILED
+                self.state.errors.append(f"Model generation failed: {exc}")
+                self.state.finished_at = datetime.now()
                 self._emit_event("model_error", str(exc), task_id=task.task_id)
                 return self._build_response(
                     task,
@@ -75,7 +89,14 @@ class BaseAgent:
             
             # If no tool calls, we're done
             if not response.tool_calls:
-                return self._build_response(task, response, TaskStatus.COMPLETED)
+                self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
+                self.state.finished_at = datetime.now()
+                return self._build_response(
+                    task,
+                    response,
+                    TaskStatus.COMPLETED if self._tests_passed else TaskStatus.FAILED,
+                    issues=[] if self._tests_passed else ["Verification tests failed"],
+                )
             
             # Add assistant message with tool calls
             messages.append(Message(
@@ -83,6 +104,8 @@ class BaseAgent:
                 content=response.content,
                 tool_calls=response.tool_calls,
             ))
+            self.state.messages = list(messages)
+            self.state.tool_calls.extend(response.tool_calls)
             
             # Execute tool calls
             for tc in response.tool_calls:
@@ -104,12 +127,26 @@ class BaseAgent:
                     )
                 
                 self._metrics.tool_calls += 1
+                if tc.name in {"read_file", "search_files", "grep"}:
+                    path = tc.arguments.get("path")
+                    if path:
+                        self.state.files_read.add(path)
                 if result.files_changed:
                     self._metrics.files_written += len(result.files_changed)
                     self._files_changed.update(result.files_changed)
+                    self.state.files_changed.update(result.files_changed)
                 if tc.name == "run_tests":
                     self._tests_run.append(tc.arguments.get("test_path") or "project tests")
                     self._tests_passed = self._tests_passed and result.success
+                    self.state.test_results.append(TestResult(
+                        test_name=tc.arguments.get("test_path") or "project tests",
+                        passed=result.success,
+                        duration_ms=result.duration_ms or 0.0,
+                        error_message=None if result.success else result.output,
+                        stdout=result.output,
+                    ))
+                if not result.success:
+                    self.state.errors.append(result.error or result.output)
                 
                 # Add tool result as message
                 tool_output = result.output
@@ -122,6 +159,7 @@ class BaseAgent:
                     tool_call_id=tc.id,
                     name=tc.name,
                 ))
+                self.state.messages = list(messages)
                 self._emit_event(
                     "tool_result",
                     f"{tc.name}: {'succeeded' if result.success else 'failed'}",
@@ -129,6 +167,9 @@ class BaseAgent:
                 )
         
         # Max iterations reached
+        self.state.phase = AgentPhase.FAILED
+        self.state.errors.append("Exceeded maximum tool-calling iterations")
+        self.state.finished_at = datetime.now()
         return self._build_response(
             task,
             ModelResponse(content="Max iterations reached"),

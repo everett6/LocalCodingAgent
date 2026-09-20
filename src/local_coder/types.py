@@ -29,6 +29,18 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class AgentPhase(str, enum.Enum):
+    """Lifecycle phase for one agent task execution."""
+    IDLE = "idle"
+    DISCOVERING = "discovering"
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    VERIFYING = "verifying"
+    REFLECTING = "reflecting"
+    DONE = "done"
+    FAILED = "failed"
+
+
 class ModelBackend(str, enum.Enum):
     OLLAMA = "ollama"
     LLAMACPP = "llama.cpp"
@@ -185,6 +197,24 @@ class AgentMetrics(BaseModel):
     latency_ms: float = 0.0
     files_read: int = 0
     files_written: int = 0
+
+
+class AgentState(BaseModel):
+    """Observable state accumulated during one agent execution."""
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:12])
+    task_id: str
+    objective: str
+    phase: AgentPhase = AgentPhase.IDLE
+    iteration: int = 0
+    max_iterations: int = 15
+    messages: list[Message] = Field(default_factory=list)
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    files_read: set[str] = Field(default_factory=set)
+    files_changed: set[str] = Field(default_factory=set)
+    test_results: list[TestResult] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 # === Task DAG ===

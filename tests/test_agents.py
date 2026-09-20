@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from local_coder.agents.base import BaseAgent
 from local_coder.types import (
+    AgentPhase,
     AgentRole,
     AgentTask,
     Message,
@@ -69,6 +70,13 @@ def test_tool_loop_returns_files_and_tool_feedback():
     assert response.files_changed == ["src/app.py"]
     assert response.metrics.model_calls == 2
     assert response.metrics.tool_calls == 1
+    assert agent.state is not None
+    assert agent.state.phase == AgentPhase.DONE
+    assert agent.state.iteration == 2
+    assert agent.state.files_read == {"src/app.py"}
+    assert agent.state.files_changed == {"src/app.py"}
+    assert agent.state.tool_calls[0] == tool_call
+    assert agent.state.finished_at is not None
     assert registry.calls == [(AgentRole.CODER, "read_file", {"path": "src/app.py"})]
     assert model.calls[1][0][-1] == Message(
         role="tool",
@@ -108,3 +116,25 @@ def test_agent_stops_after_max_iterations():
     assert response.status == TaskStatus.FAILED
     assert response.metrics.model_calls == 2
     assert "maximum tool-calling iterations" in response.issues[0]
+
+
+def test_failed_test_tool_marks_state_failed():
+    model = FakeModel([
+        ModelResponse(
+            tool_calls=[ToolCall(name="run_tests", arguments={"test_path": "tests/test_app.py"})],
+        ),
+        ModelResponse(content="Tests need another fix."),
+    ])
+    agent = LoopAgent(model, FakeRegistry([
+        ToolResult(success=False, output="AssertionError: expected 1, got 2"),
+    ]))
+
+    response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Fix the app.")))
+
+    assert response.status == TaskStatus.FAILED
+    assert response.tests_passed is False
+    assert response.tests_run == ["tests/test_app.py"]
+    assert agent.state is not None
+    assert agent.state.phase == AgentPhase.FAILED
+    assert agent.state.test_results[0].passed is False
+    assert "AssertionError" in agent.state.errors[0]
