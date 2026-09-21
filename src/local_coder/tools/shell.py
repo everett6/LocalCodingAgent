@@ -4,9 +4,10 @@ from pathlib import Path
 from typing import Any
 import time
 
+from local_coder.approval import ApprovalCallback
 from local_coder.tools.base import Tool
 from local_coder.safety import CommandPolicy, CommandRisk
-from local_coder.types import ToolName, ToolResult
+from local_coder.types import ApprovalConfig, ToolName, ToolResult
 from local_coder.workspace import Workspace
 
 
@@ -27,19 +28,30 @@ class RunCommandTool(Tool):
         "required": ["command"]
     }
     
-    def __init__(self, project_root: str):
+    def __init__(
+        self,
+        project_root: str,
+        approval: ApprovalConfig | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ):
         self.project_root = project_root
         self.policy = CommandPolicy()
-        
+        self.approval = approval or ApprovalConfig()
+        self.approval_callback = approval_callback
+
     async def execute(self, command: str, working_dir: str | None = None, timeout: int = 60, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
             risk = self.policy.classify(command)
             if risk == CommandRisk.BLOCK:
                 return ToolResult(success=False, output="Command blocked by security policy.", duration_ms=int((time.time()-start_t)*1000))
-            if risk == CommandRisk.ASK:
-                return ToolResult(success=False, output="Command requires approval before execution.", duration_ms=int((time.time()-start_t)*1000))
-                    
+            if risk == CommandRisk.ASK and self.approval.require_approval_for_commands:
+                if self.approval_callback is None:
+                    return ToolResult(success=False, output="Command requires approval before execution.", duration_ms=int((time.time()-start_t)*1000))
+                approved = await self.approval_callback(f"Run shell command: {command}")
+                if not approved:
+                    return ToolResult(success=False, output="Command denied by user.", duration_ms=int((time.time()-start_t)*1000))
+
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
             
             proc = await asyncio.create_subprocess_shell(

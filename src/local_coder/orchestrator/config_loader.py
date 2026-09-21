@@ -63,20 +63,21 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
     resources = ResourceConfig(
         max_concurrent_gpu_agents=resources_data.get("max_concurrent_gpu_agents", 1),
         max_concurrent_cpu_agents=resources_data.get("max_concurrent_cpu_agents", 2),
-        require_gpu=resources_data.get("require_gpu", False)
     )
-    
+
     verification_data = data.get("verification", {})
     verification = VerificationConfig(
         run_tests_after_changes=verification_data.get("run_tests_after_changes", True),
         max_fix_iterations=verification_data.get("max_fix_iterations", 3),
-        test_command=verification_data.get("test_command")
     )
-    
+
+    # Safe by default: an absent `approval:` section (or an absent key
+    # within it) means risky actions still pause for a human decision.
+    # Only an explicit `false` in the project's own config opts out.
     approval_data = data.get("approval", {})
     approval = ApprovalConfig(
-        require_approval_for_commands=approval_data.get("require_approval_for_commands", False),
-        require_approval_for_commits=approval_data.get("require_approval_for_commits", False)
+        require_approval_for_commands=approval_data.get("require_approval_for_commands", True),
+        require_approval_for_commits=approval_data.get("require_approval_for_commits", True)
     )
 
     agentic_data = data.get("agentic", {})

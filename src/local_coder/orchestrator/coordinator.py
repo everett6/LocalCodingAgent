@@ -1,7 +1,9 @@
+import asyncio
 import os
 import json
 from typing import Callable
 
+from local_coder.approval import ApprovalCallback
 from local_coder.types import (
     ProjectConfig, AgentEvent, AgentRole, AgentTask, TaskContext, TaskPlan, AgentResponse,
     TaskStatus,
@@ -18,26 +20,29 @@ from local_coder.verification.failures import summarize_failures
 
 class Coordinator:
     """Main orchestrator that coordinates the coding agent workflow."""
-    
+
     def __init__(
         self,
         config: ProjectConfig,
         project_root: str,
+        approval_callback: ApprovalCallback | None = None,
     ):
         self.config = config
         self.project_root = project_root
         self.repo_context = RepositoryContext(project_root)
-        
+
         # Ensure state dir exists
         state_dir_path = os.path.join(project_root, config.state_dir)
         os.makedirs(state_dir_path, exist_ok=True)
-        
+
         self.memory = MemoryStore(os.path.join(state_dir_path, "memory.db"))
-        self.tool_registry = create_tool_registry(project_root)
+        self.tool_registry = create_tool_registry(
+            project_root, approval=config.approval, approval_callback=approval_callback,
+        )
         self.model_manager = ModelManager(config)
         self.resource_manager = ResourceManager(config.resources)
         self._event_handlers: list[Callable] = []
-    
+
     def on_event(self, handler: Callable[[AgentEvent], None]) -> None:
         """Register event handler."""
         self._event_handlers.append(handler)
@@ -248,48 +253,13 @@ class Coordinator:
                         follow_up_required=True,
                     ))
                 break
+            # Mark the whole wave running up front (synchronously, before any
+            # task yields control) so a task never gets scheduled twice.
             for task in ready_tasks:
                 dag.mark_running(task.task_id)
-                agent = create_agent(
-                    task.role,
-                    await self.model_manager.get_model(task.role, task.model_name),
-                    self.tool_registry,
-                    self._dispatch,
-                    context_window_chars=self.config.agentic.context_window_chars,
-                    compact_context_chars=self.config.agentic.compact_context_chars,
-                )
-                try:
-                    if agent:
-                        response = await agent.execute(task)
-                    else:
-                        response = AgentResponse(
-                            task_id=task.task_id,
-                            status=TaskStatus.COMPLETED,
-                            summary=f"Executed {task.task_id}",
-                            files_changed=[],
-                            tests_run=[],
-                            tests_passed=True,
-                            issues=[],
-                            follow_up_required=False
-                        )
-                    
-                    if response.status == TaskStatus.FAILED or not response.tests_passed:
-                        dag.mark_failed(task.task_id, response)
-                    else:
-                        dag.mark_completed(task.task_id, response)
-                except Exception as e:
-                    response = AgentResponse(
-                        task_id=task.task_id,
-                        status=TaskStatus.FAILED,
-                        summary=str(e),
-                        files_changed=[],
-                        tests_run=[],
-                        tests_passed=False,
-                        issues=[str(e)],
-                        follow_up_required=True
-                    )
-                    dag.mark_failed(task.task_id, response)
-                    
+            semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
+            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore) for task in ready_tasks))
+
         return AgentResponse(
             task_id="plan_execution",
             status=TaskStatus.COMPLETED if not dag.has_failures() else TaskStatus.FAILED,
@@ -300,6 +270,69 @@ class Coordinator:
             issues=[],
             follow_up_required=dag.has_failures()
         )
+
+    def _parallelism_for_wave(self, tasks: list[AgentTask]) -> int:
+        """Only parallelize mutations when their file scopes are explicit and disjoint."""
+        configured = max(1, self.config.agentic.max_parallel_agents)
+        mutating_roles = {AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.TESTER}
+        mutating_tasks = [task for task in tasks if task.role in mutating_roles]
+        if not mutating_tasks:
+            return configured
+        if any(not task.files for task in mutating_tasks):
+            return 1
+
+        seen: set[str] = set()
+        for task in mutating_tasks:
+            file_scope = set(task.files)
+            if seen.intersection(file_scope):
+                return 1
+            seen.update(file_scope)
+        return configured
+
+    async def _run_dag_task(self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore) -> None:
+        """Run one DAG-scheduled task, bounded by the parallelism semaphore,
+        and record its outcome on the DAG. Concurrent siblings in the same
+        wave call this independently via asyncio.gather in _execute_plan."""
+        async with semaphore:
+            try:
+                agent = create_agent(
+                    task.role,
+                    await self.model_manager.get_model(task.role, task.model_name),
+                    self.tool_registry,
+                    self._dispatch,
+                    context_window_chars=self.config.agentic.context_window_chars,
+                    compact_context_chars=self.config.agentic.compact_context_chars,
+                )
+                if agent:
+                    response = await agent.execute(task)
+                else:
+                    response = AgentResponse(
+                        task_id=task.task_id,
+                        status=TaskStatus.COMPLETED,
+                        summary=f"Executed {task.task_id}",
+                        files_changed=[],
+                        tests_run=[],
+                        tests_passed=True,
+                        issues=[],
+                        follow_up_required=False
+                    )
+
+                if response.status == TaskStatus.FAILED or not response.tests_passed:
+                    dag.mark_failed(task.task_id, response)
+                else:
+                    dag.mark_completed(task.task_id, response)
+            except Exception as e:
+                response = AgentResponse(
+                    task_id=task.task_id,
+                    status=TaskStatus.FAILED,
+                    summary=str(e),
+                    files_changed=[],
+                    tests_run=[],
+                    tests_passed=False,
+                    issues=[str(e)],
+                    follow_up_required=True
+                )
+                dag.mark_failed(task.task_id, response)
 
     async def _review(self, result: AgentResponse) -> str:
         reviewer = create_agent(AgentRole.REVIEWER, await self.model_manager.get_model(AgentRole.REVIEWER), self.tool_registry, self._dispatch)

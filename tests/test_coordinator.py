@@ -4,6 +4,7 @@ These exercise code paths that previously raised NameError (missing
 TaskContext import) or could hang forever (unvalidated task DAG).
 """
 import asyncio
+from types import SimpleNamespace
 
 from local_coder.orchestrator.coordinator import Coordinator
 from local_coder.types import (
@@ -166,3 +167,88 @@ def test_execute_plan_fails_fast_on_cycle(tmp_path):
     result = run(asyncio.wait_for(coordinator._execute_plan(plan), timeout=5))
 
     assert result.status == TaskStatus.FAILED
+
+
+
+def test_execute_plan_runs_independent_tasks_concurrently(tmp_path):
+    """Three independent tasks (no depends_on between them) should overlap
+    in-flight when agentic.max_parallel_agents > 1, instead of the DAG
+    scheduler running them strictly one at a time."""
+    from local_coder.types import ProjectConfig, TaskPlan
+
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.agentic.max_parallel_agents = 3
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+
+    in_flight = 0
+    max_in_flight = 0
+
+    class SlowFakeModel:
+        config = SimpleNamespace(temperature=0.0, max_tokens=100)
+
+        async def generate(self, messages, **kwargs):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return ModelResponse(content="done")
+
+    coordinator.model_manager.get_model = lambda role, model_name=None: asyncio.sleep(
+        0, result=SlowFakeModel()
+    )
+
+    plan = TaskPlan(
+        objective="parallel",
+        tasks=[
+            AgentTask(task_id="a", role=AgentRole.CODER, objective="x", files=["a.py"]),
+            AgentTask(task_id="b", role=AgentRole.CODER, objective="y", files=["b.py"]),
+            AgentTask(task_id="c", role=AgentRole.CODER, objective="z", files=["c.py"]),
+        ],
+    )
+
+    result = run(asyncio.wait_for(coordinator._execute_plan(plan), timeout=5))
+
+    assert result.status == TaskStatus.COMPLETED
+    assert max_in_flight >= 2, "independent tasks should have overlapped, not run strictly sequentially"
+
+
+def test_execute_plan_respects_max_parallel_agents_limit(tmp_path):
+    """max_parallel_agents=1 must keep today's behavior: no more than one
+    task's model call in flight at a time, even with several ready tasks."""
+    from local_coder.types import ProjectConfig, TaskPlan
+
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.agentic.max_parallel_agents = 1
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+
+    in_flight = 0
+    max_in_flight = 0
+
+    class SlowFakeModel:
+        config = SimpleNamespace(temperature=0.0, max_tokens=100)
+
+        async def generate(self, messages, **kwargs):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+            return ModelResponse(content="done")
+
+    coordinator.model_manager.get_model = lambda role, model_name=None: asyncio.sleep(
+        0, result=SlowFakeModel()
+    )
+
+    plan = TaskPlan(
+        objective="sequential",
+        tasks=[
+            AgentTask(task_id="a", role=AgentRole.CODER, objective="x", files=["a.py"]),
+            AgentTask(task_id="b", role=AgentRole.CODER, objective="y", files=["b.py"]),
+        ],
+    )
+
+    result = run(asyncio.wait_for(coordinator._execute_plan(plan), timeout=5))
+
+    assert result.status == TaskStatus.COMPLETED
+    assert max_in_flight == 1

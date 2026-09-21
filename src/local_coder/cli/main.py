@@ -26,8 +26,8 @@ verification:
     run_tests_after_changes: true
     max_fix_iterations: 3
 approval:
-    require_approval_for_commands: false
-    require_approval_for_commits: false
+    require_approval_for_commands: true
+    require_approval_for_commits: true
 state_dir: .local-coder
 """
 
@@ -64,17 +64,21 @@ def _event_handler(event):
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
 @click.option("--model", help="Use this configured model for every agent in the run")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.option(
+    "--yolo", is_flag=True,
+    help="Auto-approve risky actions (shell commands, git commits/checkouts) without prompting. Dangerous.",
+)
 @click.version_option(version=__version__, prog_name="local-coder")
 @click.pass_context
-def cli(ctx, config, project, model, debug):
+def cli(ctx, config, project, model, debug, yolo):
     """Local Coding Agent - AI-powered local code assistant.
-    
+
     Run with a request to execute it:
-    
+
         local-coder "Add OAuth login"
-    
+
     Or use subcommands:
-    
+
         local-coder plan "Refactor auth"
         local-coder review
         local-coder test
@@ -84,6 +88,7 @@ def cli(ctx, config, project, model, debug):
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
     ctx.obj["model"] = model
+    ctx.obj["yolo"] = yolo
     
     if ctx.invoked_subcommand is None:
         if ctx.args:
@@ -151,13 +156,27 @@ def models(ctx):
 @cli.command()
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8787, show_default=True, type=int)
+@click.option("--token", envvar="LOCAL_CODER_REMOTE_TOKEN", hide_input=True)
 @click.pass_context
-def serve(ctx, host, port):
-    """Start the local HTTP control plane for remote sessions."""
+def serve(ctx, host, port, token):
+    """Start the local HTTP control plane for remote sessions.
+
+    The server has no interactive terminal to prompt with, so ASK-risk
+    actions are denied by default unless the top-level --yolo flag is set
+    when starting it (an explicit, opt-in autonomous mode).
+    """
     from local_coder.remote import RemoteControlServer
 
+    if ctx.obj.get("yolo"):
+        console.print("[bold yellow]Warning:[/bold yellow] --yolo is set; risky actions will be auto-approved with no prompt.")
     console.print(f"Remote control listening on http://{host}:{port}")
-    RemoteControlServer(ctx.obj["project_root"], ctx.obj["config_path"], ctx.obj.get("model")).serve(host, port)
+    try:
+        RemoteControlServer(
+            ctx.obj["project_root"], ctx.obj["config_path"], ctx.obj.get("model"),
+            yolo=ctx.obj.get("yolo", False), token=token,
+        ).serve(host, port)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command(name="sessions")
@@ -240,22 +259,48 @@ def rollback(ctx, checkpoint_id):
         raise click.ClickException(str(exc)) from exc
 
 
+async def _cli_approval_callback(description: str) -> bool:
+    """Prompt the user in the terminal for a risky action. Runs inline in
+    the same event loop as the agent -- blocking on input here is fine
+    since a single interactive session has nothing else to do meanwhile."""
+    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+    return click.confirm("Allow this action?", default=False)
+
+
+def _build_coordinator(config, ctx_obj: dict):
+    """Construct a Coordinator wired for this CLI invocation: --yolo turns
+    off approval prompts entirely, otherwise ASK-risk actions are routed
+    to an interactive y/n prompt instead of being auto-denied."""
+    from local_coder.orchestrator.coordinator import Coordinator
+
+    if ctx_obj.get("yolo"):
+        config.approval.require_approval_for_commands = False
+        config.approval.require_approval_for_commits = False
+        approval_callback = None
+    else:
+        approval_callback = _cli_approval_callback
+
+    coordinator = Coordinator(
+        config=config, project_root=ctx_obj["project_root"], approval_callback=approval_callback,
+    )
+    coordinator.on_event(_event_handler)
+    return coordinator
+
+
 def _run_request(request: str, ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.coordinator import Coordinator
     from local_coder.orchestrator.sessions import SessionStore
-    
+
     console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
-    
+
     config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     if ctx_obj.get("model"):
         from local_coder.types import AgentRole
         config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
-    
+
     async def _run():
-        coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.on_event(_event_handler)
-        
+        coordinator = _build_coordinator(config, ctx_obj)
+
         try:
             result = await coordinator.run(request)
             SessionStore(ctx_obj["project_root"]).save(
@@ -267,6 +312,7 @@ def _run_request(request: str, ctx_obj: dict):
             if ctx_obj.get("debug"):
                 import traceback
                 traceback.print_exc()
+            raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
 
@@ -332,17 +378,15 @@ Available commands:
 
 def _run_plan(request: str, ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.coordinator import Coordinator
     from local_coder.orchestrator.sessions import SessionStore
-    
+
     console.print(Panel(f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan", border_style="yellow"))
-    
+
     config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-    
+
     async def _run():
-        coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.on_event(_event_handler)
-        
+        coordinator = _build_coordinator(config, ctx_obj)
+
         try:
             result = await coordinator.run(f"Create a detailed plan for: {request}")
             SessionStore(ctx_obj["project_root"]).save(
@@ -351,22 +395,21 @@ def _run_plan(request: str, ctx_obj: dict):
             console.print(Panel(Markdown(result), title="Plan", border_style="yellow"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
 
 
 def _run_review(ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.coordinator import Coordinator
     from local_coder.orchestrator.sessions import SessionStore
-    
+
     console.print(Panel("Reviewing current changes", title="Local Coder - Review", border_style="white"))
-    
-    config = load_config(ctx_obj["config_path"])
-    
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
     async def _run():
-        coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.on_event(_event_handler)
+        coordinator = _build_coordinator(config, ctx_obj)
         try:
             result = await coordinator.run("Review current uncommitted changes")
             SessionStore(ctx_obj["project_root"]).save(
@@ -375,26 +418,26 @@ def _run_review(ctx_obj: dict):
             console.print(Panel(Markdown(result), title="Review", border_style="white"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
 
 
 def _run_tests(ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.coordinator import Coordinator
-    
+
     console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
-    
-    config = load_config(ctx_obj["config_path"])
-    
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
     async def _run():
-        coordinator = Coordinator(config=config, project_root=ctx_obj["project_root"])
-        coordinator.on_event(_event_handler)
+        coordinator = _build_coordinator(config, ctx_obj)
         try:
             result = await coordinator.run("Run project tests and report results")
             console.print(Panel(Markdown(result), title="Test Results", border_style="magenta"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
 
@@ -439,7 +482,7 @@ def _run_status(ctx_obj: dict):
     console.print(Panel("System Status", title="Local Coder", border_style="cyan"))
     
     try:
-        config = load_config(ctx_obj["config_path"])
+        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
         console.print(f"[bold]Models Configured:[/bold] {len(config.models)}")
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
@@ -467,46 +510,77 @@ def _run_status(ctx_obj: dict):
         console.print("[red]Failed to connect (Is Ollama running?)[/red]")
 
 
+def _resolve_model_name(config, role) -> str:
+    """Mirror ModelManager.get_model's routing so this display is accurate."""
+    role_name = role.value
+    configured = config.agentic.role_models.get(role_name)
+    if configured and configured in config.models:
+        return configured
+    if role_name in config.models:
+        return role_name
+    if "default" in config.models:
+        return "default"
+    if config.models:
+        return next(iter(config.models))
+    return "[not configured]"
+
+
 def _show_agents(ctx_obj: dict):
+    from local_coder.agents import (
+        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, TesterAgent,
+    )
     from local_coder.orchestrator.config_loader import load_config
+    from local_coder.types import AgentRole
+
     try:
-        config = load_config(ctx_obj["config_path"])
+        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
-        
+
+    agent_classes = {
+        AgentRole.EXPLORER: ExplorerAgent,
+        AgentRole.PLANNER: PlannerAgent,
+        AgentRole.CODER: CoderAgent,
+        AgentRole.DEBUGGER: DebuggerAgent,
+        AgentRole.TESTER: TesterAgent,
+        AgentRole.REVIEWER: ReviewerAgent,
+    }
+
     table = Table(title="Configured Agents")
     table.add_column("Agent", style="cyan", no_wrap=True)
-    table.add_column("Model Name", style="magenta")
+    table.add_column("Model", style="magenta")
     table.add_column("System Prompt", style="green")
-    
-    for agent_name, agent_config in config.agents.items():
-        sys_prompt = agent_config.system_prompt[:50] + "..." if len(agent_config.system_prompt) > 50 else agent_config.system_prompt
-        table.add_row(agent_name, agent_config.model_name, sys_prompt)
-        
+
+    for role, agent_cls in agent_classes.items():
+        model_name = _resolve_model_name(config, role)
+        first_line = agent_cls.system_prompt.strip().splitlines()[0]
+        sys_prompt = first_line[:70] + "..." if len(first_line) > 70 else first_line
+        table.add_row(role.value, model_name, sys_prompt)
+
     console.print(table)
 
 
 def _show_models(ctx_obj: dict):
     from local_coder.orchestrator.config_loader import load_config
     try:
-        config = load_config(ctx_obj["config_path"])
+        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
-        
+
     table = Table(title="Configured Models")
     table.add_column("Model Name", style="cyan", no_wrap=True)
     table.add_column("Backend", style="blue")
     table.add_column("Model ID", style="magenta")
     table.add_column("Context Length", style="green")
-    
+
     for name, model in config.models.items():
         table.add_row(
-            name, 
-            model.backend, 
-            model.model_id, 
+            name,
+            model.backend.value,
+            model.model_id,
             str(model.context_length)
         )
-        
+
     console.print(table)

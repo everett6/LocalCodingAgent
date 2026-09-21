@@ -1,36 +1,43 @@
 {
-  "timestamp": "2026-09-20 00:54:41",
+  "timestamp": "2026-09-20 18:31:42",
   "kind": "mock_model_benchmark",
   "benchmarks": {
     "e2e_coordinator_run": {
       "iterations": 10,
-      "mean_ms": 0.446,
-      "p50_ms": 0.175,
-      "min_ms": 0.163,
-      "max_ms": 2.828
+      "mean_ms": 0.44,
+      "p50_ms": 0.181,
+      "min_ms": 0.164,
+      "max_ms": 2.762
     },
     "dag_scheduling": {
       "task_count": 25,
       "status": "completed",
-      "total_ms": 0.686,
-      "ms_per_task": 0.027
+      "total_ms": 1.08,
+      "ms_per_task": 0.043
     },
     "malformed_plan_fail_fast": {
       "status": "failed",
-      "elapsed_ms": 0.039,
+      "elapsed_ms": 0.033,
       "hung": false
     },
     "safety_classifier": {
       "iterations": 20000,
-      "total_ms": 40.197,
-      "classifications_per_second": 497550.0
+      "total_ms": 39.578,
+      "classifications_per_second": 505332.5
     },
     "drafter_cache": {
       "iterations": 50,
       "model_calls": 1,
       "cache_hits": 49,
-      "total_ms": 11.075,
-      "ms_per_call": 0.221
+      "total_ms": 10.937,
+      "ms_per_call": 0.219
+    },
+    "parallel_speedup": {
+      "task_count": 6,
+      "simulated_task_latency_ms": 50.0,
+      "sequential_ms": 300.99,
+      "parallel_ms": 50.455,
+      "speedup_x": 5.97
     }
   }
 }

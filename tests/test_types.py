@@ -205,8 +205,8 @@ class TestConfiguration:
 
     def test_approval_config(self):
         ac = ApprovalConfig()
-        assert ac.destructive_shell_commands is True
-        assert ac.git_push is True
+        assert ac.require_approval_for_commands is True
+        assert ac.require_approval_for_commits is True
 
     def test_verification_config(self):
         vc = VerificationConfig()

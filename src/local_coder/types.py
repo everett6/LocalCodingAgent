@@ -272,12 +272,14 @@ class AgentPermissions(BaseModel):
 
 
 class ApprovalConfig(BaseModel):
-    """What operations require human approval."""
-    destructive_shell_commands: bool = True
-    dependency_changes: bool = True
-    database_migrations: bool = True
-    large_file_deletions: bool = True
-    git_push: bool = True
+    """Controls whether ASK-risk actions pause for human approval.
+
+    When the relevant flag is True and no approval callback is wired in
+    (e.g. a headless/remote run), the action is denied rather than silently
+    allowed -- approval is opt-out only when explicitly configured.
+    """
+    require_approval_for_commands: bool = True
+    require_approval_for_commits: bool = True
 
 
 class VerificationConfig(BaseModel):

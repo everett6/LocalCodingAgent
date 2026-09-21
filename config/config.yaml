@@ -62,13 +62,12 @@ resources:
 #       - write_file
 #       - ...
 
-# Operations requiring human approval
+# Operations requiring human approval. When true and no interactive
+# approval handler is available (e.g. a headless/remote run), the action
+# is denied rather than silently allowed.
 approval:
-  destructive_shell_commands: true
-  dependency_changes: true
-  database_migrations: true
-  large_file_deletions: true
-  git_push: true
+  require_approval_for_commands: true
+  require_approval_for_commits: true
 
 # Verification loop settings
 verification:

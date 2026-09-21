@@ -59,10 +59,11 @@ class FakeModel:
         return ModelResponse(content=self.content, prompt_tokens=32, completion_tokens=16)
 
 
-def make_coordinator(project_root: str, model_latency_s: float = 0.0) -> Coordinator:
+def make_coordinator(project_root: str, model_latency_s: float = 0.0, max_parallel_agents: int = 1) -> Coordinator:
     config = ProjectConfig(project_root=project_root)
+    config.agentic.max_parallel_agents = max_parallel_agents
     coordinator = Coordinator(config=config, project_root=project_root)
-    coordinator.model_manager.get_model = lambda role: asyncio.sleep(
+    coordinator.model_manager.get_model = lambda role, model_name=None: asyncio.sleep(
         0, result=FakeModel(latency_s=model_latency_s)
     )
     return coordinator
@@ -120,6 +121,41 @@ async def benchmark_dag_scheduling(project_root: str, task_count: int = 25) -> d
         "status": result.status.value,
         "total_ms": round(elapsed_ms, 3),
         "ms_per_task": round(elapsed_ms / task_count, 3),
+    }
+
+
+async def benchmark_parallel_speedup(project_root: str, task_count: int = 6, task_latency_s: float = 0.05) -> dict:
+    """Independent (no depends_on) tasks should run concurrently when
+    agentic.max_parallel_agents > 1. Compares wall-clock time for the same
+    plan run sequentially (max_parallel_agents=1, today's default) vs. with
+    all tasks able to run at once."""
+    from local_coder.types import TaskPlan
+
+    def make_plan() -> "TaskPlan":
+        return TaskPlan(
+            objective="parallel speedup benchmark",
+            tasks=[
+                AgentTask(task_id=f"p{i}", role=AgentRole.CODER, objective=f"independent step {i}")
+                for i in range(task_count)
+            ],
+        )
+
+    sequential_coordinator = make_coordinator(project_root, model_latency_s=task_latency_s, max_parallel_agents=1)
+    start = time.perf_counter()
+    await sequential_coordinator._execute_plan(make_plan())
+    sequential_ms = (time.perf_counter() - start) * 1000
+
+    parallel_coordinator = make_coordinator(project_root, model_latency_s=task_latency_s, max_parallel_agents=task_count)
+    start = time.perf_counter()
+    await parallel_coordinator._execute_plan(make_plan())
+    parallel_ms = (time.perf_counter() - start) * 1000
+
+    return {
+        "task_count": task_count,
+        "simulated_task_latency_ms": round(task_latency_s * 1000, 1),
+        "sequential_ms": round(sequential_ms, 3),
+        "parallel_ms": round(parallel_ms, 3),
+        "speedup_x": round(sequential_ms / parallel_ms, 2) if parallel_ms else None,
     }
 
 
@@ -189,25 +225,29 @@ async def main():
 
     report = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": "mock_model_benchmark", "benchmarks": {}}
 
-    print("--- [1/5] End-to-end Coordinator.run() with fake model ---")
+    print("--- [1/6] End-to-end Coordinator.run() with fake model ---")
     report["benchmarks"]["e2e_coordinator_run"] = await benchmark_e2e_run(project_root)
     print(json.dumps(report["benchmarks"]["e2e_coordinator_run"], indent=2))
 
-    print("\n--- [2/5] DAG scheduling (25-task plan) ---")
+    print("\n--- [2/6] DAG scheduling (25-task plan) ---")
     report["benchmarks"]["dag_scheduling"] = await benchmark_dag_scheduling(project_root)
     print(json.dumps(report["benchmarks"]["dag_scheduling"], indent=2))
 
-    print("\n--- [3/5] Malformed (cyclic) plan fail-fast guard ---")
+    print("\n--- [3/6] Malformed (cyclic) plan fail-fast guard ---")
     report["benchmarks"]["malformed_plan_fail_fast"] = await benchmark_malformed_plan_fail_fast(project_root)
     print(json.dumps(report["benchmarks"]["malformed_plan_fail_fast"], indent=2))
 
-    print("\n--- [4/5] CommandPolicy safety classifier throughput ---")
+    print("\n--- [4/6] CommandPolicy safety classifier throughput ---")
     report["benchmarks"]["safety_classifier"] = benchmark_safety_classifier()
     print(json.dumps(report["benchmarks"]["safety_classifier"], indent=2))
 
-    print("\n--- [5/5] Speculative drafter cache ---")
+    print("\n--- [5/6] Speculative drafter cache ---")
     report["benchmarks"]["drafter_cache"] = await benchmark_drafter_cache()
     print(json.dumps(report["benchmarks"]["drafter_cache"], indent=2))
+
+    print("\n--- [6/6] Parallel sub-agent execution speedup ---")
+    report["benchmarks"]["parallel_speedup"] = await benchmark_parallel_speedup(project_root)
+    print(json.dumps(report["benchmarks"]["parallel_speedup"], indent=2))
 
     print("\n================ MOCK BENCHMARK REPORT ================")
     print(json.dumps(report, indent=2))

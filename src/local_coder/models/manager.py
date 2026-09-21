@@ -50,6 +50,8 @@ class ModelManager:
             # Explicit task routing wins, followed by configured role routing.
             role_name = role.value if isinstance(role, AgentRole) else role
             selected_name = model_name or self.config.agentic.role_models.get(role_name)
+            if selected_name is not None and selected_name not in self.config.models:
+                raise ValueError(f"Model not configured: {selected_name}")
             if selected_name in self.config.models:
                 model_name = selected_name
             elif role_name in self.config.models:

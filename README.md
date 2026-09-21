@@ -67,6 +67,11 @@ Long tool histories are compacted automatically while the system and task
 context remain available. Use `local-coder --model coding-model "..."` to route
 one run to a selected model.
 
+Independent tasks in a plan (no `depends_on` between them) run concurrently,
+bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
+sequential). Raise it to have several coder/tester/reviewer agents working
+different parts of a plan at the same time.
+
 For remote control from another terminal or machine on a trusted network,
 start the explicitly opt-in loopback server:
 
@@ -84,9 +89,17 @@ local-coder sessions
 local-coder resume auth-run
 ```
 
-The remote server binds to `127.0.0.1` by default and does not expose a public
-authentication layer, so put it behind an authenticated tunnel or reverse
-proxy before binding to a non-loopback interface.
+The remote server binds to `127.0.0.1` by default. A non-loopback bind requires
+a token, supplied directly or through `LOCAL_CODER_REMOTE_TOKEN`:
+
+```bash
+local-coder serve --host 0.0.0.0 --port 8787 --token "$LOCAL_CODER_REMOTE_TOKEN"
+curl -H "Authorization: Bearer $LOCAL_CODER_REMOTE_TOKEN" \
+	http://127.0.0.1:8787/status
+```
+
+Use an authenticated tunnel or reverse proxy as an additional boundary before
+exposing the service outside a trusted network.
 
 The default configuration expects an OpenAI-compatible server at `http://localhost:8090/v1`. Change the endpoint and model ID to match your local server.
 
@@ -95,6 +108,24 @@ Checkpoints save the current Git working tree locally under `.local-coder/checkp
 ## Safety
 
 All filesystem paths are resolved relative to the selected project workspace. Parent traversal and symlink escapes are rejected. Shell commands are classified as safe, approval-required, or blocked; tests and read-only inspection commands are safe by default, while package installation, Git mutation, privilege escalation, and destructive commands are restricted.
+
+Approval-required actions (an ASK-risk shell command, a git commit, or a git
+checkout) pause for a real decision instead of just failing:
+
+- Interactively (`local-coder ...`), you get a y/n prompt in the terminal
+  showing exactly what the agent wants to run.
+- Pass `--yolo` to auto-approve every risky action for that invocation
+  without prompting (equivalent to Claude Code's
+  `--dangerously-skip-permissions` or Cursor's auto-run) -- only use it in a
+  sandbox or on a branch you don't mind the agent breaking.
+- Headless/remote runs (`local-coder serve`, or any use of `Coordinator`
+  without wiring an approval callback) deny approval-required actions by
+  default; pass `--yolo` when starting `serve` to opt that server into
+  auto-approval explicitly.
+
+This is controlled by `approval.require_approval_for_commands` and
+`approval.require_approval_for_commits` in the config, both `true` by
+default.
 
 Agent runs are bounded by iteration, tool-call, and test-run limits. Verification failures are summarized before being passed to the debugger, and the final report records whether verification passed or exhausted its retry budget.
 

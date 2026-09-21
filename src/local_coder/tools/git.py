@@ -4,8 +4,9 @@ from typing import Any
 import subprocess
 import time
 
+from local_coder.approval import ApprovalCallback
 from local_coder.tools.base import Tool
-from local_coder.types import ToolName, ToolResult
+from local_coder.types import ApprovalConfig, ToolName, ToolResult
 from local_coder.workspace import Workspace
 
 
@@ -111,13 +112,26 @@ class GitCommitTool(Tool):
         },
         "required": ["message"]
     }
-    
-    def __init__(self, project_root: str):
+
+    def __init__(
+        self,
+        project_root: str,
+        approval: ApprovalConfig | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ):
         self.project_root = project_root
-        
+        self.approval = approval or ApprovalConfig()
+        self.approval_callback = approval_callback
+
     async def execute(self, message: str, files: list[str] | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
+            if self.approval.require_approval_for_commits:
+                if self.approval_callback is None:
+                    return ToolResult(success=False, output="Commit requires approval before execution.", duration_ms=int((time.time()-start_t)*1000))
+                approved = await self.approval_callback(f"Create git commit: {message!r}")
+                if not approved:
+                    return ToolResult(success=False, output="Commit denied by user.", duration_ms=int((time.time()-start_t)*1000))
             if files:
                 safe_files = [_safe_relative_path(self.project_root, path) for path in files]
                 add_cmd = ["git", "add"] + safe_files
@@ -150,13 +164,26 @@ class GitCheckoutTool(Tool):
         },
         "required": ["branch"]
     }
-    
-    def __init__(self, project_root: str):
+
+    def __init__(
+        self,
+        project_root: str,
+        approval: ApprovalConfig | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ):
         self.project_root = project_root
-        
+        self.approval = approval or ApprovalConfig()
+        self.approval_callback = approval_callback
+
     async def execute(self, branch: str, create: bool = False, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
+            if self.approval.require_approval_for_commits:
+                if self.approval_callback is None:
+                    return ToolResult(success=False, output="Checkout requires approval before execution.", duration_ms=int((time.time()-start_t)*1000))
+                approved = await self.approval_callback(f"Checkout branch: {branch} (create={create})")
+                if not approved:
+                    return ToolResult(success=False, output="Checkout denied by user.", duration_ms=int((time.time()-start_t)*1000))
             cmd = ["git", "checkout"]
             if create:
                 cmd.append("-b")
