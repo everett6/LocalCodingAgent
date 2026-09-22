@@ -75,3 +75,23 @@ def test_yolo_flag_is_accepted(tmp_path):
     result = CliRunner().invoke(cli, ["--project", str(tmp_path), "--yolo", "agents"])
 
     assert result.exit_code == 0
+
+
+def test_local_server_status_command_does_not_crash(tmp_path, monkeypatch):
+    from local_coder import local_server
+    monkeypatch.setattr(local_server, "STATE_DIR", tmp_path)
+
+    result = CliRunner().invoke(cli, ["local-server", "status"])
+
+    assert result.exit_code == 0
+    assert "big" in result.output
+    assert "draft" in result.output
+
+
+def test_local_server_models_command_does_not_crash(tmp_path, monkeypatch):
+    from local_coder import local_server
+    monkeypatch.setattr(local_server, "AI2_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli, ["local-server", "models"])
+
+    assert result.exit_code == 0

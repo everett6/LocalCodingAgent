@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import json
 from typing import Callable
@@ -10,11 +11,13 @@ from local_coder.types import (
 )
 from local_coder.agents import create_agent
 from local_coder.tools import create_tool_registry
+from local_coder.models.cache import PromptCache
 from local_coder.models.manager import ModelManager
 from local_coder.memory.store import MemoryStore
 from local_coder.context.repository import RepositoryContext
 from local_coder.scheduler.dag import TaskDAG
 from local_coder.scheduler.resources import ResourceManager
+from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
 
 
@@ -42,11 +45,28 @@ class Coordinator:
         self.model_manager = ModelManager(config)
         self.resource_manager = ResourceManager(config.resources)
         self._event_handlers: list[Callable] = []
+        # Shared across every drafter this Coordinator creates, so a repeated
+        # draft prompt (e.g. the same file across a fix-loop retry) can hit
+        # the cache instead of paying for another small-model round trip.
+        self._prompt_cache = PromptCache()
 
     def on_event(self, handler: Callable[[AgentEvent], None]) -> None:
         """Register event handler."""
         self._event_handlers.append(handler)
-    
+
+    async def _get_drafter(self) -> SpeculativeDrafter | None:
+        """Best-effort speculative drafter for file-editing roles (coder,
+        debugger). Only available when config.yaml has a "drafter" model
+        entry -- returns None otherwise so callers degrade to undrafted
+        execution instead of failing."""
+        if "drafter" not in self.config.models:
+            return None
+        try:
+            drafter_model = await self.model_manager.get_model("drafter")
+        except Exception:
+            return None
+        return SpeculativeDrafter(drafter_model, prompt_cache=self._prompt_cache)
+
     def _emit(self, source: str, event_type: str, message: str, **kwargs) -> None:
         event = AgentEvent(source=source, event_type=event_type, message=message, **kwargs)
         self._dispatch(event)
@@ -115,10 +135,29 @@ class Coordinator:
             self._emit("ORCHESTRATOR", "task_failed", "Verification did not pass within the retry limit")
         return report
     
+    def _session_cache_filename(self) -> str:
+        """Stable per-project filename for the disk-backed slot cache, so
+        different projects sharing one llama-server don't collide."""
+        digest = hashlib.sha256(os.path.abspath(self.project_root).encode()).hexdigest()[:16]
+        return f"local-coder-{digest}.bin"
+
     async def _explore(self, request: str) -> str:
+        model = await self.model_manager.get_model(AgentRole.EXPLORER)
+
+        # Exploration's prefix (system prompt + repository structure) is the
+        # part of the conversation most likely to be identical across
+        # separate runs on this project, so it's the one worth keeping warm
+        # on disk across a server restart. Both calls are best-effort and
+        # silently no-op on any backend that doesn't support them (e.g.
+        # Ollama, or a llama-server not started with --slot-save-path).
+        if self.config.agentic.session_cache:
+            restore = getattr(model, "restore_slot", None)
+            if restore is not None:
+                await restore(self._session_cache_filename())
+
         explorer = create_agent(
             AgentRole.EXPLORER,
-            await self.model_manager.get_model(AgentRole.EXPLORER),
+            model,
             self.tool_registry,
             self._dispatch,
             context_window_chars=self.config.agentic.context_window_chars,
@@ -127,9 +166,13 @@ class Coordinator:
         if explorer:
             task = AgentTask(role=AgentRole.EXPLORER, objective=request)
             response = await explorer.execute(task)
+            if self.config.agentic.session_cache:
+                save = getattr(model, "save_slot", None)
+                if save is not None:
+                    await save(self._session_cache_filename())
             return response.summary
         return "Exploration fallback: Checked repository structure."
-        
+
     async def _plan(self, request: str, exploration: str) -> TaskPlan:
         planner = create_agent(AgentRole.PLANNER, await self.model_manager.get_model(AgentRole.PLANNER), self.tool_registry, self._dispatch)
         if planner:
@@ -199,6 +242,7 @@ class Coordinator:
             self._dispatch,
             context_window_chars=self.config.agentic.context_window_chars,
             compact_context_chars=self.config.agentic.compact_context_chars,
+            drafter=await self._get_drafter(),
         )
         if coder:
             task = AgentTask(role=AgentRole.CODER, objective=f"Request: {request}\nContext: {exploration}")
@@ -295,6 +339,7 @@ class Coordinator:
         wave call this independently via asyncio.gather in _execute_plan."""
         async with semaphore:
             try:
+                drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
                 agent = create_agent(
                     task.role,
                     await self.model_manager.get_model(task.role, task.model_name),
@@ -302,6 +347,7 @@ class Coordinator:
                     self._dispatch,
                     context_window_chars=self.config.agentic.context_window_chars,
                     compact_context_chars=self.config.agentic.compact_context_chars,
+                    drafter=drafter,
                 )
                 if agent:
                     response = await agent.execute(task)
@@ -360,7 +406,13 @@ class Coordinator:
         )
         
     async def _fix_failures(self, test_result: AgentResponse) -> AgentResponse:
-        debugger = create_agent(AgentRole.DEBUGGER, await self.model_manager.get_model(AgentRole.DEBUGGER), self.tool_registry, self._dispatch)
+        debugger = create_agent(
+            AgentRole.DEBUGGER,
+            await self.model_manager.get_model(AgentRole.DEBUGGER),
+            self.tool_registry,
+            self._dispatch,
+            drafter=await self._get_drafter(),
+        )
         if debugger:
             failure_context = summarize_failures(test_result.summary)
             task = AgentTask(

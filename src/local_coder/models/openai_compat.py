@@ -54,7 +54,12 @@ class OpenAICompatibleBackend(BaseModelBackend):
             payload["tool_choice"] = "auto"
 
         try:
-            response = await self.client.post("/v1/chat/completions", json=payload)
+            # Relative to base_url, which is expected to already include the
+            # server's own "/v1" prefix (the OpenAI SDK convention, e.g.
+            # "http://localhost:8090/v1") -- httpx joins a leading-slash path
+            # onto base_url's own path rather than replacing it, so a
+            # "/v1/..." path here would request ".../v1/v1/...".
+            response = await self.client.post("/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as e:
@@ -114,7 +119,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
         }
 
         try:
-            async with self.client.stream("POST", "/v1/chat/completions", json=payload) as response:
+            async with self.client.stream("POST", "/chat/completions", json=payload) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line or not line.startswith("data: "):
@@ -139,7 +144,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def is_available(self) -> bool:
         """Check if the server is reachable and model exists."""
         try:
-            response = await self.client.get("/v1/models", timeout=5.0)
+            response = await self.client.get("/models", timeout=5.0)
             if response.status_code == 200:
                 return True
             return False
@@ -149,7 +154,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def get_model_info(self) -> dict:
         """Get model details from /v1/models."""
         try:
-            response = await self.client.get(f"/v1/models/{self.config.model_id}", timeout=5.0)
+            response = await self.client.get(f"/models/{self.config.model_id}", timeout=5.0)
             if response.status_code == 200:
                 data = response.json()
                 info = await super().get_model_info()
@@ -166,3 +171,48 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def close(self):
         """Close HTTP client."""
         await self.client.aclose()
+
+    def _server_root_url(self) -> str:
+        """The /slots endpoint lives at the llama-server root, not under the
+        configured base_url's "/v1" path (base_url is expected to already
+        include "/v1" -- see generate()'s comment)."""
+        base = str(self.client.base_url).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return base
+
+    async def save_slot(self, filename: str, slot_id: int = 0) -> bool:
+        """Persist a slot's KV cache to disk so it survives a server
+        restart, via llama-server's /slots API (requires the server to be
+        started with --slot-save-path; a 400 here most likely means it
+        wasn't). Best-effort: returns False rather than raising on any
+        failure -- this is purely a latency optimization for the next
+        prefill, and its absence must never break a run.
+        """
+        try:
+            response = await self.client.post(
+                f"{self._server_root_url()}/slots/{slot_id}",
+                params={"action": "save"},
+                json={"filename": filename},
+                timeout=120.0,
+            )
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    async def restore_slot(self, filename: str, slot_id: int = 0) -> bool:
+        """Reload a previously saved slot KV cache from disk. A subsequent
+        generate() call whose messages share a prefix with what was saved
+        will skip re-computing that shared prefix (llama-server's own
+        longest-common-prefix prompt-cache matching, enabled by default).
+        Best-effort, see save_slot()."""
+        try:
+            response = await self.client.post(
+                f"{self._server_root_url()}/slots/{slot_id}",
+                params={"action": "restore"},
+                json={"filename": filename},
+                timeout=120.0,
+            )
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False

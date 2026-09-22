@@ -252,3 +252,123 @@ def test_execute_plan_respects_max_parallel_agents_limit(tmp_path):
 
     assert result.status == TaskStatus.COMPLETED
     assert max_in_flight == 1
+
+
+class FakeModelWithSlotCache(FakeModel):
+    """A backend that supports llama-server's disk-backed slot cache."""
+
+    def __init__(self, content: str):
+        super().__init__(content)
+        self.restore_calls: list[str] = []
+        self.save_calls: list[str] = []
+
+    async def restore_slot(self, filename: str, slot_id: int = 0) -> bool:
+        self.restore_calls.append(filename)
+        return True
+
+    async def save_slot(self, filename: str, slot_id: int = 0) -> bool:
+        self.save_calls.append(filename)
+        return True
+
+
+def test_explore_restores_and_saves_session_cache_when_enabled(tmp_path):
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.agentic.session_cache = True
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    model = FakeModelWithSlotCache("Explored the repo.")
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(0, result=model)
+
+    summary = run(coordinator._explore("Add a feature"))
+
+    assert summary == "Explored the repo."
+    filename = coordinator._session_cache_filename()
+    assert model.restore_calls == [filename]
+    assert model.save_calls == [filename]
+
+
+def test_explore_skips_session_cache_when_disabled(tmp_path):
+    config = ProjectConfig(project_root=str(tmp_path))
+    assert config.agentic.session_cache is False  # default
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    model = FakeModelWithSlotCache("Explored the repo.")
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(0, result=model)
+
+    run(coordinator._explore("Add a feature"))
+
+    assert model.restore_calls == []
+    assert model.save_calls == []
+
+
+def test_explore_tolerates_backends_without_slot_cache_support(tmp_path):
+    """FakeModel has no restore_slot/save_slot at all (like OllamaBackend) --
+    enabling session_cache must not crash against it."""
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.agentic.session_cache = True
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(
+        0, result=FakeModel("Explored the repo.")
+    )
+
+    summary = run(coordinator._explore("Add a feature"))
+
+    assert summary == "Explored the repo."
+
+
+def test_session_cache_filename_is_stable_and_project_specific(tmp_path):
+    config = ProjectConfig(project_root=str(tmp_path))
+    coordinator_a = Coordinator(config=config, project_root=str(tmp_path))
+    coordinator_a2 = Coordinator(config=config, project_root=str(tmp_path))
+    coordinator_b = Coordinator(config=config, project_root=str(tmp_path / "other"))
+
+    assert coordinator_a._session_cache_filename() == coordinator_a2._session_cache_filename()
+    assert coordinator_a._session_cache_filename() != coordinator_b._session_cache_filename()
+    assert coordinator_a._session_cache_filename().endswith(".bin")
+
+
+def test_get_drafter_returns_none_without_a_configured_drafter_model(tmp_path):
+    coordinator = make_coordinator(tmp_path)  # default config has no "drafter" model entry
+
+    drafter = run(coordinator._get_drafter())
+
+    assert drafter is None
+
+
+def test_get_drafter_builds_a_working_drafter_when_configured(tmp_path):
+    from local_coder.speculative.drafter import SpeculativeDrafter
+    from local_coder.types import ModelConfig, ModelBackend
+
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.models["drafter"] = ModelConfig(
+        name="drafter", backend=ModelBackend.OPENAI_COMPAT, model_id="fast-model",
+        base_url="http://localhost:1234/v1",
+    )
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(
+        0, result=FakeModel("draft")
+    )
+
+    drafter = run(coordinator._get_drafter())
+
+    assert isinstance(drafter, SpeculativeDrafter)
+    # Shares the Coordinator's own PromptCache instance across drafters.
+    assert drafter._prompt_cache is coordinator._prompt_cache
+
+
+def test_execute_simple_wires_the_drafter_through_to_the_coder_agent(tmp_path):
+    """End-to-end through the real path _execute_simple takes: a configured
+    drafter model must actually reach the CoderAgent it creates."""
+    from local_coder.types import ModelConfig, ModelBackend
+
+    config = ProjectConfig(project_root=str(tmp_path))
+    config.models["drafter"] = ModelConfig(
+        name="drafter", backend=ModelBackend.OPENAI_COMPAT, model_id="fast-model",
+        base_url="http://localhost:1234/v1",
+    )
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(
+        0, result=FakeModel("Done.")
+    )
+
+    response = run(coordinator._execute_simple("Add a feature", "exploration notes"))
+
+    assert response.status == TaskStatus.COMPLETED

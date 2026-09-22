@@ -295,6 +295,12 @@ class AgenticConfig(BaseModel):
     context_window_chars: int = 24000
     compact_context_chars: int = 12000
     max_parallel_agents: int = 1
+    # Disk-backed KV cache for the exploration prefix (llama-server's
+    # /slots save/restore API; requires the server to be started with
+    # --slot-save-path). Off by default: it requires that specific server
+    # support and is a no-op (silently ignored) otherwise. See README.md's
+    # "Local model server" section.
+    session_cache: bool = False
 
 
 class ProjectConfig(BaseModel):

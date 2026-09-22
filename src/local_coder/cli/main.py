@@ -259,6 +259,108 @@ def rollback(ctx, checkpoint_id):
         raise click.ClickException(str(exc)) from exc
 
 
+@cli.group(name="local-server")
+def local_server_group():
+    """Start, stop, and choose models for this machine's local inference server(s)."""
+
+
+@local_server_group.command(name="models")
+def local_server_models():
+    """List GGUF quantizations available on disk for the big model."""
+    from local_coder import local_server
+
+    available = local_server.list_available_models()
+    if not available:
+        console.print(f"[red]No quants found under {local_server.AI2_DIR}/models/quants/[/red]")
+        return
+    table = Table(title="Available local models")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Size", style="magenta")
+    table.add_column("Notes", style="green")
+    for info in available:
+        table.add_row(info.name, f"{info.size_gb} GB", info.note)
+    console.print(table)
+    console.print("Switch with [bold]local-coder local-server start --quant <name>[/bold]")
+
+
+@local_server_group.command(name="status")
+def local_server_status():
+    """Show whether the big and draft model servers are running and healthy."""
+    from local_coder import local_server
+
+    state = local_server.status()
+    table = Table(title="Local server status")
+    table.add_column("Server", style="cyan")
+    table.add_column("PID", style="magenta")
+    table.add_column("Port", style="blue")
+    table.add_column("Healthy", style="green")
+    for which, info in state.items():
+        healthy = "[green]yes[/green]" if info["healthy"] else "[red]no[/red]"
+        table.add_row(which, str(info["pid"] or "-"), str(info["port"]), healthy)
+    console.print(table)
+
+
+@local_server_group.command(name="start")
+@click.option("--quant", default="q2_k", show_default=True, help="Which GGUF quant to load for the big model.")
+@click.option("--n-ctx", default=65536, show_default=True, type=int, help="Context length in tokens.")
+@click.option("--no-slot-cache", is_flag=True, help="Disable the disk-backed session cache (--slot-save-path).")
+@click.option("--no-draft", is_flag=True, help="Skip starting the small draft model.")
+@click.option("--wait/--no-wait", default=True, help="Wait for the server(s) to become healthy before returning.")
+def local_server_start(quant, n_ctx, no_slot_cache, no_draft, wait):
+    """Start the big model (and, by default, the draft model)."""
+    from local_coder import local_server
+
+    result = local_server.start_big_model(quant=quant, n_ctx=n_ctx, slot_cache=not no_slot_cache)
+    console.print(f"Big model ({quant}): {result['status']} (pid {result.get('pid', '-')})")
+    if not no_draft:
+        try:
+            draft_result = local_server.start_draft_model()
+            console.print(f"Draft model: {draft_result['status']} (pid {draft_result.get('pid', '-')})")
+        except FileNotFoundError as exc:
+            console.print(f"[yellow]Draft model not started:[/yellow] {exc}")
+
+    if wait:
+        console.print("Waiting for the big model to warm up (can take 1-2 minutes)...")
+        if local_server.wait_healthy("big"):
+            console.print("[green]Big model is ready.[/green]")
+        else:
+            console.print(f"[red]Big model did not become healthy -- check {local_server.STATE_DIR / 'big_model.log'}[/red]")
+
+
+@local_server_group.command(name="switch")
+@click.option("--quant", required=True, help="Which GGUF quant to switch to.")
+@click.option("--n-ctx", default=65536, show_default=True, type=int)
+@click.option("--no-slot-cache", is_flag=True)
+@click.option("--wait/--no-wait", default=True)
+def local_server_switch(quant, n_ctx, no_slot_cache, wait):
+    """Stop the big model and restart it with a different quant (llama-server can't hot-swap weights)."""
+    from local_coder import local_server
+
+    result = local_server.switch_big_model(quant=quant, n_ctx=n_ctx, slot_cache=not no_slot_cache)
+    console.print(f"Big model ({quant}): {result['status']} (pid {result.get('pid', '-')})")
+    if wait:
+        console.print("Waiting for the big model to warm up (can take 1-2 minutes)...")
+        if local_server.wait_healthy("big"):
+            console.print("[green]Big model is ready.[/green]")
+        else:
+            console.print(f"[red]Big model did not become healthy -- check {local_server.STATE_DIR / 'big_model.log'}[/red]")
+
+
+@local_server_group.command(name="stop")
+@click.option("--big/--no-big", default=True)
+@click.option("--draft/--no-draft", default=True)
+def local_server_stop(big, draft):
+    """Stop the running server(s)."""
+    from local_coder import local_server
+
+    if big:
+        result = local_server.stop("big")
+        console.print(f"Big model: {result['status']}")
+    if draft:
+        result = local_server.stop("draft")
+        console.print(f"Draft model: {result['status']}")
+
+
 async def _cli_approval_callback(description: str) -> bool:
     """Prompt the user in the terminal for a risky action. Runs inline in
     the same event loop as the agent -- blocking on input here is fine

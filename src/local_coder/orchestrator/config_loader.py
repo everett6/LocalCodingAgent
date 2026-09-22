@@ -86,6 +86,7 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
         context_window_chars=agentic_data.get("context_window_chars", 24000),
         compact_context_chars=agentic_data.get("compact_context_chars", 12000),
         max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
+        session_cache=agentic_data.get("session_cache", False),
     )
     
     return ProjectConfig(

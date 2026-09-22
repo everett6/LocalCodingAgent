@@ -9,7 +9,10 @@ models:
     backend: openai_compatible
     model_id: "Qwen3-30B-A3B-Instruct-2507"
     base_url: "http://localhost:8090/v1"
-    context_length: 8192
+    # Matches the llama-server this repo's AI2 stack actually launches with
+    # (`-c 65536`). A literal 500000 was requested but does not fit this
+    # card: see the "Local model server" section of README.md.
+    context_length: 65536
     temperature: 0.3
     max_tokens: 4096
     estimated_vram_mb: 9000
@@ -20,7 +23,7 @@ models:
     backend: openai_compatible
     model_id: "Qwen3-30B-A3B-Instruct-2507"
     base_url: "http://localhost:8090/v1"
-    context_length: 8192
+    context_length: 65536
     temperature: 0.2
     max_tokens: 4096
     estimated_vram_mb: 5000
@@ -31,21 +34,26 @@ models:
     backend: openai_compatible
     model_id: "Qwen3-30B-A3B-Instruct-2507"
     base_url: "http://localhost:8090/v1"
-    context_length: 8192
+    context_length: 65536
     temperature: 0.1
     max_tokens: 4096
     estimated_vram_mb: 5000
 
-  # Small draft model for predictive drafting
+  # Small, genuinely separate draft model for predictive drafting, served
+  # on its own port (see README.md's "Local model server" section). This
+  # used to point at the SAME 30B model/server as everything else, which
+  # defeated the point: a draft call competed for the one GPU slot the main
+  # agent call also needed instead of running cheaply alongside it.
+  # Qwen2.5-Coder-0.5B fully offloads in under 1GB and runs at ~500 tok/s.
   drafter:
     name: drafter
     backend: openai_compatible
-    model_id: "Qwen3-30B-A3B-Instruct-2507"
-    base_url: "http://localhost:8090/v1"
-    context_length: 4096
+    model_id: "Qwen2.5-Coder-0.5B-Instruct"
+    base_url: "http://localhost:8091/v1"
+    context_length: 8192
     temperature: 0.4
     max_tokens: 2048
-    estimated_vram_mb: 500
+    estimated_vram_mb: 700
 
 # Resource management
 resources:
@@ -75,7 +83,14 @@ verification:
   run_tests_after_changes: true
   require_review: true
 
-# Agentic routing and bounded context
+# Agentic routing and bounded context. context_window_chars/compact_context_chars
+# are sized off the server's real 65536-token window (see models.*.context_length
+# and README.md's "Local model server" section): ~61k tokens are left for
+# conversation history after reserving max_tokens for the reply, and at a
+# conservative ~3.3 chars/token for code that is roughly 200k characters.
+# 180000/90000 leaves headroom below that ceiling instead of the previous
+# 24000/12000, which was sized for an 8192-token server and compacted after
+# using well under a tenth of the real context.
 agentic:
   role_models:
     planner: orchestrator
@@ -83,9 +98,14 @@ agentic:
     reviewer: reviewer
     tester: reviewer
     debugger: coder
-  context_window_chars: 24000
-  compact_context_chars: 12000
+  context_window_chars: 180000
+  compact_context_chars: 90000
   max_parallel_agents: 1
+  # The AI2 llama-server this config points at is launched with
+  # --slot-save-path (see README.md's "Local model server" section), so the
+  # exploration prefix's KV cache survives a server restart instead of
+  # needing a full re-prefill.
+  session_cache: true
 
 # Logging
 log_level: INFO

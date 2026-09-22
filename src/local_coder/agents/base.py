@@ -1,5 +1,6 @@
 """Base agent with tool-calling loop."""
 from __future__ import annotations
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -16,13 +17,29 @@ logger = logging.getLogger(__name__)
 
 class BaseAgent:
     """Base agent with model interaction and tool-calling loop."""
-    
+
     role: AgentRole
     system_prompt: str
     max_iterations: int = 15  # Max tool-calling rounds
     max_tool_calls: int = 100
     max_test_runs: int = 20
-    
+    # Stagnation guard: a small local model is much likelier than a frontier
+    # one to retry an identical failing tool call instead of changing
+    # approach. After this many IDENTICAL (name + arguments) failing calls in
+    # a row, inject a corrective nudge; after this many more, give up rather
+    # than silently burning the rest of the iteration budget on a call that
+    # has never once succeeded.
+    stagnation_warning_threshold: int = 3
+    stagnation_abort_threshold: int = 5
+    # A quantized local model occasionally emits a tool call whose
+    # arguments aren't valid JSON (single quotes, a truncated brace) --
+    # llama-server's parser rejects that with a 500 rather than truncating
+    # or repairing it. That's usually just a bad sample, not a structural
+    # failure, so retry generation this many extra times (with a short
+    # backoff) before giving up on the whole task over one glitch.
+    generation_retry_limit: int = 2
+    generation_retry_backoff_seconds: float = 0.5
+
     def __init__(
         self,
         model,  # LocalModel protocol
@@ -30,6 +47,7 @@ class BaseAgent:
         event_callback: Callable[[AgentEvent], None] | None = None,
         context_window_chars: int = 24000,
         compact_context_chars: int = 12000,
+        drafter=None,  # Optional[SpeculativeDrafter]
     ):
         self.model = model
         self.tool_registry = tool_registry
@@ -42,15 +60,70 @@ class BaseAgent:
         self.state: AgentState | None = None
         self.context_window_chars = context_window_chars
         self.compact_context_chars = compact_context_chars
-    
+        self._last_failing_call_signature: str | None = None
+        self._repeated_failure_count: int = 0
+        self._stagnation_warned: bool = False
+        self.drafter = drafter
+
     async def execute(self, task: AgentTask) -> AgentResponse:
-        """Execute a task through the tool-calling loop."""
+        """Execute a task through the tool-calling loop, optionally primed
+        with a speculative draft of the first relevant file's edit."""
+        draft_prediction = None
+        if self.drafter is not None and task.files:
+            draft_prediction = await self._maybe_draft(task)
+
+        response = await self._execute_loop(task, draft_prediction)
+
+        if draft_prediction is not None:
+            self._settle_draft(draft_prediction, response)
+        return response
+
+    async def _maybe_draft(self, task: AgentTask):
+        """Best-effort speculative draft of the first listed file's edit,
+        using the same tool the model would use to read it. Never raises --
+        a failure here just means no draft, not a broken task."""
+        file_path = task.files[0]
+        try:
+            result = await self.tool_registry.execute_tool(self.role, "read_file", {"path": file_path})
+            if not result.success:
+                return None
+            return await self.drafter.predict_edit(file_path, result.output, task.objective)
+        except Exception:
+            return None
+
+    def _settle_draft(self, draft_prediction, response: AgentResponse) -> None:
+        """Feed back whether the draft actually matched what the agent did,
+        so PredictionPolicy's should_predict() adapts over time instead of
+        drafting forever regardless of whether it ever helps."""
+        useful = (
+            response.status == TaskStatus.COMPLETED
+            and draft_prediction.file_path in response.files_changed
+        )
+        if useful:
+            self.drafter.accept_prediction(draft_prediction.prediction_id)
+        else:
+            self.drafter.reject_prediction(draft_prediction.prediction_id)
+
+    async def _execute_loop(self, task: AgentTask, draft_prediction) -> AgentResponse:
         # Build initial messages
         messages = self._build_messages(task)
+        if draft_prediction is not None:
+            messages.append(Message(
+                role="system",
+                content=(
+                    f"Speculative draft for {draft_prediction.file_path} (unverified -- a "
+                    "fast draft model's guess, not applied to any file). Use it as a "
+                    "starting point if it looks right; verify and correct it before relying "
+                    f"on it, don't apply it blindly:\n{draft_prediction.content}"
+                ),
+            ))
         self._files_changed.clear()
         self._metrics = AgentMetrics()
         self._tests_run = []
         self._tests_passed = True
+        self._last_failing_call_signature = None
+        self._repeated_failure_count = 0
+        self._stagnation_warned = False
         self.state = AgentState(
             task_id=task.task_id,
             objective=task.objective,
@@ -73,23 +146,50 @@ class BaseAgent:
                 task_id=task.task_id,
             )
 
-            try:
-                response = await self.model.generate(
-                    messages,
-                    temperature=self.model.config.temperature if hasattr(self.model, "config") else 0.2,
-                    max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
-                    tools=self.tool_registry.get_schemas_for_role(self.role),
-                )
-            except Exception as exc:
+            base_temperature = self.model.config.temperature if hasattr(self.model, "config") else 0.2
+            response = None
+            generation_error: Exception | None = None
+            for attempt in range(self.generation_retry_limit + 1):
+                try:
+                    # A malformed-tool-call-JSON failure from a quantized
+                    # model can be a near-deterministic mode of the
+                    # distribution at this exact prompt, not just sampling
+                    # noise -- retrying with the same temperature reproduces
+                    # it every time. Nudge temperature up a bit each retry
+                    # to actually diversify the sample instead of repeating
+                    # the same bad draw, capped so it doesn't get incoherent.
+                    retry_temperature = min(base_temperature + 0.15 * attempt, 1.0)
+                    response = await self.model.generate(
+                        messages,
+                        temperature=retry_temperature,
+                        max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
+                        tools=self.tool_registry.get_schemas_for_role(self.role),
+                    )
+                    generation_error = None
+                    break
+                except Exception as exc:
+                    generation_error = exc
+                    if attempt < self.generation_retry_limit:
+                        self._emit_event(
+                            "model_retry",
+                            f"Generation failed ({exc}); retrying ({attempt + 1}/{self.generation_retry_limit})",
+                            task_id=task.task_id,
+                        )
+                        await asyncio.sleep(self.generation_retry_backoff_seconds)
+
+            if generation_error is not None:
+                total_attempts = self.generation_retry_limit + 1
                 self.state.phase = AgentPhase.FAILED
-                self.state.errors.append(f"Model generation failed: {exc}")
+                self.state.errors.append(
+                    f"Model generation failed after {total_attempts} attempts: {generation_error}"
+                )
                 self.state.finished_at = datetime.now()
-                self._emit_event("model_error", str(exc), task_id=task.task_id)
+                self._emit_event("model_error", str(generation_error), task_id=task.task_id)
                 return self._build_response(
                     task,
                     ModelResponse(content="Model generation failed."),
                     TaskStatus.FAILED,
-                    issues=[f"Model generation failed: {exc}"],
+                    issues=[f"Model generation failed after {total_attempts} attempts: {generation_error}"],
                 )
             
             # Track metrics
@@ -183,7 +283,22 @@ class BaseAgent:
                     ))
                 if not result.success:
                     self.state.errors.append(result.error or result.output)
-                
+
+                # Stagnation tracking: has this exact (tool, arguments) call
+                # just failed again, identically to the immediately preceding
+                # call? Anything else -- a different call, or this one
+                # finally succeeding -- resets the streak.
+                call_signature = f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, default=str)}"
+                if not result.success and call_signature == self._last_failing_call_signature:
+                    self._repeated_failure_count += 1
+                elif not result.success:
+                    self._repeated_failure_count = 1
+                    self._stagnation_warned = False
+                else:
+                    self._repeated_failure_count = 0
+                    self._stagnation_warned = False
+                self._last_failing_call_signature = call_signature if not result.success else None
+
                 # Add tool result as message
                 tool_output = result.output
                 if not result.success and result.error:
@@ -201,6 +316,45 @@ class BaseAgent:
                     f"{tc.name}: {'succeeded' if result.success else 'failed'}",
                     task_id=task.task_id,
                 )
+
+                if self._repeated_failure_count >= self.stagnation_abort_threshold:
+                    self.state.phase = AgentPhase.FAILED
+                    self.state.errors.append(
+                        f"Aborted: {tc.name} failed identically {self._repeated_failure_count} times in a row"
+                    )
+                    self.state.finished_at = datetime.now()
+                    self._emit_event(
+                        "stagnation_abort",
+                        f"Giving up after {self._repeated_failure_count} identical failing calls to {tc.name}",
+                        task_id=task.task_id,
+                    )
+                    return self._build_response(
+                        task,
+                        ModelResponse(content=f"Stuck repeating a failing {tc.name} call; aborting."),
+                        TaskStatus.FAILED,
+                        issues=[
+                            f"Repeated the same failing {tc.name} call "
+                            f"{self._repeated_failure_count} times without making progress"
+                        ],
+                    )
+                if self._repeated_failure_count >= self.stagnation_warning_threshold and not self._stagnation_warned:
+                    self._stagnation_warned = True
+                    messages.append(Message(
+                        role="system",
+                        content=(
+                            f"You have called {tc.name} with the exact same arguments "
+                            f"{self._repeated_failure_count} times in a row and it keeps failing the "
+                            "same way. Repeating it again will not help. Read the error carefully, "
+                            "then either fix the underlying cause, use different arguments, or try a "
+                            "different tool entirely."
+                        ),
+                    ))
+                    self.state.messages = list(messages)
+                    self._emit_event(
+                        "stagnation_warning",
+                        f"Nudged the model after {self._repeated_failure_count} identical failing calls to {tc.name}",
+                        task_id=task.task_id,
+                    )
         
         # Max iterations reached
         self.state.phase = AgentPhase.FAILED

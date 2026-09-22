@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Coding Agent</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --panel: #fafaf9;
+    --panel-alt: #f4f3f1;
+    --border: #e7e5e2;
+    --text: #1c1c1a;
+    --text-dim: #86847e;
+    --text-mid: #57564f;
+    --accent: #c96442;
+    --accent-weak: #f4e3dc;
+    --green: #3d8a5f;
+    --green-weak: #e4f2e9;
+    --red: #c4433a;
+    --red-weak: #fbe8e6;
+    --yellow: #b5860b;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+    font-size: 13.5px; height: 100vh; display: flex; flex-direction: column;
+  }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 10px 16px;
+    background: var(--bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  header h1 { font-size: 13.5px; font-weight: 600; margin: 0; color: var(--text); }
+  #statusDot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); display: inline-block; flex-shrink: 0; }
+  #statusDot.ok { background: var(--green); }
+  #statusDot.bad { background: var(--red); }
+  header .project { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+  header .spacer { flex: 1; }
+
+  #gpuBar { display: flex; align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel); font-size: 11.5px; color: var(--text-mid); }
+  #gpuBar[hidden] { display: none; }
+  #gpuBar .gpu-name { color: var(--text-dim); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #gpuBar .gpu-meter { width: 46px; height: 5px; border-radius: 3px; background: var(--panel-alt); overflow: hidden; position: relative; }
+  #gpuBar .gpu-meter i { position: absolute; inset: 0; width: 0%; background: var(--accent); display: block; }
+  #gpuBar .gpu-stat { white-space: nowrap; }
+
+  #settingsToggle { background: none; border: 1px solid var(--border); color: var(--text-dim); width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 13px; padding: 0; }
+  #settingsToggle:hover { color: var(--text); border-color: var(--text-dim); }
+  #settingsPanel { position: absolute; top: 46px; right: 16px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 20px rgba(0,0,0,.08); padding: 12px; width: 240px; z-index: 10; }
+  #settingsPanel[hidden] { display: none; }
+  #settingsPanel label { font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px; }
+  #settingsPanel input { width: 100%; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 12px; }
+
+  main { flex: 1; display: flex; min-height: 0; position: relative; }
+  aside {
+    width: 250px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 18px;
+  }
+  aside h2 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); margin: 0 0 8px 2px; font-weight: 600; }
+
+  .session-item {
+    padding: 7px 8px; border-radius: 7px; cursor: default; font-size: 12px; color: var(--text-mid);
+    display: flex; flex-direction: column; gap: 3px; margin-bottom: 2px;
+  }
+  .session-item:hover { background: var(--panel-alt); }
+  .session-item .phase { color: var(--accent); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em; }
+  .session-item .req { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sessionList .empty { color: var(--text-dim); font-size: 12px; padding: 4px 2px; }
+
+  .server-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; background: var(--bg); border: 1px solid var(--border); margin-bottom: 6px; }
+  .server-row .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); flex-shrink: 0; }
+  .server-row .dot.healthy { background: var(--green); }
+  .server-row .dot.running { background: var(--yellow); }
+  .server-row .name { font-weight: 600; font-size: 12px; }
+  .server-row .state { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+
+  select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 8px; border-radius: 7px; font-size: 12px; margin-bottom: 8px;
+  }
+  .cmd-row { display: flex; gap: 6px; }
+  .cmd-row button { flex: 1; padding: 6px 4px; font-size: 11.5px; }
+
+  #content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 10px;
+    max-width: 720px;
+  }
+  #log .empty-state { color: var(--text-dim); font-size: 14px; padding: 24px 4px; }
+
+  /* Narration: the plain-prose lines the orchestrator/agents say between
+     tool calls -- rendered like ordinary chat text, not a log line. */
+  p.narration {
+    margin: 0; font-size: 14px; line-height: 1.65; color: var(--text);
+  }
+  p.narration .src-tag {
+    font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .03em;
+    margin-right: 6px; opacity: .75;
+  }
+  .src-ORCHESTRATOR { color: var(--accent); }
+  .src-EXPLORER { color: var(--green); }
+  .src-PLANNER { color: var(--yellow); }
+  .src-CODER { color: #3568b0; }
+  .src-DEBUGGER { color: var(--red); }
+  .src-TESTER { color: #7c5cbf; }
+  .src-REVIEWER { color: var(--text-mid); }
+
+  /* Tool-call activity collapses into one row, like Claude Code's "Ran N
+     commands" -- expanded only on click, so the transcript reads as prose
+     with occasional collapsed detail instead of a raw event dump. */
+  .cmd-group { font-size: 13px; }
+  .cmd-group .summary {
+    display: flex; align-items: center; gap: 6px; color: var(--text-dim);
+    cursor: pointer; padding: 3px 0; user-select: none;
+  }
+  .cmd-group .summary:hover { color: var(--text-mid); }
+  .cmd-group .summary .chevron { font-size: 9px; transition: transform .12s ease; display: inline-block; }
+  .cmd-group.open .summary .chevron { transform: rotate(90deg); }
+  .cmd-group .detail {
+    display: none; margin: 4px 0 2px 4px; padding-left: 10px; border-left: 2px solid var(--border);
+    flex-direction: column; gap: 3px;
+  }
+  .cmd-group.open .detail { display: flex; }
+  .cmd-group .detail .line { font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
+  .cmd-group .detail .line .mono { color: var(--text-mid); }
+  .cmd-group .detail .line.failed .mono { color: var(--red); }
+
+  .report {
+    margin: 4px 0; padding: 14px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); white-space: pre-wrap; font-size: 13.5px; line-height: 1.65;
+  }
+  .report.error { border-color: var(--red); background: var(--red-weak); color: var(--red); }
+
+  #composer {
+    flex-shrink: 0; border-top: 1px solid var(--border); background: var(--bg); padding: 12px 20px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #requestInput {
+    width: 100%; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: var(--radius); padding: 9px 11px; font-family: inherit; font-size: 13px; resize: vertical;
+    min-height: 44px;
+  }
+  #requestInput:focus { outline: none; border-color: var(--accent); }
+  #composer .row { display: flex; gap: 8px; align-items: center; }
+  button {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 14px; border-radius: 8px; font-family: inherit; font-size: 12.5px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { opacity: .9; color: #fff; }
+  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+  button:disabled { opacity: .45; cursor: default; }
+  #composer .spacer { flex: 1; }
+  #composer .hint { color: var(--text-dim); font-size: 11px; }
+  ::-webkit-scrollbar { width: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="statusDot"></span>
+  <h1>Local Coding Agent</h1>
+  <span class="project">project: <b id="projectRoot" class="mono">-</b></span>
+  <span class="spacer"></span>
+  <div id="gpuBar" hidden>
+    <span class="gpu-name mono" id="gpuName"></span>
+    <span class="gpu-stat mono" id="gpuUtil"></span>
+    <div class="gpu-meter"><i id="gpuMeterFill"></i></div>
+    <span class="gpu-stat mono" id="gpuMem"></span>
+    <span class="gpu-stat mono" id="gpuTemp"></span>
+  </div>
+  <button id="settingsToggle" title="Settings">&#9881;</button>
+  <div id="settingsPanel" hidden>
+    <label for="tokenInput">Access token</label>
+    <input type="password" id="tokenInput" placeholder="only needed for non-loopback binds">
+  </div>
+</header>
+<main>
+  <aside>
+    <div>
+      <h2>Sessions</h2>
+      <div id="sessionList"><div class="empty">No sessions yet</div></div>
+    </div>
+    <div>
+      <h2>Local server</h2>
+      <div class="server-row">
+        <span class="dot" id="bigDot"></span>
+        <span class="name">Big model</span>
+        <span class="state" id="bigState">unknown</span>
+      </div>
+      <div class="server-row">
+        <span class="dot" id="draftDot"></span>
+        <span class="name">Draft model</span>
+        <span class="state" id="draftState">unknown</span>
+      </div>
+      <select id="quantSelect"></select>
+      <div class="cmd-row">
+        <button id="startServerBtn" title="Start big + draft model">Start</button>
+        <button id="switchServerBtn" title="Restart big model with the selected quant">Switch</button>
+        <button id="stopServerBtn" class="danger" title="Stop big + draft model">Stop</button>
+      </div>
+    </div>
+  </aside>
+  <div id="content">
+    <div id="log"><div class="empty-state">Describe a task below, or Plan/Review without one.</div></div>
+    <div id="composer">
+      <textarea id="requestInput" placeholder="Describe what you want done, e.g. &quot;Add input validation to the signup form&quot;"></textarea>
+      <div class="row">
+        <button class="primary" id="runBtn">Run</button>
+        <button id="planBtn">Plan only</button>
+        <button id="reviewBtn">Review changes</button>
+        <span class="spacer"></span>
+        <span class="hint" id="hint">Risky actions (shell commands, git commits) are denied unless the server was started with --yolo.</span>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const log = $("log");
+  const sessionList = $("sessionList");
+  const statusDot = $("statusDot");
+  const tokenInput = $("tokenInput");
+  tokenInput.value = localStorage.getItem("lc_token") || "";
+  tokenInput.addEventListener("input", () => localStorage.setItem("lc_token", tokenInput.value));
+
+  $("settingsToggle").addEventListener("click", () => {
+    $("settingsPanel").hidden = !$("settingsPanel").hidden;
+  });
+  document.addEventListener("click", (e) => {
+    if (!$("settingsPanel").hidden && !$("settingsPanel").contains(e.target) && e.target !== $("settingsToggle")) {
+      $("settingsPanel").hidden = true;
+    }
+  });
+
+  function authHeaders() {
+    const t = tokenInput.value.trim();
+    return t ? { "Authorization": "Bearer " + t } : {};
+  }
+
+  async function api(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { status: res.status, data });
+    return data;
+  }
+
+  function fmtTime(iso) {
+    try { return new Date(iso).toLocaleTimeString(); } catch (e) { return ""; }
+  }
+
+  // Tool-call chatter (one line per iteration/call/result) is the "thinking"
+  // noise Claude Code collapses into "Ran N commands" -- everything else
+  // (phase narration, completion, errors) is prose the agent is "saying".
+  const COMMAND_EVENT_TYPES = new Set(["iteration_started", "tool_call", "tool_result", "model_retry"]);
+
+  let currentGroup = null; // { source, el, countEl, detailEl, count }
+
+  function clearEmptyState() {
+    const empty = log.querySelector(".empty-state");
+    if (empty) empty.remove();
+  }
+
+  function startGroup(source) {
+    clearEmptyState();
+    const el = document.createElement("div");
+    el.className = "cmd-group";
+    el.innerHTML =
+      '<div class="summary">' +
+        '<span class="chevron">&#9656;</span>' +
+        '<span class="src-' + source + '"></span>' +
+        '<span class="count"></span>' +
+      '</div>' +
+      '<div class="detail"></div>';
+    el.querySelector(".src-" + source).textContent = source;
+    const summary = el.querySelector(".summary");
+    summary.addEventListener("click", () => el.classList.toggle("open"));
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+    return { source, el, countEl: el.querySelector(".count"), detailEl: el.querySelector(".detail"), count: 0 };
+  }
+
+  function addToGroup(ev) {
+    if (!currentGroup || currentGroup.source !== ev.source) {
+      currentGroup = startGroup(ev.source);
+    }
+    currentGroup.count += 1;
+    currentGroup.countEl.textContent = "Ran " + currentGroup.count + (currentGroup.count === 1 ? " command" : " commands");
+    const line = document.createElement("div");
+    line.className = "line" + (/failed/i.test(ev.message || "") ? " failed" : "");
+    line.innerHTML = '<span class="ts mono">' + fmtTime(ev.timestamp) + '</span> <span class="mono"></span>';
+    line.querySelector(".mono:last-child").textContent = ev.message || "";
+    currentGroup.detailEl.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function appendNarration(ev) {
+    currentGroup = null; // narration breaks the current command group
+    clearEmptyState();
+    const p = document.createElement("p");
+    p.className = "narration";
+    const tag = document.createElement("span");
+    tag.className = "src-tag src-" + (ev.source || "");
+    tag.textContent = ev.source || "";
+    p.appendChild(tag);
+    p.appendChild(document.createTextNode(ev.message || ""));
+    log.appendChild(p);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function appendEvent(ev) {
+    if (COMMAND_EVENT_TYPES.has(ev.event_type)) {
+      addToGroup(ev);
+    } else {
+      appendNarration(ev);
+    }
+  }
+
+  function appendReport(text, isError) {
+    currentGroup = null;
+    clearEmptyState();
+    const div = document.createElement("div");
+    div.className = "report" + (isError ? " error" : "");
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  let lastSeq = 0; // highest event.seq already rendered -- see remote.py's _event()
+  let polling = null;
+
+  async function pollEvents() {
+    try {
+      const data = await api("GET", "/events");
+      const events = (data.events || []).filter((ev) => ev.seq > lastSeq);
+      events.forEach(appendEvent);
+      if (events.length) lastSeq = events[events.length - 1].seq;
+      statusDot.className = "ok";
+    } catch (e) {
+      statusDot.className = "bad";
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const data = await api("GET", "/status");
+      $("projectRoot").textContent = data.project_root || "-";
+      statusDot.className = "ok";
+      renderSessions(data.sessions || []);
+    } catch (e) {
+      statusDot.className = "bad";
+    }
+  }
+
+  function renderSessions(sessions) {
+    if (!sessions.length) {
+      sessionList.innerHTML = '<div class="empty">No sessions yet</div>';
+      return;
+    }
+    sessionList.innerHTML = "";
+    sessions.slice(0, 50).forEach((s) => {
+      const div = document.createElement("div");
+      div.className = "session-item";
+      div.innerHTML = '<span class="phase"></span><span class="req"></span>';
+      div.querySelector(".phase").textContent = s.phase || "";
+      div.querySelector(".req").textContent = (s.request || s.session_id || "").slice(0, 60);
+      div.title = s.session_id + " - " + (s.updated_at || "");
+      sessionList.appendChild(div);
+    });
+  }
+
+  function setBusy(busy) {
+    ["runBtn", "planBtn", "reviewBtn"].forEach((id) => { $(id).disabled = busy; });
+  }
+
+  async function submit(kind) {
+    const request = $("requestInput").value.trim();
+    if (kind !== "review" && !request) return;
+    setBusy(true);
+    currentGroup = null;
+    log.innerHTML = "";
+    // /events is one shared ring buffer across every past run, not scoped
+    // to this one -- snapshot the highest seq already in it first, so
+    // polling only renders events appended after this click, not replayed
+    // history from earlier runs.
+    try {
+      const before = await api("GET", "/events");
+      const events = before.events || [];
+      lastSeq = events.length ? events[events.length - 1].seq : 0;
+    } catch (e) {
+      lastSeq = 0;
+    }
+    polling = setInterval(pollEvents, 1000);
+    try {
+      const path = "/" + kind;
+      const body = kind === "review" ? {} : { request };
+      const data = await api("POST", path, body);
+      await pollEvents();
+      appendReport(data.result || "(no result)", false);
+    } catch (e) {
+      appendReport("Error: " + e.message, true);
+    } finally {
+      clearInterval(polling);
+      setBusy(false);
+      refreshStatus();
+    }
+  }
+
+  $("runBtn").addEventListener("click", () => submit("run"));
+  $("planBtn").addEventListener("click", () => submit("plan"));
+  $("reviewBtn").addEventListener("click", () => submit("review"));
+  $("requestInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit("run");
+  });
+
+  // --- GPU usage bar ---
+  async function pollGpu() {
+    try {
+      const data = await api("GET", "/gpu");
+      const bar = $("gpuBar");
+      if (!data.available || !data.gpus || !data.gpus.length) {
+        bar.hidden = true;
+        return;
+      }
+      const gpu = data.gpus[0];
+      bar.hidden = false;
+      $("gpuName").textContent = gpu.name;
+      $("gpuUtil").textContent = Math.round(gpu.utilization_pct) + "%";
+      $("gpuMeterFill").style.width = Math.min(100, (gpu.memory_used_mb / gpu.memory_total_mb) * 100) + "%";
+      $("gpuMem").textContent = (gpu.memory_used_mb / 1024).toFixed(1) + "/" + (gpu.memory_total_mb / 1024).toFixed(1) + "GB";
+      $("gpuTemp").textContent = Math.round(gpu.temperature_c) + "°C";
+    } catch (e) {
+      $("gpuBar").hidden = true;
+    }
+  }
+
+  // --- Local server panel ---
+  let modelsLoaded = false;
+
+  async function loadModels() {
+    if (modelsLoaded) return;
+    try {
+      const data = await api("GET", "/local-server/models");
+      const select = $("quantSelect");
+      select.innerHTML = "";
+      (data.models || []).forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = m.name;
+        opt.textContent = m.name + " (" + m.size_gb + "GB) - " + m.note;
+        select.appendChild(opt);
+      });
+      if (!data.models || !data.models.length) {
+        const opt = document.createElement("option");
+        opt.textContent = "no quants found on disk";
+        opt.disabled = true;
+        select.appendChild(opt);
+      }
+      modelsLoaded = true;
+    } catch (e) { /* server-side quant listing unavailable; leave select empty */ }
+  }
+
+  function renderServerDot(el, entry) {
+    el.className = "dot" + (entry.healthy ? " healthy" : entry.process_running ? " running" : "");
+  }
+
+  async function pollLocalServer() {
+    try {
+      const data = await api("GET", "/local-server/status");
+      renderServerDot($("bigDot"), data.big);
+      renderServerDot($("draftDot"), data.draft);
+      $("bigState").textContent = data.big.healthy ? "healthy" : data.big.process_running ? "starting" : "stopped";
+      $("draftState").textContent = data.draft.healthy ? "healthy" : data.draft.process_running ? "starting" : "stopped";
+    } catch (e) { /* local-server routes unavailable (e.g. no AI2 stack); leave dots as-is */ }
+  }
+
+  function setServerButtonsBusy(busy) {
+    ["startServerBtn", "switchServerBtn", "stopServerBtn"].forEach((id) => { $(id).disabled = busy; });
+  }
+
+  $("startServerBtn").addEventListener("click", async () => {
+    setServerButtonsBusy(true);
+    try {
+      await api("POST", "/local-server/start", { quant: $("quantSelect").value || "q2_k" });
+    } catch (e) { appendReport("Start failed: " + e.message, true); }
+    finally { setServerButtonsBusy(false); pollLocalServer(); }
+  });
+  $("switchServerBtn").addEventListener("click", async () => {
+    if (!$("quantSelect").value) return;
+    setServerButtonsBusy(true);
+    try {
+      await api("POST", "/local-server/switch", { quant: $("quantSelect").value });
+    } catch (e) { appendReport("Switch failed: " + e.message, true); }
+    finally { setServerButtonsBusy(false); pollLocalServer(); }
+  });
+  $("stopServerBtn").addEventListener("click", async () => {
+    setServerButtonsBusy(true);
+    try {
+      await api("POST", "/local-server/stop", {});
+    } catch (e) { appendReport("Stop failed: " + e.message, true); }
+    finally { setServerButtonsBusy(false); pollLocalServer(); }
+  });
+
+  refreshStatus();
+  loadModels();
+  pollLocalServer();
+  pollGpu();
+  setInterval(refreshStatus, 5000);
+  setInterval(pollLocalServer, 5000);
+  setInterval(pollGpu, 4000);
+})();
+</script>
+</body>
+</html>

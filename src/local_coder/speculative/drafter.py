@@ -34,6 +34,9 @@ class DraftStats(BaseModel):
         return self.total_latency_ms / self.total if self.total > 0 else 0.0
 
 
+_DEFINITION_LINE = re.compile(r"^\s*(def|class|async def|function|const|let|var)\s")
+
+
 class DeltaAttention:
     """Application-level attention over changed and task-relevant code regions.
 
@@ -41,25 +44,75 @@ class DeltaAttention:
     attention weights or claim native DeltaNet/speculative decoding support.
     """
 
-    def focus(self, objective: str, content: str, max_lines: int = 80) -> str:
+    def focus(
+        self,
+        objective: str,
+        content: str,
+        max_lines: int = 80,
+        context_radius: int = 2,
+    ) -> str:
+        """Score every line, then keep the highest-scoring ones AND a small
+        window of their neighbors (context_radius on each side).
+
+        A changed or objective-relevant line taken in isolation usually
+        doesn't mean much to a draft model -- "return timeout" only makes
+        sense next to the function it's returning from. Selecting isolated
+        single lines (the previous behavior) threw that context away.
+        """
         objective_terms = {
             term.lower()
             for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]+", objective)
             if len(term) > 2
         }
+        # Word-boundary patterns, not substring checks: a plain `term in
+        # line` match on "class" would also fire on "subclass" or
+        # "classify", diluting the score with false positives.
+        term_patterns = [re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE) for term in objective_terms]
+
         lines = content.splitlines()
         scored = []
         for index, line in enumerate(lines):
-            score = 0
+            score = 0.0
             if line.startswith(("+", "-")):
-                score += 4
-            if any(term in line.lower() for term in objective_terms):
-                score += 2
+                score += 4.0
+            # Weight by how many DISTINCT objective terms a line matches,
+            # not just whether any single one does -- a line hitting two
+            # or three terms from the objective is more likely to be the
+            # relevant one than a line that happens to share one common word.
+            matching_terms = sum(1 for pattern in term_patterns if pattern.search(line))
+            score += matching_terms * 2.0
+            if _DEFINITION_LINE.match(line):
+                # Definitions anchor whatever's selected near them -- worth
+                # a small bonus even with no other signal, since a selected
+                # line inside a function is far more useful alongside its
+                # own `def` line than floating with no header at all.
+                score += 1.5
             if line.strip():
-                score += 1
+                score += 0.5
             scored.append((score, index, line))
-        selected = sorted(scored, key=lambda item: (-item[0], item[1]))[:max_lines]
-        return "\n".join(f"{index + 1}: {line}" for _, index, line in sorted(selected, key=lambda item: item[1]))
+
+        ranked = sorted(scored, key=lambda item: (-item[0], item[1]))
+        selected_indices: set[int] = set()
+        for score, index, _line in ranked:
+            if len(selected_indices) >= max_lines:
+                break
+            if score <= 0:
+                continue
+            selected_indices.add(index)
+            for offset in range(1, context_radius + 1):
+                if len(selected_indices) >= max_lines:
+                    break
+                for neighbor in (index - offset, index + offset):
+                    if 0 <= neighbor < len(lines):
+                        selected_indices.add(neighbor)
+
+        if not selected_indices:
+            # Nothing scored (e.g. an objective with no matching terms and
+            # a diff-free file): fall back to the head of the file instead
+            # of returning an empty focus window.
+            selected_indices = set(range(min(max_lines, len(lines))))
+
+        return "\n".join(f"{i + 1}: {lines[i]}" for i in sorted(selected_indices))
 
 
 class PredictionPolicy:
