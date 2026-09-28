@@ -2,7 +2,7 @@
 
 from local_coder.approval import ApprovalCallback
 from local_coder.tools.base import ToolRegistry
-from local_coder.tools.filesystem import ReadFileTool, WriteFileTool, ListFilesTool, ApplyPatchTool
+from local_coder.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListFilesTool, ApplyPatchTool
 from local_coder.tools.search import SearchFilesTool, GrepTool
 from local_coder.tools.git import GitStatusTool, GitDiffTool, GitLogTool, GitCommitTool, GitCheckoutTool
 from local_coder.tools.shell import RunCommandTool
@@ -26,6 +26,7 @@ def create_tool_registry(
     # Filesystem tools
     registry.register(ReadFileTool(project_root))
     registry.register(WriteFileTool(project_root))
+    registry.register(EditFileTool(project_root))
     registry.register(ListFilesTool(project_root))
     registry.register(ApplyPatchTool(project_root))
 

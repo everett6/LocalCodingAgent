@@ -17,7 +17,7 @@ Your methodology:
 1. Use tools to read the specific files mentioned in stack traces.
 2. Form a hypothesis about the root cause.
 3. Verify your hypothesis by reading related dependencies or calling relevant tools.
-4. Implement the fix using file editing tools.
+4. Implement the fix using file editing tools, preferring edit_file for targeted changes.
 
 When complete, DO NOT call any more tools.
 Respond with a markdown summary containing:

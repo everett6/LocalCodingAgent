@@ -149,6 +149,17 @@ something else; after 5 it gives up on the task rather than silently
 burning the rest of the iteration budget on a call that has never once
 succeeded.
 
+**Targeted edits:** Coder, Debugger, and Tester agents get an `edit_file`
+tool that replaces an exact snippet of a file (`old_string` -> `new_string`,
+optionally `replace_all`), alongside `write_file` and `apply_patch`. Small
+local models get whole-file rewrites and unified diffs wrong far more often
+than a copy-and-replace, so the prompts steer them to `edit_file` for changes
+to existing files. A failed edit explains how to recover: an ambiguous match
+lists every matching line, and a match that differs only in whitespace
+names the line to re-read. CRLF files keep their line endings. `apply_patch`
+now reports which files it changed, so patch edits show up in task summaries
+and in the drafter's accept/reject signal like other edits do.
+
 Independent tasks in a plan (no `depends_on` between them) run concurrently,
 bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
 sequential). Raise it to have several coder/tester/reviewer agents working

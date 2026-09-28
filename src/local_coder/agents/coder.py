@@ -19,7 +19,8 @@ Guidelines:
 - Add or update type hints, comments, and docstrings appropriately.
 - Ensure you understand the surrounding code before making edits.
 
-Use file editing tools to safely modify code. 
+Use file editing tools to safely modify code. Prefer edit_file (exact search-and-replace) for
+changes to existing files, and use write_file only for new files or full rewrites.
 Once you have successfully applied all required changes and are confident they are correct, stop calling tools.
 Respond with a markdown summary of the changes you made, explaining your reasoning and noting any design choices.
 """

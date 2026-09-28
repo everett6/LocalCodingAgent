@@ -48,19 +48,19 @@ class ToolRegistry:
                 ToolName.GIT_STATUS, ToolName.GIT_LOG, ToolName.GIT_DIFF,
             },
             AgentRole.CODER: {
-                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.APPLY_PATCH,
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH,
                 ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG, ToolName.GIT_COMMIT,
                 ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
             },
             AgentRole.DEBUGGER: {
-                ToolName.READ_FILE, ToolName.WRITE_FILE,
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE,
                 ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
                 ToolName.RUN_COMMAND, ToolName.RUN_TESTS,
             },
             AgentRole.TESTER: {
-                ToolName.READ_FILE, ToolName.WRITE_FILE,
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE,
                 ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF,
                 ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,

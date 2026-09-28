@@ -50,6 +50,7 @@ class ModelBackend(str, enum.Enum):
 class ToolName(str, enum.Enum):
     READ_FILE = "read_file"
     WRITE_FILE = "write_file"
+    EDIT_FILE = "edit_file"
     APPLY_PATCH = "apply_patch"
     LIST_FILES = "list_files"
     SEARCH_FILES = "search_files"
