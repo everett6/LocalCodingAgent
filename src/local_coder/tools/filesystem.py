@@ -16,7 +16,10 @@ def _resolve_and_check_path(project_root: str, path: str) -> Path:
 
 class ReadFileTool(Tool):
     name = ToolName.READ_FILE
-    description = "Read a file's contents."
+    description = (
+        "Read a file's contents. Large files are returned a page at a time; the output "
+        "ends with the start_line to pass to read the next page."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -26,7 +29,12 @@ class ReadFileTool(Tool):
         },
         "required": ["path"]
     }
-    
+    # One page is bounded on lines and characters, and one pathological
+    # line (minified code, an embedded blob) can't eat the whole page.
+    max_chars = 10000
+    max_lines = 1000
+    max_line_chars = 1000
+
     def __init__(self, project_root: str):
         self.project_root = project_root
         
@@ -40,13 +48,29 @@ class ReadFileTool(Tool):
             def _read() -> str:
                 with open(target, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-                if start_line is not None or end_line is not None:
-                    sl = max(1, start_line or 1) - 1
-                    el = end_line or len(lines)
-                    lines = lines[sl:el]
-                content = "".join(lines)
-                if len(content) > 10000:
-                    return content[:10000] + "\n...[TRUNCATED: output exceeded 10000 chars]..."
+                total = len(lines)
+                first = max(1, start_line or 1)
+                last = min(end_line or total, total)
+                if total and first > total:
+                    return f"[start_line {first} is past the end of {path} ({total} lines)]"
+                page: list[str] = []
+                used = 0
+                for line in lines[first - 1:last]:
+                    if len(line) > self.max_line_chars:
+                        line = line[:self.max_line_chars] + f"...[line truncated, {len(line)} chars]\n"
+                    if page and (len(page) >= self.max_lines or used + len(line) > self.max_chars):
+                        break
+                    page.append(line)
+                    used += len(line)
+                content = "".join(page)
+                shown_last = first + len(page) - 1
+                if shown_last < last:
+                    if not content.endswith("\n"):
+                        content += "\n"
+                    content += (
+                        f"[Showing lines {first}-{shown_last} of {total}. "
+                        f"Call read_file with start_line={shown_last + 1} to continue.]"
+                    )
                 return content
                 
             content = await asyncio.to_thread(_read)
