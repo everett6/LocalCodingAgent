@@ -498,6 +498,40 @@ class Coordinator:
         response = await agent.execute(task)
         return response.summary
 
+    async def validate_finding(self, finding: str, paths: list[str] | None = None) -> str:
+        """Red-team companion to the reviewer: reproduce an already-identified
+        finding in this project's own code as a local PoC test, so a fix can be
+        verified. Requires a concrete finding; refuses anything out of scope."""
+        finding = (finding or "").strip()
+        if not finding:
+            return (
+                "A specific, already-identified finding is required. Run `local-coder security` "
+                "first, then pass one of its findings to validate. This tool only reproduces "
+                "findings in this project's own code; it does not go looking for something to attack."
+            )
+        agent = create_agent(
+            AgentRole.EXPLOIT_VALIDATOR,
+            await self.model_manager.get_model(AgentRole.EXPLOIT_VALIDATOR),
+            self.tool_registry,
+            self._dispatch,
+        )
+        task = AgentTask(
+            role=AgentRole.EXPLOIT_VALIDATOR,
+            objective=(
+                "Reproduce this already-identified vulnerability in THIS project's own code as a "
+                f"proof-of-concept test, so a maintainer can confirm it and verify a fix:\n{finding}"
+            ),
+            files=paths or [],
+            constraints=[
+                "Only this repository's own code; only the finding above.",
+                "Write the PoC as a pytest test under tests/security_poc/; do not modify other project code.",
+                "Offline only: no network, no external hosts, no DoS, no evasion or persistence, no credential harvesting.",
+                "If the task would require anything above, refuse and explain instead.",
+            ],
+        )
+        response = await agent.execute(task)
+        return response.summary
+
     async def run_tests_only(self) -> str:
         """Just run tests and report."""
         res = await self._run_tests()

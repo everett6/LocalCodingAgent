@@ -55,6 +55,7 @@ def _event_handler(event):
         "TESTER": "bold magenta",
         "REVIEWER": "bold white",
         "SECURITY": "bold bright_red",
+        "EXPLOIT_VALIDATOR": "bold red",
     }
     color = source_colors.get(event.source, "white")
     console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
@@ -83,6 +84,7 @@ def cli(ctx, config, project, model, debug, yolo):
         local-coder plan "Refactor auth"
         local-coder review
         local-coder security
+        local-coder validate-finding "SQL injection in ..."
         local-coder test
     """
     ctx.ensure_object(dict)
@@ -134,6 +136,20 @@ def review(ctx):
 def security(ctx, paths, focus):
     """Red/blue team security review of the project (read-only)."""
     _run_security(ctx.obj, list(paths), focus)
+
+
+@cli.command(name="validate-finding")
+@click.argument("finding", nargs=-1, required=True)
+@click.option("--path", "paths", multiple=True, help="File(s) the finding is in (repeatable)")
+@click.pass_context
+def validate_finding(ctx, finding, paths):
+    """Reproduce an already-identified security finding in this repo as a local PoC test.
+
+    Red-team companion to `security`: pass a finding it reported (with its file:line) to
+    confirm the vulnerability is real and get a test that fails once it is fixed.
+    Operates only on this project's own code.
+    """
+    _run_validate_finding(ctx.obj, " ".join(finding), list(paths))
 
 
 @cli.command()
@@ -456,6 +472,8 @@ def _interactive_mode(ctx_obj: dict):
                 elif cmd == "/security":
                     focus = user_input[len("/security"):].strip() or None
                     _run_security(ctx_obj, [], focus)
+                elif cmd == "/validate-finding":
+                    _run_validate_finding(ctx_obj, user_input[len("/validate-finding"):].strip(), [])
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
                 elif cmd == "/checkpoint":
@@ -476,6 +494,7 @@ Available commands:
   /plan <request>  : Create a plan without executing
   /review          : Review current uncommitted changes
   /security [focus]: Red/blue team security review (read-only)
+  /validate-finding <desc> : Reproduce an identified finding as a local PoC test
   /test            : Run tests and report results
     /checkpoint      : Save the current working tree
     /checkpoints     : List saved checkpoints
@@ -557,6 +576,33 @@ def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
                 f"local-{uuid.uuid4().hex[:8]}", request=f"Security review: {focus or scope}", phase="security", result=result
             )
             console.print(Panel(Markdown(result), title="Security Review", border_style="bright_red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    asyncio.run(_run())
+
+
+def _run_validate_finding(ctx_obj: dict, finding: str, paths: list[str]):
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionStore
+
+    if not finding.strip():
+        console.print("[red]Provide the finding to validate, e.g. the file:line and what is wrong.[/red]")
+        return
+
+    console.print(Panel("Validating a security finding (local PoC)", title="Local Coder - Validate Finding", border_style="red"))
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        try:
+            result = await coordinator.validate_finding(finding, paths)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Validate finding: {finding[:80]}", phase="validate-finding", result=result
+            )
+            console.print(Panel(Markdown(result), title="Finding Validation", border_style="red"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
@@ -668,7 +714,8 @@ def _resolve_model_name(config, role) -> str:
 
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
-        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, SecurityAgent, TesterAgent,
+        CoderAgent, DebuggerAgent, ExplorerAgent, ExploitValidatorAgent, PlannerAgent, ReviewerAgent,
+        SecurityAgent, TesterAgent,
     )
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.types import AgentRole
@@ -687,6 +734,7 @@ def _show_agents(ctx_obj: dict):
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
         AgentRole.SECURITY: SecurityAgent,
+        AgentRole.EXPLOIT_VALIDATOR: ExploitValidatorAgent,
     }
 
     table = Table(title="Configured Agents")

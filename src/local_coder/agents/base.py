@@ -380,7 +380,10 @@ class BaseAgent:
     def _format_task(self, task: AgentTask) -> str:
         """Format a task into a user message. Override in subclasses for custom formatting."""
         parts = [f"## Objective\n{task.objective}"]
-        
+
+        if task.context.guidelines:
+            parts.append("## Project Guidelines (AGENTS.md)\n" + task.context.guidelines)
+
         if task.files:
             parts.append("## Relevant Files\n" + "\n".join(f"- {f}" for f in task.files))
         

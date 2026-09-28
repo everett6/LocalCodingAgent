@@ -18,6 +18,7 @@ class AgentRole(str, enum.Enum):
     TESTER = "tester"
     REVIEWER = "reviewer"
     SECURITY = "security"
+    EXPLOIT_VALIDATOR = "exploit_validator"
 
 
 class TaskStatus(str, enum.Enum):
@@ -148,6 +149,7 @@ class AgentTask(BaseModel):
 class TaskContext(BaseModel):
     """Context provided to an agent for a task."""
     architecture: str = ""
+    guidelines: str = ""
     relevant_symbols: list[str] = Field(default_factory=list)
     previous_findings: list[str] = Field(default_factory=list)
     file_contents: dict[str, str] = Field(default_factory=dict)

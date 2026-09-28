@@ -80,6 +80,15 @@ class ToolRegistry:
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
                 ToolName.LINT, ToolName.SECURITY_SCAN,
             },
+            # Red-team companion: reproduce an already-identified finding as a
+            # local PoC test. It can write test files and run tests, but has no
+            # tool that reaches outside the workspace (no shell, no git mutation).
+            AgentRole.EXPLOIT_VALIDATOR: {
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.LIST_FILES,
+                ToolName.SEARCH_FILES, ToolName.GREP,
+                ToolName.GIT_STATUS, ToolName.GIT_DIFF,
+                ToolName.SECURITY_SCAN, ToolName.RUN_TESTS,
+            },
             AgentRole.ORCHESTRATOR: set(ToolName),  # Full access
         }
     
