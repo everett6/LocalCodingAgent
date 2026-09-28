@@ -17,6 +17,7 @@ class AgentRole(str, enum.Enum):
     DEBUGGER = "debugger"
     TESTER = "tester"
     REVIEWER = "reviewer"
+    SECURITY = "security"
 
 
 class TaskStatus(str, enum.Enum):
@@ -65,6 +66,7 @@ class ToolName(str, enum.Enum):
     BUILD = "build"
     LINT = "lint"
     FORMAT_CODE = "format_code"
+    SECURITY_SCAN = "security_scan"
 
 
 # === Messages ===

@@ -54,6 +54,7 @@ def _event_handler(event):
         "DEBUGGER": "bold red",
         "TESTER": "bold magenta",
         "REVIEWER": "bold white",
+        "SECURITY": "bold bright_red",
     }
     color = source_colors.get(event.source, "white")
     console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
@@ -81,6 +82,7 @@ def cli(ctx, config, project, model, debug, yolo):
 
         local-coder plan "Refactor auth"
         local-coder review
+        local-coder security
         local-coder test
     """
     ctx.ensure_object(dict)
@@ -123,6 +125,15 @@ def plan(ctx, request):
 def review(ctx):
     """Review current uncommitted changes."""
     _run_review(ctx.obj)
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+@click.option("--focus", help="What to concentrate on, e.g. 'auth' or 'injection in the API handlers'")
+@click.pass_context
+def security(ctx, paths, focus):
+    """Red/blue team security review of the project (read-only)."""
+    _run_security(ctx.obj, list(paths), focus)
 
 
 @cli.command()
@@ -442,6 +453,9 @@ def _interactive_mode(ctx_obj: dict):
                         console.print("[red]Please provide a request to plan.[/red]")
                 elif cmd == "/review":
                     _run_review(ctx_obj)
+                elif cmd == "/security":
+                    focus = user_input[len("/security"):].strip() or None
+                    _run_security(ctx_obj, [], focus)
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
                 elif cmd == "/checkpoint":
@@ -461,6 +475,7 @@ Available commands:
   /status          : Show system status
   /plan <request>  : Create a plan without executing
   /review          : Review current uncommitted changes
+  /security [focus]: Red/blue team security review (read-only)
   /test            : Run tests and report results
     /checkpoint      : Save the current working tree
     /checkpoints     : List saved checkpoints
@@ -518,6 +533,30 @@ def _run_review(ctx_obj: dict):
                 f"local-{uuid.uuid4().hex[:8]}", request="Review current uncommitted changes", phase="review", result=result
             )
             console.print(Panel(Markdown(result), title="Review", border_style="white"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    asyncio.run(_run())
+
+
+def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionStore
+
+    scope = ", ".join(paths) if paths else "whole project"
+    console.print(Panel(f"Security review: {scope}", title="Local Coder - Security", border_style="bright_red"))
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        try:
+            result = await coordinator.security_review(paths, focus)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Security review: {focus or scope}", phase="security", result=result
+            )
+            console.print(Panel(Markdown(result), title="Security Review", border_style="bright_red"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
@@ -629,7 +668,7 @@ def _resolve_model_name(config, role) -> str:
 
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
-        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, TesterAgent,
+        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, SecurityAgent, TesterAgent,
     )
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.types import AgentRole
@@ -647,6 +686,7 @@ def _show_agents(ctx_obj: dict):
         AgentRole.DEBUGGER: DebuggerAgent,
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
+        AgentRole.SECURITY: SecurityAgent,
     }
 
     table = Table(title="Configured Agents")

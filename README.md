@@ -160,6 +160,48 @@ names the line to re-read. CRLF files keep their line endings. `apply_patch`
 now reports which files it changed, so patch edits show up in task summaries
 and in the drafter's accept/reject signal like other edits do.
 
+**Lint and format:** `lint` runs the project's linter and reports problems
+without touching files; `format_code` formats in place and reports which
+files it rewrote. Both auto-detect the language from its marker file
+(`pyproject.toml`, `package.json`, `go.mod`, `Cargo.toml`) and pick the first
+installed tool -- ruff or flake8, eslint, go vet, clippy for linting; ruff
+format or black, prettier, gofmt, cargo fmt for formatting -- preferring a
+project-local `node_modules/.bin` binary over `PATH`. The model can name one
+of those tools and pass workspace paths, but never an arbitrary command, so
+neither needs the shell approval flow. Review roles get `lint` only.
+
+## Security review (red and blue team)
+
+`local-coder security` runs a read-only security agent over the project
+(`/security` in interactive mode):
+
+```bash
+local-coder security                          # whole project
+local-coder security src/api --focus "auth and injection in request handlers"
+```
+
+The agent works both sides: it maps the attack surface and traces untrusted
+input to dangerous sinks (injection, path traversal, SSRF, unsafe
+deserialization, missing authorization, secrets), verifies scanner hits by
+reading the code, and reports each finding with `file:line`, how it is
+exploitable, its impact, and a concrete fix, plus hardening recommendations
+and the false positives it dismissed. Route it to its own model with
+`agentic.role_models.security`.
+
+Its `security_scan` tool (also available to the coder, debugger, and
+reviewer roles) combines:
+
+- a built-in secret scanner (private keys, AWS/GitHub/Slack/Google/Stripe/
+  Anthropic/OpenAI-style keys, hard-coded passwords and tokens) that needs no
+  dependencies and redacts every matched value in its output;
+- `bandit` for Python, when installed;
+- `semgrep`, when installed **and** the project has its own rules
+  (`.semgrep.yml`, `.semgrep.yaml`, or `.semgrep/`). Remote rule packs are
+  never fetched and metrics are off, so scanning stays offline.
+
+Everything is scoped to the local workspace: the security role cannot edit
+files, run shell commands, or contact other hosts.
+
 Independent tasks in a plan (no `depends_on` between them) run concurrently,
 bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
 sequential). Raise it to have several coder/tester/reviewer agents working

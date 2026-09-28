@@ -478,6 +478,26 @@ class Coordinator:
             follow_up_required=False
         ))
     
+    async def security_review(self, paths: list[str] | None = None, focus: str | None = None) -> str:
+        """Run a read-only red/blue team security review of the local project."""
+        agent = create_agent(
+            AgentRole.SECURITY, await self.model_manager.get_model(AgentRole.SECURITY), self.tool_registry, self._dispatch
+        )
+        objective = "Perform a security review of this project: find exploitable vulnerabilities and propose fixes."
+        if focus:
+            objective += f" Focus: {focus}"
+        task = AgentTask(
+            role=AgentRole.SECURITY,
+            objective=objective,
+            files=paths or [],
+            constraints=[
+                "Read-only: do not modify files.",
+                "Analyze only the local workspace; do not contact external hosts.",
+            ],
+        )
+        response = await agent.execute(task)
+        return response.summary
+
     async def run_tests_only(self) -> str:
         """Just run tests and report."""
         res = await self._run_tests()

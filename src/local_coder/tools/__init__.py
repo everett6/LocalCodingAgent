@@ -7,6 +7,8 @@ from local_coder.tools.search import SearchFilesTool, GrepTool
 from local_coder.tools.git import GitStatusTool, GitDiffTool, GitLogTool, GitCommitTool, GitCheckoutTool
 from local_coder.tools.shell import RunCommandTool
 from local_coder.tools.testing import RunTestsTool, BuildTool
+from local_coder.tools.quality import LintTool, FormatCodeTool
+from local_coder.tools.security import SecurityScanTool
 from local_coder.types import ApprovalConfig
 
 
@@ -47,5 +49,10 @@ def create_tool_registry(
     # Testing tools
     registry.register(RunTestsTool(project_root))
     registry.register(BuildTool(project_root))
+
+    # Code quality tools
+    registry.register(LintTool(project_root))
+    registry.register(FormatCodeTool(project_root))
+    registry.register(SecurityScanTool(project_root))
 
     return registry
