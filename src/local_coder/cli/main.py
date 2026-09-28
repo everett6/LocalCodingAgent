@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
 from local_coder import __version__
+from local_coder.cli import ui
 
 console = Console()
 
@@ -44,19 +45,8 @@ def _get_project_root() -> str:
 
 
 def _event_handler(event):
-    """Handle agent events for display."""
-    timestamp = event.timestamp.strftime("%H:%M:%S")
-    source_colors = {
-        "ORCHESTRATOR": "bold cyan",
-        "EXPLORER": "bold green",
-        "PLANNER": "bold yellow",
-        "CODER": "bold blue",
-        "DEBUGGER": "bold red",
-        "TESTER": "bold magenta",
-        "REVIEWER": "bold white",
-    }
-    color = source_colors.get(event.source, "white")
-    console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
+    """Handle agent events for display (routed to the live progress view)."""
+    ui.render_event(console, event)
 
 
 @click.group(invoke_without_command=True, context_settings={"allow_extra_args": True})
@@ -365,8 +355,15 @@ async def _cli_approval_callback(description: str) -> bool:
     """Prompt the user in the terminal for a risky action. Runs inline in
     the same event loop as the agent -- blocking on input here is fine
     since a single interactive session has nothing else to do meanwhile."""
-    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
-    return click.confirm("Allow this action?", default=False)
+    with ui.paused():
+        console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+        try:
+            with ui.sigint_raises():
+                return click.confirm("Allow this action?", default=False)
+        except click.Abort:
+            # Ctrl+C at the approval prompt cancels the whole request.
+            console.print()
+            raise KeyboardInterrupt from None
 
 
 def _build_coordinator(config, ctx_obj: dict):
@@ -416,18 +413,23 @@ def _run_request(request: str, ctx_obj: dict):
                 traceback.print_exc()
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "request"):
+        asyncio.run(_run())
 
 
 def _interactive_mode(ctx_obj: dict):
-    console.print(Panel("[bold cyan]Local Coding Agent[/bold cyan]\nType /help for commands, /quit to exit.", border_style="cyan"))
-    
+    console.print(Panel(ui.build_banner(ctx_obj, __version__), border_style="cyan", expand=False))
+    session = ui.PromptSession(console, ctx_obj["project_root"])
+
     while True:
+        user_input = session.read()
+        if user_input is None:  # Ctrl+D, or Ctrl+C twice at the prompt
+            break
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+        session.save_history()
         try:
-            user_input = console.input("[bold green]> [/bold green]").strip()
-            if not user_input:
-                continue
-                
             if user_input.startswith("/"):
                 cmd = user_input.split()[0].lower()
                 if cmd in ("/quit", "/exit", "/q"):
@@ -455,27 +457,22 @@ def _interactive_mode(ctx_obj: dict):
                     else:
                         console.print("[red]Please provide a checkpoint ID.[/red]")
                 elif cmd == "/help":
-                    console.print("""
-Available commands:
-  /quit, /exit, /q : Exit the interactive mode
-  /status          : Show system status
-  /plan <request>  : Create a plan without executing
-  /review          : Review current uncommitted changes
-  /test            : Run tests and report results
-    /checkpoint      : Save the current working tree
-    /checkpoints     : List saved checkpoints
-    /rollback <id>   : Restore a checkpoint
-  /help            : Show this help message
-                    """)
+                    console.print(ui.build_help_table())
                 else:
-                    console.print(f"[red]Unknown command:[/red] {cmd}")
+                    console.print(ui.unknown_command_message(cmd))
             else:
                 _run_request(user_input, ctx_obj)
-                
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
+
+        except BaseException as exc:
+            if ui.is_cancellation(exc):
+                console.print("[yellow]Request cancelled.[/yellow] Back at the prompt.")
+            elif isinstance(exc, click.ClickException):
+                pass  # already reported by the command; keep the REPL alive
+            elif isinstance(exc, Exception):
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+            else:
+                raise
+    session.save_history()
 
 
 def _run_plan(request: str, ctx_obj: dict):
@@ -499,7 +496,8 @@ def _run_plan(request: str, ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "plan"):
+        asyncio.run(_run())
 
 
 def _run_review(ctx_obj: dict):
@@ -522,7 +520,8 @@ def _run_review(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "review"):
+        asyncio.run(_run())
 
 
 def _run_tests(ctx_obj: dict):
@@ -541,7 +540,8 @@ def _run_tests(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "tests"):
+        asyncio.run(_run())
 
 
 def _run_checkpoint(ctx_obj: dict):
