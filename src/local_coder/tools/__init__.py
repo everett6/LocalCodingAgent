@@ -8,6 +8,7 @@ from local_coder.tools.git import GitStatusTool, GitDiffTool, GitLogTool, GitCom
 from local_coder.tools.shell import RunCommandTool
 from local_coder.tools.testing import RunTestsTool, BuildTool
 from local_coder.types import ApprovalConfig
+from local_coder.tools.code_search import CodeSearchTool
 
 
 def create_tool_registry(
@@ -32,6 +33,7 @@ def create_tool_registry(
     # Search tools
     registry.register(SearchFilesTool(project_root))
     registry.register(GrepTool(project_root))
+    registry.register(CodeSearchTool(project_root))
 
     # Git tools
     registry.register(GitStatusTool(project_root))
