@@ -3,12 +3,12 @@ import hashlib
 import os
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Protocol
 
 from local_coder.approval import ApprovalCallback
 from local_coder.types import (
     ProjectConfig, AgentEvent, AgentRole, AgentTask, TaskContext, TaskPlan, AgentResponse,
-    TaskStatus,
+    TaskStatus, ToolName,
 )
 from local_coder.agents import create_agent
 from local_coder.tools import create_tool_registry
@@ -24,6 +24,17 @@ from local_coder.security.triage import LAST_SCAN_FILE, promote_last_scan
 from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
+from local_coder.verification.test_runner import detect_framework
+
+
+class RunCheckpoint(Protocol):
+    """Where Coordinator.run saves each finished phase so an interrupted run
+    can resume (orchestrator.sessions.TurnCheckpoint is the on-disk one).
+    Values are JSON-compatible: strings or model_dump(mode="json") dicts."""
+
+    def get(self, key: str) -> Any | None: ...
+
+    def put(self, key: str, value: Any) -> None: ...
 
 
 class Coordinator:
@@ -87,42 +98,57 @@ class Coordinator:
         for handler in self._event_handlers:
             handler(event)
 
-    async def run(self, request: str) -> str:
-        """Execute a user request end-to-end."""
+    async def run(
+        self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",
+    ) -> str:
+        """Execute a user request end-to-end.
+
+        With a checkpoint, every finished phase is saved to it and any phase
+        it already holds is reused instead of re-run, so calling run() again
+        with the same checkpoint resumes after the last finished phase.
+        history is earlier turns of the same session, given to the agents as
+        context for a follow-up request."""
         self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
-        
+        objective = f"{history}\n\nCurrent request: {request}" if history else request
+
         # Step 1: Explore repository
         self._emit("ORCHESTRATOR", "phase", "Exploring repository...")
-        exploration = await self._explore(request)
-        
+        exploration = await self._resumable(checkpoint, "explore", lambda: self._explore(objective))
+
         # Step 2: Plan
         self._emit("ORCHESTRATOR", "phase", "Creating plan...")
-        plan = await self._plan(request, exploration)
-        
+        plan = await self._resumable(checkpoint, "plan", lambda: self._plan(objective, exploration), TaskPlan)
+
         # Step 3: Determine if simple or complex
         if len(plan.tasks) <= 1:
             self._emit("ORCHESTRATOR", "phase", "Executing simple task...")
-            result = await self._execute_simple(request, exploration)
+            result = await self._resumable(
+                checkpoint, "execute", lambda: self._execute_simple(objective, exploration), AgentResponse,
+            )
         else:
             self._emit("ORCHESTRATOR", "phase", "Executing complex task plan...")
-            result = await self._execute_plan(plan)
-        
+            result = await self._resumable(
+                checkpoint, "execute", lambda: self._execute_plan(plan, checkpoint), AgentResponse,
+            )
+
         # Step 4: Review
         self._emit("ORCHESTRATOR", "phase", "Reviewing changes...")
-        review = await self._review(result)
+        review = await self._resumable(checkpoint, "review", lambda: self._review(result))
         
         # Step 5: Test
         test_result = None
         last_fix_result: AgentResponse | None = None
         if self.config.verification.run_tests_after_changes:
             self._emit("ORCHESTRATOR", "phase", "Running tests...")
-            test_result = await self._run_tests()
+            test_result = await self._resumable(checkpoint, "tests.0", self._run_tests, AgentResponse)
 
             # Step 6: Fix loop
             fix_iterations = 0
             while not test_result.tests_passed and fix_iterations < self.config.verification.max_fix_iterations:
                 self._emit("ORCHESTRATOR", "fix_loop", f"Fixing failures (attempt {fix_iterations + 1})...")
-                last_fix_result = await self._fix_failures(test_result)
+                last_fix_result = await self._resumable(
+                    checkpoint, f"fix.{fix_iterations}", lambda: self._fix_failures(test_result), AgentResponse,
+                )
                 fix_iterations += 1
                 if last_fix_result.status == TaskStatus.FAILED:
                     self._emit(
@@ -130,7 +156,9 @@ class Coordinator:
                         f"Debugger could not attempt a fix: {last_fix_result.summary}",
                     )
                     break
-                test_result = await self._run_tests()
+                test_result = await self._resumable(
+                    checkpoint, f"tests.{fix_iterations}", self._run_tests, AgentResponse,
+                )
 
         # Step 7: Final report
         report = await self._generate_report(result, review, test_result, last_fix_result)
@@ -140,11 +168,43 @@ class Coordinator:
             self._emit("ORCHESTRATOR", "task_failed", "Verification did not pass within the retry limit")
         return report
     
+    async def _resumable(self, checkpoint: RunCheckpoint | None, key: str, produce: Callable, model=None):
+        """Return the checkpointed value for key if there is one, otherwise
+        run produce() and checkpoint its result. model is the pydantic type
+        the value round-trips through (None for plain strings)."""
+        saved = checkpoint.get(key) if checkpoint is not None else None
+        if saved is not None:
+            self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved '{key}' result from the session")
+            return model.model_validate(saved) if model is not None else saved
+        value = await produce()
+        if checkpoint is not None:
+            checkpoint.put(key, value.model_dump(mode="json") if model is not None else value)
+        return value
+
     def _session_cache_filename(self) -> str:
         """Stable per-project filename for the disk-backed slot cache, so
         different projects sharing one llama-server don't collide."""
         digest = hashlib.sha256(os.path.abspath(self.project_root).encode()).hexdigest()[:16]
         return f"local-coder-{digest}.bin"
+
+    async def _repo_map(self, query: str, files: list[str] | None = None) -> str:
+        """Ranked repo map for a task's context, or "" if it is off or fails."""
+        budget = self.config.agentic.repo_map_tokens
+        tool = self.tool_registry.get_tool(ToolName.REPO_MAP)
+        if budget <= 0 or tool is None:
+            return ""
+        try:
+            text = await asyncio.to_thread(tool.repo_map.build, query, files or [], budget)
+        except Exception as e:  # orientation is a bonus; never block the task on it
+            self._emit("ORCHESTRATOR", "repo_map_error", f"Could not build repo map: {e}")
+            return ""
+        if not text:
+            return ""
+        return (
+            "Most relevant files and their key definitions, ranked for this task "
+            "(number = line where each starts). read_file the ranges you need; "
+            "call repo_map with other terms to re-center it.\n" + text
+        )
 
     async def _explore(self, request: str) -> str:
         model = await self.model_manager.get_model(AgentRole.EXPLORER)
@@ -169,7 +229,11 @@ class Coordinator:
             compact_context_chars=self.config.agentic.compact_context_chars,
         )
         if explorer:
-            task = AgentTask(role=AgentRole.EXPLORER, objective=request)
+            task = AgentTask(
+                role=AgentRole.EXPLORER,
+                objective=request,
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await explorer.execute(task)
             if self.config.agentic.session_cache:
                 save = getattr(model, "save_slot", None)
@@ -181,7 +245,11 @@ class Coordinator:
     async def _plan(self, request: str, exploration: str) -> TaskPlan:
         planner = create_agent(AgentRole.PLANNER, await self.model_manager.get_model(AgentRole.PLANNER), self.tool_registry, self._dispatch)
         if planner:
-            task = AgentTask(role=AgentRole.PLANNER, objective=f"Request: {request}\nExploration: {exploration}")
+            task = AgentTask(
+                role=AgentRole.PLANNER,
+                objective=f"Request: {request}\nExploration: {exploration}",
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await planner.execute(task)
             plan_data = response.summary
             
@@ -250,7 +318,11 @@ class Coordinator:
             drafter=await self._get_drafter(),
         )
         if coder:
-            task = AgentTask(role=AgentRole.CODER, objective=f"Request: {request}\nContext: {exploration}")
+            task = AgentTask(
+                role=AgentRole.CODER,
+                objective=f"Request: {request}\nContext: {exploration}",
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await coder.execute(task)
             return response
         return AgentResponse(
@@ -264,9 +336,18 @@ class Coordinator:
             follow_up_required=False
         )
 
-    async def _execute_plan(self, plan: TaskPlan) -> AgentResponse:
+    async def _execute_plan(self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None) -> AgentResponse:
         dag = TaskDAG()
         dag.add_tasks(plan.tasks)
+        # Plan tasks that finished before an interruption stay finished; only
+        # the rest run again. Failed tasks are never checkpointed, so they
+        # get another attempt on resume.
+        if checkpoint is not None:
+            for task in plan.tasks:
+                saved = checkpoint.get(f"task.{task.task_id}")
+                if saved is not None:
+                    dag.mark_completed(task.task_id, AgentResponse.model_validate(saved))
+                    self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved result for plan task {task.task_id}")
 
         validation_errors = dag.validate()
         if validation_errors:
@@ -307,7 +388,7 @@ class Coordinator:
             for task in ready_tasks:
                 dag.mark_running(task.task_id)
             semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
-            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore) for task in ready_tasks))
+            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore, checkpoint) for task in ready_tasks))
 
         return AgentResponse(
             task_id="plan_execution",
@@ -338,7 +419,10 @@ class Coordinator:
             seen.update(file_scope)
         return configured
 
-    async def _run_dag_task(self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore) -> None:
+    async def _run_dag_task(
+        self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore,
+        checkpoint: RunCheckpoint | None = None,
+    ) -> None:
         """Run one DAG-scheduled task, bounded by the parallelism semaphore,
         and record its outcome on the DAG. Concurrent siblings in the same
         wave call this independently via asyncio.gather in _execute_plan."""
@@ -355,6 +439,8 @@ class Coordinator:
                     drafter=drafter,
                 )
                 if agent:
+                    if not task.context.architecture:
+                        task.context.architecture = await self._repo_map(task.objective, task.files)
                     response = await agent.execute(task)
                 else:
                     response = AgentResponse(
@@ -372,6 +458,8 @@ class Coordinator:
                     dag.mark_failed(task.task_id, response)
                 else:
                     dag.mark_completed(task.task_id, response)
+                    if checkpoint is not None:
+                        checkpoint.put(f"task.{task.task_id}", response.model_dump(mode="json"))
             except Exception as e:
                 response = AgentResponse(
                     task_id=task.task_id,
@@ -394,6 +482,22 @@ class Coordinator:
         return "Fallback review: looks good."
 
     async def _run_tests(self) -> AgentResponse:
+        # Running a known framework needs no model: call the tool directly and
+        # save the tester's round trips. Its compact report is what the
+        # debugger sees if anything failed.
+        if detect_framework(self.project_root) is not None:
+            self._emit("ORCHESTRATOR", "tool_call", "Running project tests directly")
+            result = await self.tool_registry.execute_tool(AgentRole.TESTER, "run_tests", {})
+            return AgentResponse(
+                task_id="test_run",
+                status=TaskStatus.COMPLETED if result.success else TaskStatus.FAILED,
+                summary=result.output,
+                files_changed=[],
+                tests_run=["project tests"],
+                tests_passed=result.success,
+                issues=[] if result.success else ["Verification tests failed"],
+                follow_up_required=not result.success,
+            )
         tester = create_agent(AgentRole.TESTER, await self.model_manager.get_model(AgentRole.TESTER), self.tool_registry, self._dispatch)
         if tester:
             task = AgentTask(role=AgentRole.TESTER, objective="Run project tests")

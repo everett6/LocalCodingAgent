@@ -21,7 +21,7 @@ from local_coder.types import ToolName, ToolResult
 from local_coder.workspace import Workspace
 
 MAX_OUTPUT_CHARS = 20000
-EXCLUDED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "target", "dist", "build"}
+EXCLUDED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "target", "dist", "build", ".local-coder"}
 
 # Project marker files, in the order auto-detection tries languages.
 LANGUAGE_MARKERS: dict[str, tuple[str, ...]] = {

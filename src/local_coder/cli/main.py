@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.markdown import Markdown
 from rich.markup import escape
 from local_coder import __version__
+from local_coder.cli import ui
 
 console = Console()
 
@@ -45,35 +46,42 @@ def _get_project_root() -> str:
 
 
 def _event_handler(event):
-    """Handle agent events for display."""
-    timestamp = event.timestamp.strftime("%H:%M:%S")
-    source_colors = {
-        "ORCHESTRATOR": "bold cyan",
-        "EXPLORER": "bold green",
-        "PLANNER": "bold yellow",
-        "CODER": "bold blue",
-        "DEBUGGER": "bold red",
-        "TESTER": "bold magenta",
-        "REVIEWER": "bold white",
-        "SECURITY": "bold bright_red",
-        "EXPLOIT_VALIDATOR": "bold red",
-    }
-    color = source_colors.get(event.source, "white")
-    console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
+    """Handle agent events for display (routed to the live progress view)."""
+    ui.render_event(console, event)
 
 
-@click.group(invoke_without_command=True, context_settings={"allow_extra_args": True})
+class _RequestGroup(click.Group):
+    """Lets `local-coder "Add OAuth login"` run a request directly: click
+    would otherwise look the request up as a subcommand name and fail. A
+    single word that isn't a command is still reported as an unknown
+    command, so a typo like `local-coder staus` doesn't start a run."""
+
+    def resolve_command(self, ctx, args):
+        if args and self.get_command(ctx, args[0]) is None and (len(args) > 1 or " " in args[0].strip()):
+            return "run", self.get_command(ctx, "run"), args
+        return super().resolve_command(ctx, args)
+
+
+@click.group(cls=_RequestGroup, invoke_without_command=True, context_settings={"allow_extra_args": True})
 @click.option("--config", "-c", type=click.Path(), help="Config file path")
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
 @click.option("--model", help="Use this configured model for every agent in the run")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.option(
+    "--resume", "-r", is_flag=True,
+    help="Continue the most recent session: pick up its unfinished request, or add a follow-up request to it.",
+)
+@click.option(
+    "--session", "-s", "session_id", metavar="ID",
+    help="Run in this session (created if new); resumes its unfinished request when no request is given.",
+)
 @click.option(
     "--yolo", is_flag=True,
     help="Auto-approve risky actions (shell commands, git commits/checkouts) without prompting. Dangerous.",
 )
 @click.version_option(version=__version__, prog_name="local-coder")
 @click.pass_context
-def cli(ctx, config, project, model, debug, yolo):
+def cli(ctx, config, project, model, debug, resume, session_id, yolo):
     """Local Coding Agent - AI-powered local code assistant.
 
     Run with a request to execute it:
@@ -82,12 +90,20 @@ def cli(ctx, config, project, model, debug, yolo):
 
     Or use subcommands:
 
+    \b
         local-coder plan "Refactor auth"
         local-coder review
         local-coder security
         local-coder security-lessons
         local-coder validate-finding "SQL injection in ..."
         local-coder test
+
+    Every run is saved as a session, so an interrupted or failed run can
+    pick up where it stopped, and later requests can build on earlier ones:
+
+    \b
+        local-coder --resume
+        local-coder --resume "now add tests for it"
     """
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
@@ -95,12 +111,16 @@ def cli(ctx, config, project, model, debug, yolo):
     ctx.obj["debug"] = debug
     ctx.obj["model"] = model
     ctx.obj["yolo"] = yolo
-    
+    ctx.obj["resume"] = resume
+    ctx.obj["session_id"] = session_id
+
     if ctx.invoked_subcommand is None:
         if ctx.args:
             # Direct execution: local-coder "Add OAuth login"
             request_str = " ".join(ctx.args)
             _run_request(request_str, ctx.obj)
+        elif resume or session_id:
+            _resume_or_interactive(ctx.obj)
         else:
             # Interactive mode
             _interactive_mode(ctx.obj)
@@ -258,26 +278,32 @@ def serve(ctx, host, port, token):
 
 
 @cli.command(name="sessions")
+@click.argument("session_id", required=False)
 @click.pass_context
-def sessions(ctx):
-    """List resumable agent sessions."""
-    from local_coder.orchestrator.sessions import SessionStore
-
-    for session in SessionStore(ctx.obj["project_root"]).list():
-        console.print(f"{session['session_id']}  {session.get('phase', 'unknown')}  {session.get('updated_at', '')}")
+def sessions(ctx, session_id):
+    """List saved sessions, or show one session's requests."""
+    if session_id:
+        _show_session(session_id, ctx.obj)
+    else:
+        _list_sessions(ctx.obj)
 
 
 @cli.command()
-@click.argument("session_id")
+@click.argument("session_id", required=False)
 @click.pass_context
 def resume(ctx, session_id):
-    """Resume a session's request from the local journal."""
-    from local_coder.orchestrator.sessions import SessionStore
+    """Pick up a session's unfinished request (the latest session by default)."""
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
 
-    session = SessionStore(ctx.obj["project_root"]).get(session_id)
-    if not session or not session.get("request"):
-        raise click.ClickException(f"Session not found or has no request: {session_id}")
-    _run_request(session["request"], ctx.obj)
+    if session_id:
+        try:
+            SessionStore(ctx.obj["project_root"]).open(session_id)
+        except SessionError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ctx.obj["session_id"] = session_id
+    else:
+        ctx.obj["resume"] = True
+    _run_request(None, ctx.obj)
 
 
 @cli.command()
@@ -335,6 +361,19 @@ def rollback(ctx, checkpoint_id):
         console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="map")
+@click.argument("query", nargs=-1)
+@click.option("--file", "-f", "files", multiple=True, help="File the work is about (repeatable)")
+@click.option("--tokens", "-t", default=1024, show_default=True, type=int, help="Approximate map size")
+@click.pass_context
+def repo_map(ctx, query, files, tokens):
+    """Print the ranked repo map agents see, optionally centered on QUERY."""
+    from local_coder.context.repo_map import RepoMap
+
+    text = RepoMap(ctx.obj["project_root"]).build(" ".join(query), list(files), tokens)
+    click.echo(text or "No source files with definitions were found.")
 
 
 @cli.group(name="local-server")
@@ -443,8 +482,15 @@ async def _cli_approval_callback(description: str) -> bool:
     """Prompt the user in the terminal for a risky action. Runs inline in
     the same event loop as the agent -- blocking on input here is fine
     since a single interactive session has nothing else to do meanwhile."""
-    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
-    return click.confirm("Allow this action?", default=False)
+    with ui.paused():
+        console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+        try:
+            with ui.sigint_raises():
+                return click.confirm("Allow this action?", default=False)
+        except click.Abort:
+            # Ctrl+C at the approval prompt cancels the whole request.
+            console.print()
+            raise KeyboardInterrupt from None
 
 
 def _build_coordinator(config, ctx_obj: dict):
@@ -467,45 +513,175 @@ def _build_coordinator(config, ctx_obj: dict):
     return coordinator
 
 
-def _run_request(request: str, ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.sessions import SessionStore
+def _open_session(ctx_obj: dict):
+    """The session this invocation runs in: the one named with --session
+    (created if new), the latest one with --resume, otherwise a new one."""
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
 
-    console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
+    store = SessionStore(ctx_obj["project_root"])
+    try:
+        if ctx_obj.get("session_id"):
+            return store.open_or_create(ctx_obj["session_id"])
+        if ctx_obj.get("resume"):
+            session = store.latest()
+            if session is None:
+                raise click.ClickException("No saved session to resume. Run a request first.")
+            return session
+        return store.create()
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _resume_hint(session_id: str) -> str:
+    return f"[dim]Session {session_id} -- continue it with: local-coder --session {session_id} [request][/dim]"
+
+
+def _run_request(request: str | None, ctx_obj: dict):
+    """Run a request in a persistent session. With request=None, pick the
+    session's unfinished request back up from its last checkpoint."""
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionError
+
+    session = _open_session(ctx_obj)
+    # Later requests in this process (the interactive prompt) stay in it.
+    ctx_obj["session_id"] = session.session_id
+
+    if request is None:
+        turn = session.unfinished_turn()
+        if turn is None:
+            raise click.ClickException(
+                f"Nothing to resume in session {session.session_id}: its last request finished. "
+                f"Add a new request to continue it: local-coder --session {session.session_id} \"...\""
+            )
+        done = ", ".join(turn["checkpoints"]) or "nothing yet"
+        console.print(Panel(
+            f"Resuming: [bold]{turn['request']}[/bold]\n[dim]Already done: {done}[/dim]",
+            title=f"Local Coder - session {session.session_id}", border_style="cyan",
+        ))
+    else:
+        if session.unfinished_turn() is not None:
+            console.print("[yellow]The previous request in this session never finished; starting the new one instead.[/yellow]")
+        console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
 
     config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     if ctx_obj.get("model"):
         from local_coder.types import AgentRole
         config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
 
-    async def _run():
-        coordinator = _build_coordinator(config, ctx_obj)
+    try:
+        session.acquire()
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        if request is None:
+            turn = session.unfinished_turn()
+            if turn is None:
+                raise click.ClickException(f"Session {session.session_id} has nothing left to resume.")
+            session.reopen_turn(turn)
+        else:
+            turn = session.start_turn(request)
+
+        async def _run():
+            coordinator = _build_coordinator(config, ctx_obj)
+            coordinator.on_event(session.record_event)
+            return await coordinator.run(
+                turn["request"], checkpoint=session.checkpoint(turn), history=turn["context"],
+            )
 
         try:
-            result = await coordinator.run(request)
-            SessionStore(ctx_obj["project_root"]).save(
-                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="run", result=result
-            )
-            console.print(Panel(Markdown(result), title="Result", border_style="green"))
+            with ui.progress(console, "request"):
+                result = asyncio.run(_run())
+        except KeyboardInterrupt:
+            session.finish_turn(turn, "interrupted", error="Interrupted")
+            console.print("[yellow]Interrupted. Finished phases are saved.[/yellow]")
+            console.print(_resume_hint(session.session_id))
+            raise
         except Exception as e:
+            session.finish_turn(turn, "failed", error=str(e))
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(_resume_hint(session.session_id))
             if ctx_obj.get("debug"):
                 import traceback
                 traceback.print_exc()
             raise click.ClickException(str(e)) from e
+        session.finish_turn(turn, "completed", report=result)
+        console.print(Panel(Markdown(result), title="Result", border_style="green"))
+        console.print(_resume_hint(session.session_id))
+    finally:
+        session.release()
 
-    asyncio.run(_run())
+
+
+def _resume_or_interactive(ctx_obj: dict):
+    """--resume / --session with no request: pick up the session's
+    unfinished request if it has one, otherwise open the interactive prompt
+    attached to that session."""
+    session = _open_session(ctx_obj)
+    ctx_obj["session_id"] = session.session_id
+    if session.unfinished_turn() is not None:
+        _run_request(None, ctx_obj)
+    else:
+        console.print(f"[dim]Session {session.session_id} has nothing unfinished; new requests will continue it.[/dim]")
+        _interactive_mode(ctx_obj)
+
+
+def _list_sessions(ctx_obj: dict):
+    from local_coder.orchestrator.sessions import SessionStore
+
+    records = SessionStore(ctx_obj["project_root"]).list()
+    if not records:
+        console.print("No sessions yet.")
+        return
+    table = Table(title="Sessions")
+    table.add_column("Session", style="cyan", no_wrap=True)
+    table.add_column("Status", style="magenta")
+    table.add_column("Requests", style="blue")
+    table.add_column("Last request", style="green")
+    table.add_column("Updated", style="dim")
+    for record in records:
+        request = str(record.get("request", ""))
+        table.add_row(
+            record["session_id"],
+            str(record.get("status") or record.get("phase", "")),
+            str(record.get("turns", 1)),
+            request[:60] + ("..." if len(request) > 60 else ""),
+            str(record.get("updated_at", ""))[:19],
+        )
+    console.print(table)
+
+
+def _show_session(session_id: str, ctx_obj: dict):
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
+
+    try:
+        session = SessionStore(ctx_obj["project_root"]).open(session_id)
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
+    table = Table(title=f"Session {session_id}")
+    table.add_column("#", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Request", style="green")
+    table.add_column("Finished phases", style="dim")
+    for turn in session.turns:
+        table.add_row(str(turn["index"] + 1), turn["status"], turn["request"], ", ".join(turn["checkpoints"]))
+    console.print(table)
+    if session.unfinished_turn() is not None:
+        console.print(f"Resume the unfinished request with: [bold]local-coder resume {session_id}[/bold]")
 
 
 def _interactive_mode(ctx_obj: dict):
-    console.print(Panel("[bold cyan]Local Coding Agent[/bold cyan]\nType /help for commands, /quit to exit.", border_style="cyan"))
-    
+    console.print(Panel(ui.build_banner(ctx_obj, __version__), border_style="cyan", expand=False))
+    session = ui.PromptSession(console, ctx_obj["project_root"])
+
     while True:
+        user_input = session.read()
+        if user_input is None:  # Ctrl+D, or Ctrl+C twice at the prompt
+            break
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+        session.save_history()
         try:
-            user_input = console.input("[bold green]> [/bold green]").strip()
-            if not user_input:
-                continue
-                
             if user_input.startswith("/"):
                 cmd = user_input.split()[0].lower()
                 if cmd in ("/quit", "/exit", "/q"):
@@ -537,30 +713,37 @@ def _interactive_mode(ctx_obj: dict):
                         _run_rollback(parts[1], ctx_obj)
                     else:
                         console.print("[red]Please provide a checkpoint ID.[/red]")
+                elif cmd == "/sessions":
+                    _list_sessions(ctx_obj)
+                elif cmd == "/new":
+                    ctx_obj["session_id"] = None
+                    ctx_obj["resume"] = False
+                    console.print("Next request starts a new session.")
+                elif cmd == "/resume":
+                    parts = user_input.split(maxsplit=1)
+                    ctx_obj["session_id"] = parts[1] if len(parts) == 2 else ctx_obj.get("session_id")
+                    ctx_obj["resume"] = True
+                    try:
+                        _run_request(None, ctx_obj)
+                    except click.ClickException as exc:
+                        console.print(f"[red]{exc.message}[/red]")
                 elif cmd == "/help":
-                    console.print("""
-Available commands:
-  /quit, /exit, /q : Exit the interactive mode
-  /status          : Show system status
-  /plan <request>  : Create a plan without executing
-  /review          : Review current uncommitted changes
-  /security [focus]: Red/blue team security review (read-only)
-  /validate-finding <desc> : Reproduce an identified finding as a local PoC test
-  /test            : Run tests and report results
-    /checkpoint      : Save the current working tree
-    /checkpoints     : List saved checkpoints
-    /rollback <id>   : Restore a checkpoint
-  /help            : Show this help message
-                    """)
+                    console.print(ui.build_help_table())
                 else:
-                    console.print(f"[red]Unknown command:[/red] {cmd}")
+                    console.print(ui.unknown_command_message(cmd))
             else:
                 _run_request(user_input, ctx_obj)
-                
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
+
+        except BaseException as exc:
+            if ui.is_cancellation(exc):
+                console.print("[yellow]Request cancelled.[/yellow] Back at the prompt.")
+            elif isinstance(exc, click.ClickException):
+                pass  # already reported by the command; keep the REPL alive
+            elif isinstance(exc, Exception):
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+            else:
+                raise
+    session.save_history()
 
 
 def _run_plan(request: str, ctx_obj: dict):
@@ -584,7 +767,8 @@ def _run_plan(request: str, ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "plan"):
+        asyncio.run(_run())
 
 
 def _run_review(ctx_obj: dict):
@@ -607,7 +791,8 @@ def _run_review(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "review"):
+        asyncio.run(_run())
 
 
 def _run_security(ctx_obj: dict, paths: list[str], focus: str | None, batch_chars: int | None = None):
@@ -631,7 +816,8 @@ def _run_security(ctx_obj: dict, paths: list[str], focus: str | None, batch_char
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "security review"):
+        asyncio.run(_run())
 
 
 def _show_security_lessons(project_root: str):
@@ -700,10 +886,12 @@ def _run_validate_finding(ctx_obj: dict, finding: str, paths: list[str]):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "finding validation"):
+        asyncio.run(_run())
 
 
 def _run_tests(ctx_obj: dict):
+    from rich.text import Text
     from local_coder.orchestrator.config_loader import load_config
 
     console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
@@ -713,13 +901,15 @@ def _run_tests(ctx_obj: dict):
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
         try:
-            result = await coordinator.run("Run project tests and report results")
-            console.print(Panel(Markdown(result), title="Test Results", border_style="magenta"))
+            result = await coordinator.run_tests_only()
+            # Plain text: the report's line layout matters and it may contain [brackets].
+            console.print(Panel(Text(result), title="Test Results", border_style="magenta"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "tests"):
+        asyncio.run(_run())
 
 
 def _run_checkpoint(ctx_obj: dict):

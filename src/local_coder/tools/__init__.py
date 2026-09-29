@@ -10,6 +10,8 @@ from local_coder.tools.testing import RunTestsTool, BuildTool
 from local_coder.tools.quality import LintTool, FormatCodeTool
 from local_coder.tools.security import RecordFindingTool, SecurityScanTool
 from local_coder.types import ApprovalConfig
+from local_coder.tools.code_search import CodeSearchTool
+from local_coder.tools.repo_map import RepoMapTool
 
 
 def create_tool_registry(
@@ -35,6 +37,10 @@ def create_tool_registry(
     # Search tools
     registry.register(SearchFilesTool(project_root))
     registry.register(GrepTool(project_root))
+    code_search = CodeSearchTool(project_root)
+    registry.register(code_search)
+    # The repo map reads the same index, so it is loaded and refreshed once.
+    registry.register(RepoMapTool(project_root, index=code_search.index))
 
     # Git tools
     registry.register(GitStatusTool(project_root))

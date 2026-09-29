@@ -38,6 +38,7 @@ class RepositoryContext:
         self.project_root = Path(project_root).resolve()
         self._file_tree_cache: str | None = None
         self._file_tree_cache_time: float = 0
+        self._index = None  # CodeIndex, built lazily on first retrieval
 
     async def get_file_tree(self, max_depth: int = 4) -> str:
         """Get a tree representation of the project structure."""
@@ -137,6 +138,27 @@ class RepositoryContext:
         query: str,
         max_files: int = 20,
     ) -> list[str]:
+        """Find files relevant to a query, ranked by the local code index.
+
+        Falls back to grep-based search if the index finds nothing.
+        """
+        try:
+            ranked = await asyncio.to_thread(self._code_index().search_files, query, max_files)
+        except Exception as e:  # never let retrieval break context building
+            logger.debug("Code index search failed: %s", e)
+            ranked = []
+        if ranked:
+            return ranked
+        return await self._grep_relevant_files(query, max_files)
+
+    def _code_index(self):
+        from local_coder.context.code_index import CodeIndex
+
+        if self._index is None:
+            self._index = CodeIndex(str(self.project_root))
+        return self._index
+
+    async def _grep_relevant_files(self, query: str, max_files: int) -> list[str]:
         """Find files relevant to a query using grep-based search."""
         files: list[str] = []
 

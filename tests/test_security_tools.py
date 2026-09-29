@@ -162,3 +162,28 @@ def test_create_agent_builds_security_agent(tmp_path):
 
     assert isinstance(agent, SecurityAgent)
     assert "red team" in agent.system_prompt and "blue team" in agent.system_prompt
+
+
+def test_secret_scan_skips_symlinks_that_leave_the_workspace(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "creds.py").write_text(f'aws = "{AWS_KEY}"\n')
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "link.py").symlink_to(outside / "creds.py")
+    (workspace / "inside.py").write_text(f'aws = "{AWS_KEY}"\n')
+
+    result = asyncio.run(SecurityScanTool(str(workspace)).execute(scanners=["secrets"]))
+
+    assert "inside.py:1" in result.output
+    assert "link.py" not in result.output
+
+
+def test_secret_scan_ignores_local_coder_state(tmp_path):
+    state = tmp_path / ".local-coder" / "tool-output"
+    state.mkdir(parents=True)
+    (state / "read_file-1.txt").write_text(f'aws = "{AWS_KEY}"\n')
+
+    result = asyncio.run(SecurityScanTool(str(tmp_path)).execute(scanners=["secrets"]))
+
+    assert "Findings: 0" in result.output

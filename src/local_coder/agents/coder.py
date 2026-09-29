@@ -14,6 +14,7 @@ class CoderAgent(BaseAgent):
 You should use tools to read files, understand the exact context, and then write or modify code.
 
 Guidelines:
+- Use code_search to locate the relevant code by description, then read_file only the line ranges it returns.
 - Follow existing coding conventions, style, and patterns in the repository.
 - Write clean, robust, and production-quality code.
 - Add or update type hints, comments, and docstrings appropriately.

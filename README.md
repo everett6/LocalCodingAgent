@@ -43,8 +43,41 @@ local-coder --version
 ```
 
 Running `local-coder` with no arguments opens the interactive terminal mode.
+Type a request to run it, or a slash command (`/plan <request>`, `/review`,
+`/test`, `/status`, `/checkpoint`, `/checkpoints`, `/rollback <id>`, `/help`,
+`/quit`); Tab completes slash commands and input history is kept in
+`.local-coder/history`. While a request runs a spinner shows the active agent
+and elapsed time; Ctrl+C cancels the request and returns to the prompt, and
+Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
+
+### Sessions and resume
+
+Every request runs in a session saved under `.local-coder/sessions/<id>/`, so
+work can span several invocations instead of starting cold each time:
+
+```bash
+local-coder "Add OAuth login"          # new session; its id is printed at the end
+local-coder --resume                   # pick the latest session's unfinished request back up
+local-coder --resume "Now add tests"   # follow-up request in the latest session
+local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
+local-coder resume auth                # pick up auth's unfinished request
+local-coder sessions                   # list sessions
+local-coder sessions auth              # show a session's requests and finished phases
+```
+
+The coordinator checkpoints each phase as it finishes (exploration, plan, each
+completed plan task, review, every test run and fix attempt). If a run crashes,
+errors, or is stopped with Ctrl+C, resuming skips the finished phases and
+continues from the next one, running only the plan tasks that had not finished. A follow-up
+request gets the earlier requests in the session and their results (the last
+five, each trimmed) as context. `state.json` in the session folder holds the
+turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
+two terminals from running the same session at once. In the interactive
+prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
+manage it. `POST /run` on the remote server uses the same sessions, so repeating
+a `session_id` there continues it too.
 
 ## Local model server
 
@@ -397,6 +430,45 @@ repo's Python code; the retry still helps for genuinely transient failures
 (a real sampling glitch, a momentary server hiccup), just not this specific
 deterministic one.
 
+## Context budget (token efficiency)
+
+A small local model's window fills fast, and every token of history is
+re-sent (and, on a cache miss, re-prefilled) on every turn. The agent loop
+keeps the conversation small in the same layered way opencode does, cheapest
+step first (`context/compression.py`):
+
+1. **Tool-output truncation.** One tool result is capped to
+   `max_tool_output_chars` (default: an eighth of `context_window_chars`,
+   between 2000 and 16000) and 400 lines. The head and tail are kept, since
+   errors and test failures usually sit at the end. The full text is saved to
+   `.local-coder/tool-output/<tool>-<call id>.txt` and the notice tells the
+   model to page through it with `read_file` or `grep`.
+2. **Paged reads.** `read_file` returns up to 1000 lines or 10000 characters,
+   clips lines over 1000 characters, and ends a partial page with the
+   `start_line` to continue from. Before, it cut at 10000 characters with no
+   way to ask for the rest. `grep` clips matching lines over 300 characters.
+3. **Pruning.** Once the conversation is over budget, older tool results are
+   replaced by a one-line placeholder. A read, grep, listing or git call that
+   was later repeated with the same arguments goes first, then anything past
+   the newest `compact_context_chars / 2` of tool output. No model call is
+   needed, and message structure and tool-call ids are kept.
+4. **Summarization.** If pruning isn't enough, the model summarizes the
+   middle of the history (files, facts learned, commands run, what's left).
+   That summary replaces it, and the system prompt, task and newest turns
+   stay verbatim. The cut never leaves a tool result without its tool call.
+   If summarization fails, the old character-budget trimming is the fallback.
+
+Compaction triggers when history passes `context_window_chars`, **or** when
+the prompt size the server reported last turn passes 85% of the model's
+`context_length` minus `max_tokens`. Chars per token varies a lot between
+code and prose, so the real count is the reliable signal. History is only
+rewritten when a trigger fires. Between compactions the prompt is
+append-only, so llama-server's prefix cache is reused on every turn.
+
+Past tool calls are now sent back as real JSON (compact separators) instead
+of a Python `repr`, so the model sees its own calls in the shape it wrote
+them.
+
 ## Architecture
 
 - `src/local_coder/agents/`: role-specific agents and the bounded tool loop
@@ -412,3 +484,24 @@ Run the tests with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+**Small-model guardrails:** three more checks in the same loop, for mistakes
+local models make far more often than frontier ones.
+
+- *Tool-call repair* (`agents/tool_repair.py`). A call written as text
+  (`<tool_call>{...}</tool_call>`, `<function=name>{...}</function>`, or a
+  message that is only a JSON call) is run as a real call. Arguments with
+  single quotes, `True`, a trailing comma, or a missing closing brace are
+  repaired; arguments that can't be repaired are reported back to the model
+  instead of silently running the tool with none. Near-miss names
+  (`ReadFile`, `bash`), aliased argument names (`file_path` for `path`), and
+  string-typed booleans and integers are mapped onto the schema, and the
+  tool result says what was reinterpreted.
+- *Read before overwrite.* `write_file` refuses to replace an existing file
+  the agent hasn't read (or written) in the current task.
+- *Syntax check after edits* (`verification/syntax.py`). Any `.py`, `.json`,
+  `.toml`, or `.yaml` file an edit touches is parsed in-process; if it no
+  longer parses, the edit's tool result carries the error and the lines
+  around it.
+
+Each can be turned off per agent class with `parse_text_tool_calls`,
+`require_read_before_overwrite`, and `check_syntax_after_edits`.
