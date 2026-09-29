@@ -1,0 +1,18 @@
+{
+  "name": "Local Coding Agent",
+  "short_name": "Local Coder",
+  "description": "A local-first coding workspace for planning, editing, and reviewing code.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#171716",
+  "theme_color": "#171716",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

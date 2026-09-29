@@ -221,6 +221,29 @@ def test_stagnation_abort_after_too_many_identical_failures():
     assert len(model.calls) == 5  # aborted after the 5th identical failure, not all 6 queued responses
 
 
+def test_task_prompt_includes_repository_context_details():
+    """The agent should see architecture and relevant file context before it starts
+    deciding what to read or edit, since that is how a Claude Code-like workflow
+    keeps the model grounded in the repository instead of acting on a blank slate."""
+    task = AgentTask(
+        role=AgentRole.CODER,
+        objective="Add a feature",
+        context={
+            "architecture": "Project structure:\napp/\n  main.py",
+            "relevant_symbols": ["App.main"],
+            "git_history": ["Branch: main"],
+            "file_contents": {"app/main.py": "print('hello')"},
+        },
+    )
+    prompt = LoopAgent(FakeModel([ModelResponse(content="done")]), FakeRegistry([]))._format_task(task)
+
+    assert "Project structure" in prompt
+    assert "App.main" in prompt
+    assert "Branch: main" in prompt
+    assert "app/main.py" in prompt
+    assert "print('hello')" in prompt
+
+
 def test_stagnation_counter_resets_after_success_or_different_call():
     model = FakeModel([
         ModelResponse(tool_calls=[ToolCall(name="read_file", arguments={"path": "a.py"})]),

@@ -420,14 +420,18 @@ def _run_request(request: str, ctx_obj: dict):
 
 
 def _interactive_mode(ctx_obj: dict):
-    console.print(Panel("[bold cyan]Local Coding Agent[/bold cyan]\nType /help for commands, /quit to exit.", border_style="cyan"))
-    
+    console.print(Panel(
+        "[bold cyan]Local Coding Agent[/bold cyan]\nThink, inspect, plan, and patch with a Claude Code-style flow.\nType /help for commands, /quit to exit.",
+        border_style="cyan",
+    ))
+    console.print("[dim]Repository context is loaded before each request so the agent can inspect the codebase instead of guessing.[/dim]")
+
     while True:
         try:
             user_input = console.input("[bold green]> [/bold green]").strip()
             if not user_input:
                 continue
-                
+
             if user_input.startswith("/"):
                 cmd = user_input.split()[0].lower()
                 if cmd in ("/quit", "/exit", "/q"):
@@ -462,16 +466,17 @@ Available commands:
   /plan <request>  : Create a plan without executing
   /review          : Review current uncommitted changes
   /test            : Run tests and report results
-    /checkpoint      : Save the current working tree
-    /checkpoints     : List saved checkpoints
-    /rollback <id>   : Restore a checkpoint
+  /checkpoint      : Save the current working tree
+  /checkpoints     : List saved checkpoints
+  /rollback <id>   : Restore a checkpoint
   /help            : Show this help message
                     """)
                 else:
                     console.print(f"[red]Unknown command:[/red] {cmd}")
             else:
+                console.print("[cyan]Inspecting the repo and building context…[/cyan]")
                 _run_request(user_input, ctx_obj)
-                
+
         except KeyboardInterrupt:
             break
         except EOFError:

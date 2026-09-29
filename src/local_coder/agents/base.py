@@ -379,28 +379,40 @@ class BaseAgent:
     
     def _format_task(self, task: AgentTask) -> str:
         """Format a task into a user message. Override in subclasses for custom formatting."""
-        parts = [f"## Objective\n{task.objective}"]
-        
+        parts = [
+            "## Objective",
+            task.objective,
+            "",
+            "## Working context",
+        ]
+
+        if task.context.architecture:
+            parts.append(f"### Repository architecture\n{task.context.architecture}")
+        if task.context.git_history:
+            parts.append("### Git context\n" + "\n".join(f"- {entry}" for entry in task.context.git_history))
+        if task.context.relevant_symbols:
+            parts.append("### Relevant symbols\n" + "\n".join(f"- {symbol}" for symbol in task.context.relevant_symbols))
+
         if task.files:
             parts.append("## Relevant Files\n" + "\n".join(f"- {f}" for f in task.files))
-        
+
         if task.constraints:
             parts.append("## Constraints\n" + "\n".join(f"- {c}" for c in task.constraints))
-        
+
         if task.success_criteria:
             parts.append("## Success Criteria\n" + "\n".join(f"- {s}" for s in task.success_criteria))
-        
+
         if task.context.file_contents:
             parts.append("## File Contents")
             for path, content in task.context.file_contents.items():
                 parts.append(f"### {path}\n```\n{content}\n```")
-        
+
         if task.context.error_context:
             parts.append(f"## Error Context\n```\n{task.context.error_context}\n```")
-        
+
         if task.context.previous_findings:
             parts.append("## Previous Findings\n" + "\n".join(f"- {f}" for f in task.context.previous_findings))
-        
+
         return "\n\n".join(parts)
     
     def _build_response(

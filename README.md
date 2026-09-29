@@ -256,10 +256,10 @@ terminal sessions, and now also serves a single-page browser UI
 (`src/local_coder/webui/index.html`) at `/`. It's a Claude-Code-style chat
 view -- session list, a live color-coded event stream per agent role, and
 Run/Plan-only/Review-changes actions -- talking to the existing JSON API
-(`/status`, `/events`, `/plan`, `/run`, `/review`) via `fetch()`. There's no
-native Linux/Windows/macOS app or per-OS build: any modern browser on any of
-the three renders the same page identically, so this is the "app" for all
-of them.
+(`/status`, `/events`, `/plan`, `/run`, `/review`) via `fetch()`. The page is
+also an installable PWA, so it can live as an app with an icon in the
+desktop/taskbar/dock on all three operating systems without separate native
+builds.
 
 ```bash
 local-coder serve --project . --port 8787   # add --yolo to auto-approve risky actions
@@ -268,7 +268,11 @@ local-coder serve --project . --port 8787   # add --yolo to auto-approve risky a
 Then open `http://localhost:8787` (or `http://<host>:8787` for a
 non-loopback bind, which requires `--token` -- paste the same token into the
 page's token field; it's sent as an `Authorization: Bearer` header on every
-API call and kept in `localStorage`).
+API call and kept in `localStorage`). Click **Install app** in the header when
+your browser offers the native PWA prompt. On Windows and Linux this adds a
+launcher/taskbar app; on macOS Chromium browsers add it to Applications/Dock,
+while Safari uses **Share > Add to Dock**. The app shell, manifest, service
+worker, and icon are served from the same local server.
 
 ## Generation retries
 

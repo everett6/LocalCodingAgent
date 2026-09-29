@@ -71,6 +71,15 @@ class Coordinator:
         event = AgentEvent(source=source, event_type=event_type, message=message, **kwargs)
         self._dispatch(event)
 
+    def _emit_task_status(self, task_id: str, status: str, note: str = "") -> None:
+        """Structured status transition for one plan task -- consumed by the
+        UI's live todo-list checklist (a "plan_created" event lists every
+        task up front; each of these updates one row's status in place)."""
+        self._emit(
+            "ORCHESTRATOR", "task_status", f"{task_id}: {status}",
+            data={"task_id": task_id, "status": status, "note": note},
+        )
+
     def _dispatch(self, event: AgentEvent) -> None:
         """Forward an already-built AgentEvent to registered handlers.
 
@@ -93,11 +102,18 @@ class Coordinator:
         # Step 2: Plan
         self._emit("ORCHESTRATOR", "phase", "Creating plan...")
         plan = await self._plan(request, exploration)
-        
+        self._emit(
+            "ORCHESTRATOR", "plan_created", f"Plan: {len(plan.tasks)} task(s)",
+            data={"tasks": [
+                {"task_id": t.task_id, "role": t.role.value, "objective": t.objective}
+                for t in plan.tasks
+            ]},
+        )
+
         # Step 3: Determine if simple or complex
         if len(plan.tasks) <= 1:
             self._emit("ORCHESTRATOR", "phase", "Executing simple task...")
-            result = await self._execute_simple(request, exploration)
+            result = await self._execute_simple(request, exploration, task_id=plan.tasks[0].task_id if plan.tasks else None)
         else:
             self._emit("ORCHESTRATOR", "phase", "Executing complex task plan...")
             result = await self._execute_plan(plan)
@@ -234,7 +250,7 @@ class Coordinator:
         )
         return TaskPlan(plan_id="plan_fallback", objective=request, tasks=[task], notes=[])
 
-    async def _execute_simple(self, request: str, exploration: str) -> AgentResponse:
+    async def _execute_simple(self, request: str, exploration: str, task_id: str | None = None) -> AgentResponse:
         coder = create_agent(
             AgentRole.CODER,
             await self.model_manager.get_model(AgentRole.CODER),
@@ -245,8 +261,11 @@ class Coordinator:
             drafter=await self._get_drafter(),
         )
         if coder:
-            task = AgentTask(role=AgentRole.CODER, objective=f"Request: {request}\nContext: {exploration}")
+            kwargs = {"task_id": task_id} if task_id else {}
+            task = AgentTask(role=AgentRole.CODER, objective=f"Request: {request}\nContext: {exploration}", **kwargs)
+            self._emit_task_status(task.task_id, "running")
             response = await coder.execute(task)
+            self._emit_task_status(task.task_id, "failed" if response.status == TaskStatus.FAILED else "completed", response.summary[:200])
             return response
         return AgentResponse(
             task_id="simple_task",
@@ -296,11 +315,13 @@ class Coordinator:
                         issues=["Blocked on a failed or unresolved dependency"],
                         follow_up_required=True,
                     ))
+                    self._emit_task_status(task_id, "failed", "Blocked on a failed or unresolved dependency")
                 break
             # Mark the whole wave running up front (synchronously, before any
             # task yields control) so a task never gets scheduled twice.
             for task in ready_tasks:
                 dag.mark_running(task.task_id)
+                self._emit_task_status(task.task_id, "running")
             semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
             await asyncio.gather(*(self._run_dag_task(dag, task, semaphore) for task in ready_tasks))
 
@@ -365,8 +386,10 @@ class Coordinator:
 
                 if response.status == TaskStatus.FAILED or not response.tests_passed:
                     dag.mark_failed(task.task_id, response)
+                    self._emit_task_status(task.task_id, "failed", response.summary[:200])
                 else:
                     dag.mark_completed(task.task_id, response)
+                    self._emit_task_status(task.task_id, "completed", response.summary[:200])
             except Exception as e:
                 response = AgentResponse(
                     task_id=task.task_id,
@@ -379,6 +402,7 @@ class Coordinator:
                     follow_up_required=True
                 )
                 dag.mark_failed(task.task_id, response)
+                self._emit_task_status(task.task_id, "failed", str(e)[:200])
 
     async def _review(self, result: AgentResponse) -> str:
         reviewer = create_agent(AgentRole.REVIEWER, await self.model_manager.get_model(AgentRole.REVIEWER), self.tool_registry, self._dispatch)
@@ -463,6 +487,13 @@ class Coordinator:
         """Plan without executing."""
         exploration = await self._explore(request)
         plan = await self._plan(request, exploration)
+        self._emit(
+            "ORCHESTRATOR", "plan_created", f"Plan: {len(plan.tasks)} task(s)",
+            data={"tasks": [
+                {"task_id": t.task_id, "role": t.role.value, "objective": t.objective}
+                for t in plan.tasks
+            ]},
+        )
         return f"Plan created: {plan.plan_id} with {len(plan.tasks)} tasks."
     
     async def review_changes(self) -> str:
