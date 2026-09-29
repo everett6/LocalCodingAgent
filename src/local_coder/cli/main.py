@@ -1,16 +1,15 @@
 """CLI for the local coding agent."""
 import asyncio
 import os
+import sys
 import uuid
 from pathlib import Path
 import click
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
 from local_coder import __version__
-
-console = Console()
+from local_coder.cli.output import JsonAwareGroup, console, emit, json_mode, json_option
 
 _DEFAULT_CONFIG = """# Local Coder project configuration
 models:
@@ -43,8 +42,10 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
-def _event_handler(event):
-    """Handle agent events for display."""
+def _event_handler(event, ctx_obj: dict | None = None):
+    """Handle agent events for display (and collect them in JSON mode)."""
+    if json_mode(ctx_obj):
+        ctx_obj.setdefault("events", []).append(event.model_dump(mode="json"))
     timestamp = event.timestamp.strftime("%H:%M:%S")
     source_colors = {
         "ORCHESTRATOR": "bold cyan",
@@ -59,7 +60,7 @@ def _event_handler(event):
     console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
 
 
-@click.group(invoke_without_command=True, context_settings={"allow_extra_args": True})
+@click.group(cls=JsonAwareGroup, invoke_without_command=True, context_settings={"allow_extra_args": True})
 @click.option("--config", "-c", type=click.Path(), help="Config file path")
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
 @click.option("--model", help="Use this configured model for every agent in the run")
@@ -69,6 +70,7 @@ def _event_handler(event):
     help="Auto-approve risky actions (shell commands, git commits/checkouts) without prompting. Dangerous.",
 )
 @click.version_option(version=__version__, prog_name="local-coder")
+@json_option
 @click.pass_context
 def cli(ctx, config, project, model, debug, yolo):
     """Local Coding Agent - AI-powered local code assistant.
@@ -82,8 +84,13 @@ def cli(ctx, config, project, model, debug, yolo):
         local-coder plan "Refactor auth"
         local-coder review
         local-coder test
+
+    Add --json (before or after the subcommand) to get one JSON document on
+    stdout instead of formatted text.
     """
     ctx.ensure_object(dict)
+    # Rich output moves to stderr in JSON mode so stdout is only the JSON.
+    console.stderr = json_mode(ctx.obj)
     ctx.obj["config_path"] = config
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
@@ -94,13 +101,17 @@ def cli(ctx, config, project, model, debug, yolo):
         if ctx.args:
             # Direct execution: local-coder "Add OAuth login"
             request_str = " ".join(ctx.args)
+            ctx.obj["command"] = "run"
             _run_request(request_str, ctx.obj)
         else:
             # Interactive mode
+            if json_mode(ctx.obj):
+                raise click.UsageError("--json needs a subcommand or a request; interactive mode has no JSON output.")
             _interactive_mode(ctx.obj)
 
 
 @cli.command()
+@json_option
 @click.argument("request", nargs=-1, required=True)
 @click.pass_context
 def run(ctx, request):
@@ -110,6 +121,7 @@ def run(ctx, request):
 
 
 @cli.command()
+@json_option
 @click.argument("request", nargs=-1, required=True)
 @click.pass_context
 def plan(ctx, request):
@@ -119,6 +131,7 @@ def plan(ctx, request):
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def review(ctx):
     """Review current uncommitted changes."""
@@ -126,6 +139,7 @@ def review(ctx):
 
 
 @cli.command()
+@json_option
 @click.pass_context  
 def test(ctx):
     """Run tests and report results."""
@@ -133,6 +147,7 @@ def test(ctx):
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def status(ctx):
     """Show system status."""
@@ -140,6 +155,7 @@ def status(ctx):
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def agents(ctx):
     """Show configured agents and models."""
@@ -147,6 +163,7 @@ def agents(ctx):
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def models(ctx):
     """Show configured models."""
@@ -180,16 +197,22 @@ def serve(ctx, host, port, token):
 
 
 @cli.command(name="sessions")
+@json_option
 @click.pass_context
 def sessions(ctx):
     """List resumable agent sessions."""
     from local_coder.orchestrator.sessions import SessionStore
 
-    for session in SessionStore(ctx.obj["project_root"]).list():
+    saved = SessionStore(ctx.obj["project_root"]).list()
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"sessions": saved})
+        return
+    for session in saved:
         console.print(f"{session['session_id']}  {session.get('phase', 'unknown')}  {session.get('updated_at', '')}")
 
 
 @cli.command()
+@json_option
 @click.argument("session_id")
 @click.pass_context
 def resume(ctx, session_id):
@@ -203,6 +226,7 @@ def resume(ctx, session_id):
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def init(ctx):
     """Create a .local-coder project configuration."""
@@ -211,11 +235,15 @@ def init(ctx):
         raise click.ClickException(f"Configuration already exists: {config_path}")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"config_path": str(config_path)})
+        return
     console.print(f"Created [bold]{config_path}[/bold]")
     console.print("Edit the model_id and base_url, then run [bold]local-coder[/bold].")
 
 
 @cli.command()
+@json_option
 @click.pass_context
 def checkpoint(ctx):
     """Create a local checkpoint of the current working tree."""
@@ -223,12 +251,16 @@ def checkpoint(ctx):
 
     try:
         saved = CheckpointManager(ctx.obj["project_root"]).create()
-        console.print(f"Created checkpoint [bold]{saved.checkpoint_id}[/bold]")
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"checkpoint": _checkpoint_json(saved)})
+        return
+    console.print(f"Created checkpoint [bold]{saved.checkpoint_id}[/bold]")
 
 
 @cli.command(name="checkpoints")
+@json_option
 @click.pass_context
 def checkpoints(ctx):
     """List local working-tree checkpoints."""
@@ -236,16 +268,20 @@ def checkpoints(ctx):
 
     try:
         saved = CheckpointManager(ctx.obj["project_root"]).list()
-        if not saved:
-            console.print("No checkpoints found.")
-            return
-        for item in saved:
-            console.print(f"{item.checkpoint_id}  {item.created_at}")
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"checkpoints": [_checkpoint_json(item) for item in saved]})
+        return
+    if not saved:
+        console.print("No checkpoints found.")
+        return
+    for item in saved:
+        console.print(f"{item.checkpoint_id}  {item.created_at}")
 
 
 @cli.command()
+@json_option
 @click.argument("checkpoint_id")
 @click.pass_context
 def rollback(ctx, checkpoint_id):
@@ -254,22 +290,158 @@ def rollback(ctx, checkpoint_id):
 
     try:
         restored = CheckpointManager(ctx.obj["project_root"]).rollback(checkpoint_id)
-        console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"checkpoint": _checkpoint_json(restored)})
+        return
+    console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
+
+
+@cli.command(name="tools")
+@json_option
+@click.pass_context
+def tools_command(ctx):
+    """List the agent's tools, their arguments, and which roles may use them."""
+    from local_coder.types import AgentRole
+
+    registry = _tool_registry(ctx.obj)
+    listed = [
+        {
+            "name": tool.name.value,
+            "description": tool.description,
+            "parameters": tool.parameters,
+            "roles": [role.value for role in AgentRole if registry.has_permission(role, tool.name)],
+        }
+        for tool in registry.get_tools_for_role(AgentRole.ORCHESTRATOR)
+    ]
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"tools": listed})
+        return
+    table = Table(title="Tools")
+    table.add_column("Tool", style="cyan", no_wrap=True)
+    table.add_column("Arguments", style="magenta")
+    table.add_column("Description", style="green")
+    for item in listed:
+        table.add_row(item["name"], ", ".join(item["parameters"].get("properties", {})), item["description"])
+    console.print(table)
+
+
+@cli.command(name="tool")
+@json_option
+@click.argument("name")
+@click.option("--arg", "-a", "pairs", multiple=True, metavar="KEY=VALUE",
+              help="A tool argument (repeatable). VALUE is parsed as JSON when it can be, else kept as a string.")
+@click.option("--args", "args_json", metavar="JSON", help="All tool arguments as one JSON object.")
+@click.pass_context
+def tool_command(ctx, name, pairs, args_json):
+    """Run one agent tool directly, with no model involved.
+
+        local-coder tool run_tests --json
+
+        local-coder tool grep -a pattern=TODO --json
+
+    Risky tools (run_command, git_commit, git_checkout) still ask for
+    approval unless --yolo is set. Exits 1 when the tool reports failure.
+    """
+    from local_coder.types import AgentRole
+
+    arguments = _parse_tool_arguments(pairs, args_json)
+    registry = _tool_registry(ctx.obj)
+    known = [tool.name.value for tool in registry.get_tools_for_role(AgentRole.ORCHESTRATOR)]
+    if name not in known:
+        raise click.BadParameter(f"unknown tool {name!r}; available: {', '.join(known)}", param_hint="NAME")
+    result = asyncio.run(registry.execute_tool(AgentRole.ORCHESTRATOR, name, arguments))
+    if json_mode(ctx.obj):
+        data = {"tool": name, "arguments": arguments, **result.model_dump(mode="json", exclude={"tool_call_id"})}
+        details = _TOOL_DETAILS.get(name)
+        data["details"] = details(result) if details else None
+        emit(ctx.obj, data, ok=result.success)
+        return
+    click.echo(result.output)
+    if result.error:
+        click.echo(result.error, err=True)
+    if not result.success:
+        ctx.exit(1)
+
+
+def _parse_tool_arguments(pairs: tuple[str, ...], args_json: str | None) -> dict:
+    import json
+
+    arguments: dict = {}
+    if args_json:
+        try:
+            arguments = json.loads(args_json)
+        except json.JSONDecodeError as exc:
+            raise click.BadParameter(f"not valid JSON: {exc}", param_hint="--args") from exc
+        if not isinstance(arguments, dict):
+            raise click.BadParameter("must be a JSON object", param_hint="--args")
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise click.BadParameter(f"expected KEY=VALUE, got {pair!r}", param_hint="--arg")
+        try:
+            arguments[key] = json.loads(value)
+        except json.JSONDecodeError:
+            arguments[key] = value
+    return arguments
+
+
+def _tool_registry(ctx_obj: dict):
+    """The same tool registry the agents get, with the CLI's approval wiring."""
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.tools import create_tool_registry
+    from local_coder.types import ApprovalConfig
+
+    try:
+        approval = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"]).approval
+    except Exception:
+        approval = ApprovalConfig()
+    if ctx_obj.get("yolo"):
+        approval.require_approval_for_commands = False
+        approval.require_approval_for_commits = False
+        callback = None
+    else:
+        callback = _json_approval_callback if json_mode(ctx_obj) else _cli_approval_callback
+    return create_tool_registry(ctx_obj["project_root"], approval, callback)
+
+
+def _run_tests_details(result) -> dict:
+    from local_coder.verification.failures import parse_failures
+
+    return {"failures": [{"test": f.test, "message": f.message} for f in parse_failures(result.output)]}
+
+
+# Extra structure pulled out of a tool's text output for `tool NAME --json`.
+_TOOL_DETAILS = {
+    "run_tests": _run_tests_details,
+}
+
+
+def _checkpoint_json(item) -> dict:
+    from dataclasses import asdict
+
+    return asdict(item)
 
 
 @cli.group(name="local-server")
+@json_option
 def local_server_group():
     """Start, stop, and choose models for this machine's local inference server(s)."""
 
 
 @local_server_group.command(name="models")
-def local_server_models():
+@json_option
+@click.pass_context
+def local_server_models(ctx):
     """List GGUF quantizations available on disk for the big model."""
+    from dataclasses import asdict
     from local_coder import local_server
 
     available = local_server.list_available_models()
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"models": [asdict(info) for info in available]})
+        return
     if not available:
         console.print(f"[red]No quants found under {local_server.AI2_DIR}/models/quants/[/red]")
         return
@@ -284,11 +456,16 @@ def local_server_models():
 
 
 @local_server_group.command(name="status")
-def local_server_status():
+@json_option
+@click.pass_context
+def local_server_status(ctx):
     """Show whether the big and draft model servers are running and healthy."""
     from local_coder import local_server
 
     state = local_server.status()
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"servers": state})
+        return
     table = Table(title="Local server status")
     table.add_column("Server", style="cyan")
     table.add_column("PID", style="magenta")
@@ -301,64 +478,81 @@ def local_server_status():
 
 
 @local_server_group.command(name="start")
+@json_option
 @click.option("--quant", default="q2_k", show_default=True, help="Which GGUF quant to load for the big model.")
 @click.option("--n-ctx", default=65536, show_default=True, type=int, help="Context length in tokens.")
 @click.option("--no-slot-cache", is_flag=True, help="Disable the disk-backed session cache (--slot-save-path).")
 @click.option("--no-draft", is_flag=True, help="Skip starting the small draft model.")
 @click.option("--wait/--no-wait", default=True, help="Wait for the server(s) to become healthy before returning.")
-def local_server_start(quant, n_ctx, no_slot_cache, no_draft, wait):
+@click.pass_context
+def local_server_start(ctx, quant, n_ctx, no_slot_cache, no_draft, wait):
     """Start the big model (and, by default, the draft model)."""
     from local_coder import local_server
 
+    data = {"big": None, "draft": None, "draft_error": None, "healthy": None}
     result = local_server.start_big_model(quant=quant, n_ctx=n_ctx, slot_cache=not no_slot_cache)
+    data["big"] = result
     console.print(f"Big model ({quant}): {result['status']} (pid {result.get('pid', '-')})")
     if not no_draft:
         try:
             draft_result = local_server.start_draft_model()
+            data["draft"] = draft_result
             console.print(f"Draft model: {draft_result['status']} (pid {draft_result.get('pid', '-')})")
         except FileNotFoundError as exc:
+            data["draft_error"] = str(exc)
             console.print(f"[yellow]Draft model not started:[/yellow] {exc}")
 
     if wait:
-        console.print("Waiting for the big model to warm up (can take 1-2 minutes)...")
-        if local_server.wait_healthy("big"):
-            console.print("[green]Big model is ready.[/green]")
-        else:
-            console.print(f"[red]Big model did not become healthy -- check {local_server.STATE_DIR / 'big_model.log'}[/red]")
+        data["healthy"] = _wait_for_big_model(local_server)
+    if json_mode(ctx.obj):
+        emit(ctx.obj, data, ok=data["healthy"] is not False)
+
+
+def _wait_for_big_model(local_server) -> bool:
+    console.print("Waiting for the big model to warm up (can take 1-2 minutes)...")
+    if local_server.wait_healthy("big"):
+        console.print("[green]Big model is ready.[/green]")
+        return True
+    console.print(f"[red]Big model did not become healthy -- check {local_server.STATE_DIR / 'big_model.log'}[/red]")
+    return False
 
 
 @local_server_group.command(name="switch")
+@json_option
 @click.option("--quant", required=True, help="Which GGUF quant to switch to.")
 @click.option("--n-ctx", default=65536, show_default=True, type=int)
 @click.option("--no-slot-cache", is_flag=True)
 @click.option("--wait/--no-wait", default=True)
-def local_server_switch(quant, n_ctx, no_slot_cache, wait):
+@click.pass_context
+def local_server_switch(ctx, quant, n_ctx, no_slot_cache, wait):
     """Stop the big model and restart it with a different quant (llama-server can't hot-swap weights)."""
     from local_coder import local_server
 
     result = local_server.switch_big_model(quant=quant, n_ctx=n_ctx, slot_cache=not no_slot_cache)
     console.print(f"Big model ({quant}): {result['status']} (pid {result.get('pid', '-')})")
-    if wait:
-        console.print("Waiting for the big model to warm up (can take 1-2 minutes)...")
-        if local_server.wait_healthy("big"):
-            console.print("[green]Big model is ready.[/green]")
-        else:
-            console.print(f"[red]Big model did not become healthy -- check {local_server.STATE_DIR / 'big_model.log'}[/red]")
+    healthy = _wait_for_big_model(local_server) if wait else None
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"big": result, "healthy": healthy}, ok=healthy is not False)
 
 
 @local_server_group.command(name="stop")
+@json_option
 @click.option("--big/--no-big", default=True)
 @click.option("--draft/--no-draft", default=True)
-def local_server_stop(big, draft):
+@click.pass_context
+def local_server_stop(ctx, big, draft):
     """Stop the running server(s)."""
     from local_coder import local_server
 
+    data = {"big": None, "draft": None}
     if big:
-        result = local_server.stop("big")
-        console.print(f"Big model: {result['status']}")
+        data["big"] = local_server.stop("big")
+        console.print(f"Big model: {data['big']['status']}")
     if draft:
-        result = local_server.stop("draft")
-        console.print(f"Draft model: {result['status']}")
+        data["draft"] = local_server.stop("draft")
+        console.print(f"Draft model: {data['draft']['status']}")
+    if json_mode(ctx.obj):
+        emit(ctx.obj, data)
 
 
 async def _cli_approval_callback(description: str) -> bool:
@@ -367,6 +561,17 @@ async def _cli_approval_callback(description: str) -> bool:
     since a single interactive session has nothing else to do meanwhile."""
     console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
     return click.confirm("Allow this action?", default=False)
+
+
+async def _json_approval_callback(description: str) -> bool:
+    """Approval prompt for --json runs: the prompt goes to stderr so stdout
+    stays pure JSON, and with no terminal to ask (a script piping stdin)
+    the action is denied rather than aborting the whole run."""
+    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+    if not sys.stdin.isatty():
+        console.print("[yellow]Denied: no terminal to confirm on (use --yolo to auto-approve).[/yellow]")
+        return False
+    return click.confirm("Allow this action?", default=False, err=True)
 
 
 def _build_coordinator(config, ctx_obj: dict):
@@ -379,21 +584,43 @@ def _build_coordinator(config, ctx_obj: dict):
         config.approval.require_approval_for_commands = False
         config.approval.require_approval_for_commits = False
         approval_callback = None
+    elif json_mode(ctx_obj):
+        approval_callback = _json_approval_callback
     else:
         approval_callback = _cli_approval_callback
 
     coordinator = Coordinator(
         config=config, project_root=ctx_obj["project_root"], approval_callback=approval_callback,
     )
-    coordinator.on_event(_event_handler)
+    coordinator.on_event(lambda event: _event_handler(event, ctx_obj))
     return coordinator
 
 
+def _agent_run_status(events: list[dict]) -> str:
+    """"completed" or "failed" from the coordinator's final event."""
+    for event in reversed(events):
+        if event["source"] == "ORCHESTRATOR" and event["event_type"] in ("task_completed", "task_failed"):
+            return "completed" if event["event_type"] == "task_completed" else "failed"
+    return "failed"
+
+
 def _run_request(request: str, ctx_obj: dict):
+    _run_agent(
+        ctx_obj, request, request=request, phase="run",
+        heading=f"Running request: [bold]{request}[/bold]", title="Local Coder",
+        result_title="Result", border="cyan", result_border="green",
+    )
+
+
+def _run_agent(
+    ctx_obj: dict, prompt: str, *, request: str, phase: str, heading: str, title: str,
+    result_title: str, border: str, result_border: str | None = None, save_session: bool = True,
+):
+    """Run one coordinator request and show (or, with --json, emit) the result."""
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.sessions import SessionStore
 
-    console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
+    console.print(Panel(heading, title=title, border_style=border))
 
     config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     if ctx_obj.get("model"):
@@ -402,19 +629,34 @@ def _run_request(request: str, ctx_obj: dict):
 
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
-
         try:
-            result = await coordinator.run(request)
-            SessionStore(ctx_obj["project_root"]).save(
-                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="run", result=result
-            )
-            console.print(Panel(Markdown(result), title="Result", border_style="green"))
+            result = await coordinator.run(prompt)
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             if ctx_obj.get("debug"):
                 import traceback
                 traceback.print_exc()
             raise click.ClickException(str(e)) from e
+
+        session_id = None
+        if save_session:
+            session_id = f"local-{uuid.uuid4().hex[:8]}"
+            SessionStore(ctx_obj["project_root"]).save(session_id, request=request, phase=phase, result=result)
+        if json_mode(ctx_obj):
+            events = ctx_obj.get("events", [])
+            status = _agent_run_status(events)
+            errors = [e for e in events if e["event_type"].endswith("error")]
+            emit(ctx_obj, {
+                "request": request,
+                "phase": phase,
+                "status": status,
+                "session_id": session_id,
+                "result": result,
+                "errors": errors,
+                "events": events,
+            }, ok=status == "completed" and not any(e["event_type"] == "model_error" for e in errors))
+            return
+        console.print(Panel(Markdown(result), title=result_title, border_style=result_border or border))
 
     asyncio.run(_run())
 
@@ -479,69 +721,29 @@ Available commands:
 
 
 def _run_plan(request: str, ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.sessions import SessionStore
-
-    console.print(Panel(f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan", border_style="yellow"))
-
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-
-    async def _run():
-        coordinator = _build_coordinator(config, ctx_obj)
-
-        try:
-            result = await coordinator.run(f"Create a detailed plan for: {request}")
-            SessionStore(ctx_obj["project_root"]).save(
-                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="plan", result=result
-            )
-            console.print(Panel(Markdown(result), title="Plan", border_style="yellow"))
-        except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
-            raise click.ClickException(str(e)) from e
-
-    asyncio.run(_run())
+    _run_agent(
+        ctx_obj, f"Create a detailed plan for: {request}", request=request, phase="plan",
+        heading=f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan",
+        result_title="Plan", border="yellow",
+    )
 
 
 def _run_review(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.sessions import SessionStore
-
-    console.print(Panel("Reviewing current changes", title="Local Coder - Review", border_style="white"))
-
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-
-    async def _run():
-        coordinator = _build_coordinator(config, ctx_obj)
-        try:
-            result = await coordinator.run("Review current uncommitted changes")
-            SessionStore(ctx_obj["project_root"]).save(
-                f"local-{uuid.uuid4().hex[:8]}", request="Review current uncommitted changes", phase="review", result=result
-            )
-            console.print(Panel(Markdown(result), title="Review", border_style="white"))
-        except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
-            raise click.ClickException(str(e)) from e
-
-    asyncio.run(_run())
+    request = "Review current uncommitted changes"
+    _run_agent(
+        ctx_obj, request, request=request, phase="review",
+        heading="Reviewing current changes", title="Local Coder - Review",
+        result_title="Review", border="white",
+    )
 
 
 def _run_tests(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
-
-    console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
-
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-
-    async def _run():
-        coordinator = _build_coordinator(config, ctx_obj)
-        try:
-            result = await coordinator.run("Run project tests and report results")
-            console.print(Panel(Markdown(result), title="Test Results", border_style="magenta"))
-        except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
-            raise click.ClickException(str(e)) from e
-
-    asyncio.run(_run())
+    request = "Run project tests and report results"
+    _run_agent(
+        ctx_obj, request, request=request, phase="test",
+        heading="Running tests", title="Local Coder - Test",
+        result_title="Test Results", border="magenta", save_session=False,
+    )
 
 
 def _run_checkpoint(ctx_obj: dict):
@@ -580,35 +782,61 @@ def _run_rollback(checkpoint_id: str, ctx_obj: dict):
 def _run_status(ctx_obj: dict):
     import subprocess
     from local_coder.orchestrator.config_loader import load_config
-    
-    console.print(Panel("System Status", title="Local Coder", border_style="cyan"))
-    
+
+    as_json = json_mode(ctx_obj)
+    data = {
+        "project_root": ctx_obj["project_root"],
+        "models_configured": None,
+        "config_error": None,
+        "git_branch": None,
+        "ollama": {"reachable": False, "status_code": None},
+    }
+    if not as_json:
+        console.print(Panel("System Status", title="Local Coder", border_style="cyan"))
+
     try:
         config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-        console.print(f"[bold]Models Configured:[/bold] {len(config.models)}")
+        data["models_configured"] = len(config.models)
+        if not as_json:
+            console.print(f"[bold]Models Configured:[/bold] {len(config.models)}")
     except Exception as e:
-        console.print(f"[red]Failed to load config:[/red] {e}")
-        
+        data["config_error"] = str(e)
+        if not as_json:
+            console.print(f"[red]Failed to load config:[/red] {e}")
+
     project_root = ctx_obj["project_root"]
-    console.print(f"[bold]Project Root:[/bold] {project_root}")
-    
+    if not as_json:
+        console.print(f"[bold]Project Root:[/bold] {project_root}")
+
     try:
-        branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=project_root, text=True).strip()
-        console.print(f"[bold]Git Branch:[/bold] {branch}")
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=project_root, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        data["git_branch"] = branch
+        if not as_json:
+            console.print(f"[bold]Git Branch:[/bold] {branch}")
     except Exception:
-        console.print("[bold]Git Branch:[/bold] Not a git repository or git not found")
-        
+        if not as_json:
+            console.print("[bold]Git Branch:[/bold] Not a git repository or git not found")
+
     # Try to check Ollama connectivity
-    console.print("[bold]Ollama Connectivity:[/bold] ", end="")
     try:
         import httpx
         with httpx.Client(timeout=2.0) as client:
             resp = client.get("http://localhost:11434/api/tags")
-            if resp.status_code == 200:
-                console.print("[green]OK[/green]")
-            else:
-                console.print(f"[red]Failed ({resp.status_code})[/red]")
+            data["ollama"] = {"reachable": resp.status_code == 200, "status_code": resp.status_code}
     except Exception:
+        pass
+
+    if as_json:
+        emit(ctx_obj, data)
+        return
+    console.print("[bold]Ollama Connectivity:[/bold] ", end="")
+    if data["ollama"]["reachable"]:
+        console.print("[green]OK[/green]")
+    elif data["ollama"]["status_code"] is not None:
+        console.print(f"[red]Failed ({data['ollama']['status_code']})[/red]")
+    else:
         console.print("[red]Failed to connect (Is Ollama running?)[/red]")
 
 
@@ -637,6 +865,8 @@ def _show_agents(ctx_obj: dict):
     try:
         config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     except Exception as e:
+        if json_mode(ctx_obj):
+            raise click.ClickException(f"Failed to load config: {e}") from e
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
 
@@ -648,6 +878,17 @@ def _show_agents(ctx_obj: dict):
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
     }
+
+    if json_mode(ctx_obj):
+        emit(ctx_obj, {"agents": [
+            {
+                "role": role.value,
+                "model": model if (model := _resolve_model_name(config, role)) in config.models else None,
+                "system_prompt": agent_cls.system_prompt.strip().splitlines()[0],
+            }
+            for role, agent_cls in agent_classes.items()
+        ]})
+        return
 
     table = Table(title="Configured Agents")
     table.add_column("Agent", style="cyan", no_wrap=True)
@@ -668,7 +909,24 @@ def _show_models(ctx_obj: dict):
     try:
         config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
     except Exception as e:
+        if json_mode(ctx_obj):
+            raise click.ClickException(f"Failed to load config: {e}") from e
         console.print(f"[red]Failed to load config:[/red] {e}")
+        return
+
+    if json_mode(ctx_obj):
+        emit(ctx_obj, {"models": [
+            {
+                "name": name,
+                "backend": model.backend.value,
+                "model_id": model.model_id,
+                "base_url": model.base_url,
+                "context_length": model.context_length,
+                "temperature": model.temperature,
+                "max_tokens": model.max_tokens,
+            }
+            for name, model in config.models.items()
+        ]})
         return
 
     table = Table(title="Configured Models")

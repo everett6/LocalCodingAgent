@@ -42,6 +42,24 @@ local-coder rollback <checkpoint-id>
 local-coder --version
 ```
 
+### JSON output for scripts
+
+Add `--json` to any command (before or after the subcommand) to get a single
+JSON document on stdout instead of formatted text; progress and prompts go to
+stderr and the exit code is 1 whenever the result's `ok` is false:
+
+```bash
+local-coder status --json | jq .data.git_branch
+local-coder --json review > review.json
+local-coder tool run_tests --json | jq '.data.details.failures'
+local-coder tool grep -a pattern=TODO --json
+local-coder tools --json          # every tool with its argument schema
+```
+
+`local-coder tool NAME` runs one agent tool directly with no model involved.
+The envelope and each command's fields are documented in
+[docs/json-output.md](docs/json-output.md).
+
 Running `local-coder` with no arguments opens the interactive terminal mode.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
