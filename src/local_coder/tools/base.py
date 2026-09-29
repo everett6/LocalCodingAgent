@@ -102,10 +102,12 @@ class ToolRegistry:
             AgentRole.ORCHESTRATOR: set(ToolName),  # Full access
         }
 
-        # code_search is read-only, so every role that can grep can use it.
+        # code_search and repo_map are read-only, so every role that can
+        # grep can use them.
         for allowed in self._permissions.values():
             if ToolName.GREP in allowed:
                 allowed.add(ToolName.CODE_SEARCH)
+                allowed.add(ToolName.REPO_MAP)
     
     def register(self, tool: Tool) -> None:
         """Register a tool instance."""

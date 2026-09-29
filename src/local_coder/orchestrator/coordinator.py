@@ -7,7 +7,7 @@ from typing import Any, Callable, Protocol
 from local_coder.approval import ApprovalCallback
 from local_coder.types import (
     ProjectConfig, AgentEvent, AgentRole, AgentTask, TaskContext, TaskPlan, AgentResponse,
-    TaskStatus,
+    TaskStatus, ToolName,
 )
 from local_coder.agents import create_agent
 from local_coder.tools import create_tool_registry
@@ -182,6 +182,25 @@ class Coordinator:
         digest = hashlib.sha256(os.path.abspath(self.project_root).encode()).hexdigest()[:16]
         return f"local-coder-{digest}.bin"
 
+    async def _repo_map(self, query: str, files: list[str] | None = None) -> str:
+        """Ranked repo map for a task's context, or "" if it is off or fails."""
+        budget = self.config.agentic.repo_map_tokens
+        tool = self.tool_registry.get_tool(ToolName.REPO_MAP)
+        if budget <= 0 or tool is None:
+            return ""
+        try:
+            text = await asyncio.to_thread(tool.repo_map.build, query, files or [], budget)
+        except Exception as e:  # orientation is a bonus; never block the task on it
+            self._emit("ORCHESTRATOR", "repo_map_error", f"Could not build repo map: {e}")
+            return ""
+        if not text:
+            return ""
+        return (
+            "Most relevant files and their key definitions, ranked for this task "
+            "(number = line where each starts). read_file the ranges you need; "
+            "call repo_map with other terms to re-center it.\n" + text
+        )
+
     async def _explore(self, request: str) -> str:
         model = await self.model_manager.get_model(AgentRole.EXPLORER)
 
@@ -205,7 +224,11 @@ class Coordinator:
             compact_context_chars=self.config.agentic.compact_context_chars,
         )
         if explorer:
-            task = AgentTask(role=AgentRole.EXPLORER, objective=request)
+            task = AgentTask(
+                role=AgentRole.EXPLORER,
+                objective=request,
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await explorer.execute(task)
             if self.config.agentic.session_cache:
                 save = getattr(model, "save_slot", None)
@@ -217,7 +240,11 @@ class Coordinator:
     async def _plan(self, request: str, exploration: str) -> TaskPlan:
         planner = create_agent(AgentRole.PLANNER, await self.model_manager.get_model(AgentRole.PLANNER), self.tool_registry, self._dispatch)
         if planner:
-            task = AgentTask(role=AgentRole.PLANNER, objective=f"Request: {request}\nExploration: {exploration}")
+            task = AgentTask(
+                role=AgentRole.PLANNER,
+                objective=f"Request: {request}\nExploration: {exploration}",
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await planner.execute(task)
             plan_data = response.summary
             
@@ -286,7 +313,11 @@ class Coordinator:
             drafter=await self._get_drafter(),
         )
         if coder:
-            task = AgentTask(role=AgentRole.CODER, objective=f"Request: {request}\nContext: {exploration}")
+            task = AgentTask(
+                role=AgentRole.CODER,
+                objective=f"Request: {request}\nContext: {exploration}",
+                context=TaskContext(architecture=await self._repo_map(request)),
+            )
             response = await coder.execute(task)
             return response
         return AgentResponse(
@@ -403,6 +434,8 @@ class Coordinator:
                     drafter=drafter,
                 )
                 if agent:
+                    if not task.context.architecture:
+                        task.context.architecture = await self._repo_map(task.objective, task.files)
                     response = await agent.execute(task)
                 else:
                     response = AgentResponse(

@@ -58,6 +58,7 @@ class ToolName(str, enum.Enum):
     SEARCH_FILES = "search_files"
     GREP = "grep"
     CODE_SEARCH = "code_search"
+    REPO_MAP = "repo_map"
     GIT_STATUS = "git_status"
     GIT_DIFF = "git_diff"
     GIT_LOG = "git_log"
@@ -307,6 +308,9 @@ class AgenticConfig(BaseModel):
     # support and is a no-op (silently ignored) otherwise. See README.md's
     # "Local model server" section.
     session_cache: bool = False
+    # Size in tokens of the ranked repo map given to agents at the start of
+    # a task (0 turns it off). See context/repo_map.py.
+    repo_map_tokens: int = 1024
 
 
 class ProjectConfig(BaseModel):

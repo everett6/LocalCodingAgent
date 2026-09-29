@@ -312,6 +312,19 @@ def rollback(ctx, checkpoint_id):
         raise click.ClickException(str(exc)) from exc
 
 
+@cli.command(name="map")
+@click.argument("query", nargs=-1)
+@click.option("--file", "-f", "files", multiple=True, help="File the work is about (repeatable)")
+@click.option("--tokens", "-t", default=1024, show_default=True, type=int, help="Approximate map size")
+@click.pass_context
+def repo_map(ctx, query, files, tokens):
+    """Print the ranked repo map agents see, optionally centered on QUERY."""
+    from local_coder.context.repo_map import RepoMap
+
+    text = RepoMap(ctx.obj["project_root"]).build(" ".join(query), list(files), tokens)
+    click.echo(text or "No source files with definitions were found.")
+
+
 @cli.group(name="local-server")
 def local_server_group():
     """Start, stop, and choose models for this machine's local inference server(s)."""

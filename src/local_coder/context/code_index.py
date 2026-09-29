@@ -535,3 +535,13 @@ class CodeIndex:
             best = [n for _, n in sorted(ranked) if n != hit.start][: max_lines - 1]
             chosen = sorted({hit.start, *best}) if hit.start <= len(lines) else sorted(best)
             hit.snippet = [(n, lines[n - 1].rstrip()[:200]) for n in chosen]
+
+    def file_chunks(self, refresh: bool = True) -> dict[str, list[list]]:
+        """Snapshot of every indexed file's chunks, for the repo map.
+
+        Each chunk is ``[start, end, kind, symbol, tf]`` as stored on disk.
+        """
+        if refresh:
+            self.refresh()
+        with self._lock:
+            return {rel: list(entry.get("chunks", [])) for rel, entry in list(self._files.items())}

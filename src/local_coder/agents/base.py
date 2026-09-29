@@ -671,6 +671,9 @@ class BaseAgent:
         if task.success_criteria:
             parts.append("## Success Criteria\n" + "\n".join(f"- {s}" for s in task.success_criteria))
         
+        if task.context.architecture:
+            parts.append(f"## Repository Map\n{task.context.architecture}")
+
         if task.context.file_contents:
             parts.append("## File Contents")
             for path, content in task.context.file_contents.items():
