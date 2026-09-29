@@ -17,6 +17,10 @@ class OllamaBackend(BaseModelBackend):
         super().__init__(config)
         self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0)
 
+    def _encode_tool_arguments(self, arguments: dict):
+        """Ollama's /api/chat takes tool-call arguments as an object."""
+        return arguments
+
     async def generate(
         self,
         messages: list[Message],
