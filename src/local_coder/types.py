@@ -70,6 +70,7 @@ class ToolName(str, enum.Enum):
     LINT = "lint"
     FORMAT_CODE = "format_code"
     SECURITY_SCAN = "security_scan"
+    RECORD_FINDING = "record_finding"
 
 
 # === Messages ===
@@ -152,6 +153,7 @@ class TaskContext(BaseModel):
     """Context provided to an agent for a task."""
     architecture: str = ""
     guidelines: str = ""
+    security_lessons: str = ""  # SECURITY_LESSONS.md, for security roles
     relevant_symbols: list[str] = Field(default_factory=list)
     previous_findings: list[str] = Field(default_factory=list)
     file_contents: dict[str, str] = Field(default_factory=dict)

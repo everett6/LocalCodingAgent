@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from local_coder.security.ledger import SEVERITIES, STATUSES, FindingsLedger, LedgerEntry
+from local_coder.security.lessons import LESSONS_FILE, LessonStore
+from local_coder.security.triage import (
+    BASELINE_FILE, LAST_SCAN_FILE, load_fingerprints, save_fingerprints, triage,
+)
 from local_coder.tools.base import Tool
 from local_coder.tools.quality import EXCLUDED_DIRS, find_executable, run_bounded
 from local_coder.types import ToolName, ToolResult
@@ -180,6 +185,16 @@ class SecurityScanTool(Tool):
             return None, (stderr.decode(errors="replace").strip() or f"exit code {returncode}")[:2000]
         return stdout.decode(errors="replace"), ""
 
+    @staticmethod
+    def _remember_scan(root: Path, fingerprints: set[str]) -> None:
+        """Accumulate what this review's scans saw; the coordinator turns it
+        into the baseline when the review finishes."""
+        try:
+            previous = load_fingerprints(root / LAST_SCAN_FILE) or set()
+            save_fingerprints(root / LAST_SCAN_FILE, previous | fingerprints)
+        except OSError:
+            pass
+
     def _semgrep_config(self) -> str | None:
         root = Path(self.project_root)
         return next((name for name in SEMGREP_CONFIGS if (root / name).exists()), None)
@@ -242,11 +257,24 @@ class SecurityScanTool(Tool):
                         findings += parse_semgrep(out)
                         ran.append("semgrep")
 
-            findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.path, f.line))
+            root = workspace.root
+            triaged = triage(
+                findings, root, LessonStore(root).suppressions(), load_fingerprints(root / BASELINE_FILE),
+            )
+            findings = triaged.findings
+            self._remember_scan(root, set(triaged.fingerprints.values()))
+
             counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
             summary = ", ".join(f"{n} {sev.lower()}" for sev, n in counts.items() if n) or "none"
             lines = [f"Scanners run: {', '.join(ran) or 'none'}", f"Findings: {len(findings)} ({summary})"]
-            lines += [f.render() for f in findings[:MAX_FINDINGS]]
+            if triaged.suppressed:
+                lines.append(f"Suppressed by {LESSONS_FILE}: {len(triaged.suppressed)} (known false positives)")
+            if triaged.has_baseline:
+                lines.append(f"New since the last review: {len(triaged.new)} (marked [new]; the rest were seen before)")
+            lines += [
+                f.render() + (" [new]" if triaged.has_baseline and triaged.is_new(f) else "")
+                for f in findings[:MAX_FINDINGS]
+            ]
             if len(findings) > MAX_FINDINGS:
                 lines.append(f"...[{len(findings) - MAX_FINDINGS} more findings not shown; narrow paths to see them]")
             lines += [f"Note: {n}" for n in notes]
@@ -254,6 +282,73 @@ class SecurityScanTool(Tool):
             return ToolResult(
                 success=not errors and bool(ran),
                 output="\n".join(lines),
+                duration_ms=int((time.time() - start_t) * 1000),
+            )
+        except Exception as e:
+            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time() - start_t) * 1000))
+
+
+class RecordFindingTool(Tool):
+    """Write a finding to the review's ledger (.local-coder/security/ledger.json).
+
+    The ledger is kept outside the conversation, so it survives context
+    compaction and carries over between the batches of a long review. It is
+    the only thing this tool writes; project files are never touched.
+    """
+
+    name = ToolName.RECORD_FINDING
+    description = (
+        "Record a security finding in the review ledger as soon as you have evidence for it, "
+        "and again to update it (same path and rule/title updates the entry). The ledger survives "
+        "context compaction, so anything not recorded here may be forgotten. Mark scanner results you "
+        "disproved as false_positive with their rule so future reviews can learn to skip them. "
+        "Writes only the agent's own state file, never project code."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short name, e.g. 'SQL injection in get_user'"},
+            "severity": {"type": "string", "enum": list(SEVERITIES)},
+            "path": {"type": "string", "description": "File relative to the project root"},
+            "line": {"type": "integer", "description": "Line of the vulnerable sink"},
+            "rule": {"type": "string", "description": "Scanner rule id if a scanner flagged it, e.g. B602 or secrets/hardcoded-credential"},
+            "status": {"type": "string", "enum": list(STATUSES), "description": "suspected until you traced the full path"},
+            "confidence": {"type": "integer", "minimum": 1, "maximum": 10, "description": "How sure you are it is exploitable (8+ is reported)"},
+            "exploit_path": {"type": "string", "description": "Attacker-controlled input and the path it takes to the sink"},
+            "fix": {"type": "string", "description": "Concrete fix"},
+            "lesson": {"type": "string", "description": "Optional reusable lesson for future reviews of this project"},
+        },
+        "required": ["title", "severity", "path"],
+    }
+
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+
+    async def execute(self, title: str = "", severity: str = "MEDIUM", path: str = "", line: int = 0,
+                      rule: str = "", status: str = "", confidence: int | None = None, exploit_path: str = "",
+                      fix: str = "", lesson: str = "", **kwargs: Any) -> ToolResult:
+        start_t = time.time()
+        try:
+            if not title.strip() or not path.strip():
+                raise ValueError("title and path are required")
+            workspace = Workspace(self.project_root)
+            rel = workspace.relative_path(path)
+            severity = str(severity).upper()
+            if severity not in SEVERITIES:
+                raise ValueError(f"severity must be one of {', '.join(SEVERITIES)}")
+            if status and status not in STATUSES:
+                raise ValueError(f"status must be one of {', '.join(STATUSES)}")
+            ledger = FindingsLedger.for_project(workspace.root)
+            entry, created = ledger.record(LedgerEntry(
+                title=title.strip(), severity=severity, path=rel, line=int(line or 0), rule=rule.strip(),
+                # Empty status / confidence 0 mean "unchanged" on an update.
+                status=status, confidence=max(1, min(10, int(confidence))) if confidence is not None else 0,
+                exploit_path=exploit_path.strip(), fix=fix.strip(), lesson=lesson.strip(),
+            ))
+            verb = "Recorded" if created else "Updated"
+            return ToolResult(
+                success=True,
+                output=f"{verb} {entry.render()}\nLedger: {len(ledger.entries)} finding(s).",
                 duration_ms=int((time.time() - start_t) * 1000),
             )
         except Exception as e:

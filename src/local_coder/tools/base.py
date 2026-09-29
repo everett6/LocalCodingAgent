@@ -88,7 +88,7 @@ class ToolRegistry:
                 ToolName.READ_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
-                ToolName.LINT, ToolName.SECURITY_SCAN,
+                ToolName.LINT, ToolName.SECURITY_SCAN, ToolName.RECORD_FINDING,
             },
             # Red-team companion: reproduce an already-identified finding as a
             # local PoC test. It can write test files and run tests, but has no
@@ -97,7 +97,7 @@ class ToolRegistry:
                 ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF,
-                ToolName.SECURITY_SCAN, ToolName.RUN_TESTS,
+                ToolName.SECURITY_SCAN, ToolName.RUN_TESTS, ToolName.RECORD_FINDING,
             },
             AgentRole.ORCHESTRATOR: set(ToolName),  # Full access
         }
