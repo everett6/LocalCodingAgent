@@ -311,3 +311,24 @@ Run the tests with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+**Small-model guardrails:** three more checks in the same loop, for mistakes
+local models make far more often than frontier ones.
+
+- *Tool-call repair* (`agents/tool_repair.py`). A call written as text
+  (`<tool_call>{...}</tool_call>`, `<function=name>{...}</function>`, or a
+  message that is only a JSON call) is run as a real call. Arguments with
+  single quotes, `True`, a trailing comma, or a missing closing brace are
+  repaired; arguments that can't be repaired are reported back to the model
+  instead of silently running the tool with none. Near-miss names
+  (`ReadFile`, `bash`), aliased argument names (`file_path` for `path`), and
+  string-typed booleans and integers are mapped onto the schema, and the
+  tool result says what was reinterpreted.
+- *Read before overwrite.* `write_file` refuses to replace an existing file
+  the agent hasn't read (or written) in the current task.
+- *Syntax check after edits* (`verification/syntax.py`). Any `.py`, `.json`,
+  `.toml`, or `.yaml` file an edit touches is parsed in-process; if it no
+  longer parses, the edit's tool result carries the error and the lines
+  around it.
+
+Each can be turned off per agent class with `parse_text_tool_calls`,
+`require_read_before_overwrite`, and `check_syntax_after_edits`.
