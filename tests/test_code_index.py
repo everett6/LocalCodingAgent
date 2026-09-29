@@ -215,3 +215,49 @@ class TestRepositoryContext:
         ctx = RepositoryContext(str(project))
         files = asyncio.run(ctx.get_relevant_files("retry backoff timeout", max_files=2))
         assert files[0] == "src/retry.py"
+
+
+def test_index_skips_symlinks_that_leave_the_project(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "credentials.py").write_text("aws_secret_access_key = 'wJalrXUtnFEMIexample'\n")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.py").write_text("def load_secret_access_key():\n    return None\n")
+    (root / "creds.py").symlink_to(outside / "credentials.py")
+
+    index = CodeIndex(str(root))
+    hits = index.search("secret access key")
+    assert {hit.path for hit in hits} == {"app.py"}
+
+
+def test_index_save_does_not_follow_a_symlinked_state_dir(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.py").write_text("def handler():\n    pass\n")
+    (root / ".local-coder").symlink_to(outside)
+
+    CodeIndex(str(root)).refresh()
+    assert list(outside.iterdir()) == []
+
+
+def test_index_creates_gitignored_state_dir(project):
+    CodeIndex(str(project)).refresh()
+    assert (project / INDEX_RELPATH).is_file()
+    assert (project / ".local-coder" / ".gitignore").read_text().strip().endswith("*")
+
+
+def test_concurrent_searches_share_one_index(project):
+    index = CodeIndex(str(project))
+
+    async def many():
+        return await asyncio.gather(*(
+            asyncio.to_thread(index.search, "parse config") for _ in range(16)
+        ))
+
+    for i in range(20):
+        (project / "src" / f"gen_{i}.py").write_text(f"def parse_config_{i}():\n    pass\n")
+    results = asyncio.run(many())
+    assert all(results)

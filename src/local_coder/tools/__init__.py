@@ -2,11 +2,13 @@
 
 from local_coder.approval import ApprovalCallback
 from local_coder.tools.base import ToolRegistry
-from local_coder.tools.filesystem import ReadFileTool, WriteFileTool, ListFilesTool, ApplyPatchTool
+from local_coder.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListFilesTool, ApplyPatchTool
 from local_coder.tools.search import SearchFilesTool, GrepTool
 from local_coder.tools.git import GitStatusTool, GitDiffTool, GitLogTool, GitCommitTool, GitCheckoutTool
 from local_coder.tools.shell import RunCommandTool
 from local_coder.tools.testing import RunTestsTool, BuildTool
+from local_coder.tools.quality import LintTool, FormatCodeTool
+from local_coder.tools.security import SecurityScanTool
 from local_coder.types import ApprovalConfig
 from local_coder.tools.code_search import CodeSearchTool
 from local_coder.tools.repo_map import RepoMapTool
@@ -28,6 +30,7 @@ def create_tool_registry(
     # Filesystem tools
     registry.register(ReadFileTool(project_root))
     registry.register(WriteFileTool(project_root))
+    registry.register(EditFileTool(project_root))
     registry.register(ListFilesTool(project_root))
     registry.register(ApplyPatchTool(project_root))
 
@@ -52,5 +55,10 @@ def create_tool_registry(
     # Testing tools
     registry.register(RunTestsTool(project_root))
     registry.register(BuildTool(project_root))
+
+    # Code quality tools
+    registry.register(LintTool(project_root))
+    registry.register(FormatCodeTool(project_root))
+    registry.register(SecurityScanTool(project_root))
 
     return registry

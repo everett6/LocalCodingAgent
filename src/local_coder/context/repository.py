@@ -337,6 +337,21 @@ class RepositoryContext:
 
         return info
 
+    GUIDELINE_FILES = ("AGENTS.md", "CLAUDE.md")
+
+    async def get_agent_guidelines(self, max_chars: int = 8000) -> str:
+        """Read the project's model-facing guidelines file, if present.
+
+        AGENTS.md (or CLAUDE.md) documents the tools and conventions the local
+        model should follow. It is loaded into every task's context so the
+        model reads it before acting.
+        """
+        for name in self.GUIDELINE_FILES:
+            content = await self.read_file_safe(name, max_chars=max_chars)
+            if content:
+                return content.strip()
+        return ""
+
     async def build_task_context(
         self,
         objective: str,
@@ -346,6 +361,9 @@ class RepositoryContext:
     ) -> TaskContext:
         """Build a TaskContext for an agent task."""
         ctx = TaskContext()
+
+        # Model-facing project guidelines (AGENTS.md / CLAUDE.md)
+        ctx.guidelines = await self.get_agent_guidelines()
 
         # Add architecture info
         if include_tree:

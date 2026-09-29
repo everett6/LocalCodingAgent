@@ -19,9 +19,12 @@ import math
 import os
 import re
 import subprocess
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from local_coder.statedir import state_path, write_state_file
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +293,8 @@ class CodeIndex:
         self._df: Counter[str] = Counter()
         self._avgdl = 1.0
         self._loaded = False
+        # Parallel agents share one index and search it from worker threads.
+        self._lock = threading.RLock()
 
     # --- file discovery ---
 
@@ -326,7 +331,13 @@ class CodeIndex:
                 break
         return out
 
+    def _inside(self, full: Path) -> bool:
+        """False for a committed symlink that points outside the project."""
+        return Path(os.path.realpath(full)).is_relative_to(self.project_root)
+
     def _read_text(self, full: Path) -> str | None:
+        if not self._inside(full):
+            return None
         try:
             data = full.read_bytes()
         except OSError:
@@ -355,11 +366,12 @@ class CodeIndex:
         if not self.persist:
             return
         try:
-            self.index_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.index_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"version": INDEX_VERSION, "files": self._files}), "utf-8")
-            os.replace(tmp, self.index_path)
-        except OSError as e:
+            tmp = write_state_file(
+                self.project_root, INDEX_RELPATH.with_suffix(".tmp"),
+                json.dumps({"version": INDEX_VERSION, "files": self._files}),
+            )
+            os.replace(tmp, state_path(self.project_root, INDEX_RELPATH))
+        except (OSError, ValueError) as e:
             logger.debug("Could not persist code index: %s", e)
 
     # --- build / refresh ---
@@ -369,6 +381,10 @@ class CodeIndex:
 
         Returns counts of files that were added/updated, removed, and kept.
         """
+        with self._lock:
+            return self._refresh()
+
+    def _refresh(self) -> dict[str, int]:
         if not self._loaded:
             self._load()
 
@@ -380,7 +396,7 @@ class CodeIndex:
                 st = full.stat()
             except OSError:
                 continue
-            if not full.is_file() or st.st_size > MAX_FILE_BYTES:
+            if not full.is_file() or st.st_size > MAX_FILE_BYTES or not self._inside(full):
                 continue
             seen.add(rel)
             entry = self._files.get(rel)
@@ -448,6 +464,10 @@ class CodeIndex:
         refresh: bool = True,
     ) -> list[SearchHit]:
         """Rank code chunks against a natural-language or identifier query."""
+        with self._lock:
+            return self._search(query, max_results, path_prefix, refresh)
+
+    def _search(self, query: str, max_results: int, path_prefix: str | None, refresh: bool) -> list[SearchHit]:
         if refresh:
             self.refresh()
         terms = list(dict.fromkeys(tokenize(query)))

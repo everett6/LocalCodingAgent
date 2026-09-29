@@ -1,9 +1,24 @@
 """Abstract base for local model backends."""
 from __future__ import annotations
 import abc
+import json
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 from local_coder.types import Message, ModelResponse, ModelConfig
+
+
+def decode_tool_arguments(raw) -> dict:
+    """Decode a tool call's arguments leniently. Arguments that can't be
+    repaired are kept under RAW_ARGUMENTS_KEY so the agent can tell the
+    model what went wrong, instead of running the tool with no arguments."""
+    from local_coder.agents.tool_repair import RAW_ARGUMENTS_KEY, parse_arguments
+
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    parsed = parse_arguments(raw) if isinstance(raw, str) else None
+    return parsed if parsed is not None else {RAW_ARGUMENTS_KEY: str(raw)}
 
 
 @runtime_checkable
@@ -94,7 +109,7 @@ class BaseModelBackend(abc.ABC):
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": str(tc.arguments),
+                            "arguments": self._encode_tool_arguments(tc.arguments),
                         }
                     }
                     for tc in msg.tool_calls
@@ -103,3 +118,11 @@ class BaseModelBackend(abc.ABC):
                 d["tool_call_id"] = msg.tool_call_id
             result.append(d)
         return result
+
+    def _encode_tool_arguments(self, arguments: dict):
+        """OpenAI-compatible APIs take arguments as a JSON string. This used
+        to send str(dict), a Python repr with single quotes that isn't JSON,
+        so the model saw its own past calls in a different shape than it
+        wrote them. Compact separators because every past call is re-sent
+        on every turn."""
+        return json.dumps(arguments, separators=(",", ":"), default=str)
