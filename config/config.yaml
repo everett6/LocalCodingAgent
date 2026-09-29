@@ -62,13 +62,20 @@ resources:
   gpu_memory_target_percent: 85.0
   model_unload_timeout_seconds: 300
 
-# Agent tool permissions (defaults are built-in, override here)
-# permissions:
-#   - role: coder
-#     allowed_tools:
-#       - read_file
-#       - write_file
-#       - ...
+# Tool settings (defaults are built-in; see README.md "Configuration")
+# tools:
+#   disabled: [git_commit]
+#   command_timeout: 120
+#   roles:
+#     reviewer: [read_file, list_files, grep, git_diff]
+
+# Multi-model routing beyond agentic.role_models below (see README.md
+# "Configuration"). escalate_to reruns a failed step on a stronger model;
+# fallbacks switch models when one's server is unreachable.
+# routing:
+#   escalate_to: orchestrator
+#   fallbacks:
+#     coder: [orchestrator]
 
 # Operations requiring human approval. When true and no interactive
 # approval handler is available (e.g. a headless/remote run), the action

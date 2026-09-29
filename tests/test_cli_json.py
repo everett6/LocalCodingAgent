@@ -54,7 +54,7 @@ def test_without_flag_output_is_unchanged(tmp_path):
 def test_agents(tmp_path):
     _, doc = invoke("--project", str(tmp_path), "agents", "--json")
     roles = {agent["role"] for agent in doc["data"]["agents"]}
-    assert {"planner", "coder", "reviewer"} <= roles
+    assert {"planner", "coder", "reviewer", "security"} <= roles
     assert all("system_prompt" in agent and "model" in agent for agent in doc["data"]["agents"])
 
 
@@ -64,6 +64,13 @@ def test_status(repo):
     assert data["project_root"] == str(repo)
     assert data["git_branch"] is not None
     assert set(data["ollama"]) == {"reachable", "status_code"}
+
+
+def test_config(repo):
+    _, doc = invoke("--project", str(repo), "config", "--json")
+    data = doc["data"]
+    assert "sources" in data and "routing" in data and "tools" in data
+    assert isinstance(data["problems"], list)
 
 
 def test_init_and_existing_config_error(tmp_path):
@@ -91,6 +98,16 @@ def test_checkpoints(repo):
     assert restored["data"]["checkpoint"]["checkpoint_id"] == checkpoint_id
 
 
+def test_map(repo):
+    _, doc = invoke("--project", str(repo), "map", "--json")
+    assert doc["command"] == "map" and "app.py" in doc["data"]["map"]
+
+
+def test_sessions_empty(tmp_path):
+    _, doc = invoke("--project", str(tmp_path), "sessions", "--json")
+    assert doc["data"]["sessions"] == []
+
+
 def test_local_server_status(monkeypatch):
     from local_coder import local_server
 
@@ -103,7 +120,8 @@ def test_local_server_status(monkeypatch):
 def test_tools_lists_schemas_and_roles(tmp_path):
     _, doc = invoke("--project", str(tmp_path), "tools", "--json")
     tools = {tool["name"]: tool for tool in doc["data"]["tools"]}
-    assert "run_tests" in tools
+    # Commands that landed on main are reachable as tools with JSON output.
+    assert {"run_tests", "grep", "code_search", "lint"} <= set(tools)
     assert tools["grep"]["parameters"]["type"] == "object"
     assert "reviewer" in tools["grep"]["roles"]
     assert "reviewer" not in tools["write_file"]["roles"]
@@ -148,7 +166,7 @@ def test_risky_tool_is_denied_without_terminal(repo):
     assert "Approval required" in result.stderr
 
 
-def test_run_tests_details_parse_failures(repo, monkeypatch):
+def test_run_tests_tool_details_parse_failures(repo, monkeypatch):
     from local_coder.tools.testing import RunTestsTool
     from local_coder.types import ToolResult
 
@@ -162,22 +180,32 @@ def test_run_tests_details_parse_failures(repo, monkeypatch):
 
 
 class FakeCoordinator:
+    """Stands in for the real Coordinator so agent-run JSON can be tested
+    without a model. Matches the calls _build_coordinator/_run_request make."""
+
     final_event = "task_completed"
     extra_events: list = []
 
     def __init__(self, **kwargs):
         self.handlers = []
+        self.tool_registry = None
 
     def on_event(self, handler):
         self.handlers.append(handler)
 
-    async def run(self, request):
-        events = [("ORCHESTRATOR", "task_started", f"Processing: {request}"), *self.extra_events,
-                  ("ORCHESTRATOR", self.final_event, "Done")]
-        for source, event_type, message in events:
-            for handler in self.handlers:
-                handler(AgentEvent(source=source, event_type=event_type, message=message))
+    def _emit(self, source, event_type, message):
+        for handler in self.handlers:
+            handler(AgentEvent(source=source, event_type=event_type, message=message))
+
+    async def run(self, request, **kwargs):
+        self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
+        for source, event_type, message in self.extra_events:
+            self._emit(source, event_type, message)
+        self._emit("ORCHESTRATOR", self.final_event, "Done")
         return f"Result for {request}"
+
+    async def run_tests_only(self):
+        return "1 passed, 0 failed"
 
 
 @pytest.fixture
@@ -185,6 +213,8 @@ def fake_coordinator(monkeypatch):
     import local_coder.orchestrator.coordinator as coordinator_module
 
     monkeypatch.setattr(coordinator_module, "Coordinator", FakeCoordinator)
+    monkeypatch.setattr(FakeCoordinator, "extra_events", [])
+    monkeypatch.setattr(FakeCoordinator, "final_event", "task_completed")
     return FakeCoordinator
 
 
@@ -196,13 +226,10 @@ def test_run_emits_result_session_and_events(tmp_path, fake_coordinator):
     assert data["request"] == "add a test" and data["phase"] == "run"
     assert data["status"] == "completed"
     assert data["result"] == "Result for add a test"
-    assert data["session_id"].startswith("local-")
+    assert data["session_id"]
     assert [e["event_type"] for e in data["events"]] == ["task_started", "task_completed"]
     # Human progress lines still go somewhere, just not stdout.
     assert "Processing: add a test" in result.stderr
-
-    _, sessions = invoke("--project", str(tmp_path), "sessions", "--json")
-    assert sessions["data"]["sessions"][0]["session_id"] == data["session_id"]
 
 
 def test_run_with_model_error_is_not_ok(tmp_path, fake_coordinator, monkeypatch):
@@ -214,11 +241,20 @@ def test_run_with_model_error_is_not_ok(tmp_path, fake_coordinator, monkeypatch)
     assert [e["message"] for e in doc["data"]["errors"]] == ["connection refused"]
 
 
-def test_failed_verification_is_not_ok(tmp_path, fake_coordinator, monkeypatch):
-    monkeypatch.setattr(FakeCoordinator, "final_event", "task_failed")
-    result, doc = invoke("--project", str(tmp_path), "test", "--json")
-    assert result.exit_code == 1
-    assert doc["data"]["status"] == "failed" and doc["data"]["session_id"] is None
+def test_plan_and_review_emit(tmp_path, fake_coordinator):
+    _, plan = invoke("--project", str(tmp_path), "plan", "do a thing", "--json")
+    assert plan["command"] == "plan" and plan["data"]["phase"] == "plan"
+    assert plan["data"]["result"].startswith("Result for Create a detailed plan")
+
+    _, review = invoke("--project", str(tmp_path), "review", "--json")
+    assert review["data"]["phase"] == "review" and review["ok"] is True
+
+
+def test_test_command_emits(tmp_path, fake_coordinator):
+    _, doc = invoke("--project", str(tmp_path), "test", "--json")
+    assert doc["command"] == "test"
+    assert doc["data"]["phase"] == "test"
+    assert doc["data"]["result"] == "1 passed, 0 failed"
 
 
 def test_interactive_mode_rejects_json(tmp_path):

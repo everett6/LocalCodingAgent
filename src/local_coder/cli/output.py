@@ -13,7 +13,7 @@ Every command run with --json prints exactly one JSON document on stdout:
 ``data`` is command-specific (see docs/json-output.md); ``error`` is
 ``{"type": ..., "message": ...}`` when the command itself failed, and the
 process exits 1 whenever ``ok`` is false. Human-readable output (panels,
-agent events, prompts) goes to stderr in JSON mode so stdout stays
+agent progress, prompts) goes to stderr in JSON mode so stdout stays
 parseable.
 
 Bump SCHEMA_VERSION only for breaking changes (a field removed, renamed,
@@ -26,12 +26,8 @@ import sys
 from typing import Any
 
 import click
-from rich.console import Console
 
 SCHEMA_VERSION = 1
-
-# The CLI's shared console. In JSON mode it is pointed at stderr.
-console = Console()
 
 
 def json_mode(ctx_obj: dict | None) -> bool:
@@ -68,7 +64,6 @@ def _set_json(ctx: click.Context, param: click.Parameter, value: bool) -> None:
     ctx.ensure_object(dict)
     if value:
         ctx.obj["json"] = True
-        console.stderr = True
     # "local-coder local-server status" -> "local-server status"
     ctx.obj["command"] = " ".join(ctx.command_path.split()[1:])
 
@@ -79,13 +74,14 @@ json_option = click.option(
 )
 
 
-class JsonAwareGroup(click.Group):
-    """Reports a subcommand's failure as a JSON error envelope in JSON mode."""
+class _JsonErrorMixin:
+    """Group mixin: in JSON mode, report a subcommand's uncaught exception
+    as a JSON error envelope on stdout instead of a traceback or bare text."""
 
     def invoke(self, ctx: click.Context) -> Any:
         try:
             return super().invoke(ctx)
-        except (click.exceptions.Exit, click.Abort, SystemExit):
+        except (click.exceptions.Exit, click.Abort, SystemExit, KeyboardInterrupt):
             raise
         except Exception as exc:
             if not json_mode(ctx.obj):

@@ -20,7 +20,7 @@ from uuid import uuid4
 from local_coder import local_server
 from local_coder.orchestrator.config_loader import load_config
 from local_coder.orchestrator.coordinator import Coordinator
-from local_coder.orchestrator.sessions import SessionStore
+from local_coder.orchestrator.sessions import SessionError, SessionStore
 from local_coder.types import AgentEvent, AgentRole
 
 _WEBUI_INDEX = Path(__file__).parent / "webui" / "index.html"
@@ -36,10 +36,15 @@ class RemoteControlServer:
         model_name: str | None = None,
         yolo: bool = False,
         token: str | None = None,
+        config_overrides: list[str] | None = None,
+        temperature: float | None = None,
     ):
         self.project_root = project_root
         self.config_path = config_path
         self.model_name = model_name
+        # --set / --temperature from the command line that started the server.
+        self.config_overrides = list(config_overrides or [])
+        self.temperature = temperature
         # The HTTP server has no terminal to prompt with, so there is never
         # an interactive approval callback here -- ASK-risk actions are
         # denied unless the operator explicitly opted into --yolo when
@@ -64,7 +69,10 @@ class RemoteControlServer:
             self.events.append(payload)
 
     def _coordinator(self) -> Coordinator:
-        config = load_config(self.config_path, project_root=self.project_root)
+        config = load_config(
+            self.config_path, project_root=self.project_root,
+            overrides=self.config_overrides, temperature=self.temperature,
+        )
         if self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
         if self.yolo:
@@ -130,16 +138,41 @@ class RemoteControlServer:
             if path != "/review" and not request:
                 return 400, {"error": "request is required"}
             session_id = body.get("session_id") or f"session-{uuid4().hex[:12]}"
+            if path == "/run":
+                return self._run_in_session(session_id, request)
             coordinator = self._coordinator()
             if path == "/plan":
                 result = asyncio.run(coordinator.plan_only(request))
-            elif path == "/review":
-                result = asyncio.run(coordinator.review_changes())
             else:
-                result = asyncio.run(coordinator.run(request))
+                result = asyncio.run(coordinator.review_changes())
             record = self.sessions.save(session_id, request=request, phase=path[1:], result=result)
             return 200, record
         return 404, {"error": "not found"}
+
+    def _run_in_session(self, session_id: str, request: str) -> tuple[int, dict[str, Any]]:
+        """/run in a persistent session, the same kind the CLI uses: a
+        repeated session_id is a follow-up that sees the earlier turns, and
+        a run that fails can be picked up with `local-coder resume <id>`."""
+        try:
+            session = self.sessions.open_or_create(session_id)
+            session.acquire()
+        except SessionError as exc:
+            return (409 if "already running" in str(exc) else 400), {"error": str(exc)}
+        try:
+            turn = session.start_turn(request)
+            coordinator = self._coordinator()
+            coordinator.on_event(session.record_event)
+            try:
+                result = asyncio.run(coordinator.run(
+                    request, checkpoint=session.checkpoint(turn), history=turn["context"],
+                ))
+            except Exception as exc:
+                session.finish_turn(turn, "failed", error=str(exc))
+                return 500, {"error": str(exc), "session_id": session_id}
+            session.finish_turn(turn, "completed", report=result)
+            return 200, self.sessions.get(session_id)
+        finally:
+            session.release()
 
     def serve(self, host: str = "127.0.0.1", port: int = 8787) -> None:
         try:

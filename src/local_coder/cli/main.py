@@ -1,15 +1,19 @@
 """CLI for the local coding agent."""
 import asyncio
 import os
-import sys
 import uuid
 from pathlib import Path
 import click
+from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
+from rich.markup import escape
 from local_coder import __version__
-from local_coder.cli.output import JsonAwareGroup, console, emit, json_mode, json_option
+from local_coder.cli import ui
+from local_coder.cli.output import _JsonErrorMixin, emit, json_mode, json_option
+
+console = Console()
 
 _DEFAULT_CONFIG = """# Local Coder project configuration
 models:
@@ -21,6 +25,15 @@ models:
         context_length: 8192
         temperature: 0.2
         max_tokens: 4096
+        # For a hosted endpoint, name the env var holding the key (never the key):
+        # api_key_env: MY_API_KEY
+routing:
+    roles:
+        planner: coder
+        coder: coder
+    # escalate_to: strong-model   # rerun failed steps on a stronger model
+tools:
+    command_timeout: 60
 verification:
     run_tests_after_changes: true
     max_fix_iterations: 3
@@ -42,29 +55,41 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
-def _event_handler(event, ctx_obj: dict | None = None):
-    """Handle agent events for display (and collect them in JSON mode)."""
-    if json_mode(ctx_obj):
-        ctx_obj.setdefault("events", []).append(event.model_dump(mode="json"))
-    timestamp = event.timestamp.strftime("%H:%M:%S")
-    source_colors = {
-        "ORCHESTRATOR": "bold cyan",
-        "EXPLORER": "bold green",
-        "PLANNER": "bold yellow",
-        "CODER": "bold blue",
-        "DEBUGGER": "bold red",
-        "TESTER": "bold magenta",
-        "REVIEWER": "bold white",
-    }
-    color = source_colors.get(event.source, "white")
-    console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
+def _event_handler(event):
+    """Handle agent events for display (routed to the live progress view)."""
+    ui.render_event(console, event)
 
 
-@click.group(cls=JsonAwareGroup, invoke_without_command=True, context_settings={"allow_extra_args": True})
+class _RequestGroup(_JsonErrorMixin, click.Group):
+    """Lets `local-coder "Add OAuth login"` run a request directly: click
+    would otherwise look the request up as a subcommand name and fail. A
+    single word that isn't a command is still reported as an unknown
+    command, so a typo like `local-coder staus` doesn't start a run."""
+
+    def resolve_command(self, ctx, args):
+        if args and self.get_command(ctx, args[0]) is None and (len(args) > 1 or " " in args[0].strip()):
+            return "run", self.get_command(ctx, "run"), args
+        return super().resolve_command(ctx, args)
+
+
+@click.group(cls=_RequestGroup, invoke_without_command=True, context_settings={"allow_extra_args": True})
 @click.option("--config", "-c", type=click.Path(), help="Config file path")
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
 @click.option("--model", help="Use this configured model for every agent in the run")
+@click.option("--temperature", type=float, help="Override the sampling temperature of every model")
+@click.option(
+    "--set", "config_overrides", multiple=True, metavar="KEY=VALUE",
+    help="Override a config value for this run, e.g. --set models.coder.temperature=0.5 (repeatable)",
+)
 @click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.option(
+    "--resume", "-r", is_flag=True,
+    help="Continue the most recent session: pick up its unfinished request, or add a follow-up request to it.",
+)
+@click.option(
+    "--session", "-s", "session_id", metavar="ID",
+    help="Run in this session (created if new); resumes its unfinished request when no request is given.",
+)
 @click.option(
     "--yolo", is_flag=True,
     help="Auto-approve risky actions (shell commands, git commits/checkouts) without prompting. Dangerous.",
@@ -72,7 +97,7 @@ def _event_handler(event, ctx_obj: dict | None = None):
 @click.version_option(version=__version__, prog_name="local-coder")
 @json_option
 @click.pass_context
-def cli(ctx, config, project, model, debug, yolo):
+def cli(ctx, config, project, model, temperature, config_overrides, debug, resume, session_id, yolo):
     """Local Coding Agent - AI-powered local code assistant.
 
     Run with a request to execute it:
@@ -81,32 +106,47 @@ def cli(ctx, config, project, model, debug, yolo):
 
     Or use subcommands:
 
+    \b
         local-coder plan "Refactor auth"
         local-coder review
+        local-coder security
+        local-coder security-lessons
+        local-coder validate-finding "SQL injection in ..."
         local-coder test
 
-    Add --json (before or after the subcommand) to get one JSON document on
-    stdout instead of formatted text.
+    Every run is saved as a session, so an interrupted or failed run can
+    pick up where it stopped, and later requests can build on earlier ones:
+
+    \b
+        local-coder --resume
+        local-coder --resume "now add tests for it"
     """
     ctx.ensure_object(dict)
-    # Rich output moves to stderr in JSON mode so stdout is only the JSON.
-    console.stderr = json_mode(ctx.obj)
     ctx.obj["config_path"] = config
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
     ctx.obj["model"] = model
+    ctx.obj["temperature"] = temperature
+    ctx.obj["config_overrides"] = list(config_overrides)
     ctx.obj["yolo"] = yolo
-    
+    ctx.obj["resume"] = resume
+    ctx.obj["session_id"] = session_id
+    # Rich output moves to stderr in JSON mode so stdout is only the JSON.
+    if json_mode(ctx.obj):
+        console.stderr = True
+
     if ctx.invoked_subcommand is None:
         if ctx.args:
             # Direct execution: local-coder "Add OAuth login"
-            request_str = " ".join(ctx.args)
             ctx.obj["command"] = "run"
+            request_str = " ".join(ctx.args)
             _run_request(request_str, ctx.obj)
+        elif json_mode(ctx.obj):
+            raise click.UsageError("--json needs a subcommand or a request; interactive/resume mode has no JSON output.")
+        elif resume or session_id:
+            _resume_or_interactive(ctx.obj)
         else:
             # Interactive mode
-            if json_mode(ctx.obj):
-                raise click.UsageError("--json needs a subcommand or a request; interactive mode has no JSON output.")
             _interactive_mode(ctx.obj)
 
 
@@ -115,9 +155,10 @@ def cli(ctx, config, project, model, debug, yolo):
 @click.argument("request", nargs=-1, required=True)
 @click.pass_context
 def run(ctx, request):
-    """Execute a coding request."""
+    """Execute a coding request, or a custom command such as "/fix-issue 42"."""
     request_str = " ".join(request)
-    _run_request(request_str, ctx.obj)
+    if not (request_str.startswith("/") and _run_extension_command(request_str, ctx.obj)):
+        _run_request(request_str, ctx.obj)
 
 
 @cli.command()
@@ -136,6 +177,80 @@ def plan(ctx, request):
 def review(ctx):
     """Review current uncommitted changes."""
     _run_review(ctx.obj)
+
+
+@cli.command()
+@json_option
+@click.argument("paths", nargs=-1)
+@click.option("--focus", help="What to concentrate on, e.g. 'auth' or 'injection in the API handlers'")
+@click.option("--batch-chars", type=int, default=None,
+              help="Review scopes larger than this many characters of source in batches (default: twice the context window)")
+@click.pass_context
+def security(ctx, paths, focus, batch_chars):
+    """Red/blue team security review of the project (read-only).
+
+    Loads SECURITY_LESSONS.md, records findings in a ledger that survives
+    context compaction, and ends by proposing new lessons for you to review
+    with `local-coder security-lessons`.
+    """
+    _run_security(ctx.obj, list(paths), focus, batch_chars)
+
+
+@cli.group(name="security-lessons", invoke_without_command=True)
+@click.pass_context
+def security_lessons(ctx):
+    """Review what the security review learned (SECURITY_LESSONS.md).
+
+    With no subcommand, lists accepted lessons and pending proposals.
+    """
+    if ctx.invoked_subcommand is None:
+        _show_security_lessons(ctx.obj["project_root"])
+
+
+@security_lessons.command(name="accept")
+@click.argument("ids", nargs=-1)
+@click.option("--all", "accept_all", is_flag=True, help="Accept every pending proposal")
+@click.pass_context
+def security_lessons_accept(ctx, ids, accept_all):
+    """Move proposed lessons into SECURITY_LESSONS.md."""
+    _decide_security_lessons(ctx.obj["project_root"], ids, accept_all, accept=True)
+
+
+@security_lessons.command(name="reject")
+@click.argument("ids", nargs=-1)
+@click.option("--all", "reject_all", is_flag=True, help="Reject every pending proposal")
+@click.pass_context
+def security_lessons_reject(ctx, ids, reject_all):
+    """Discard proposed lessons."""
+    _decide_security_lessons(ctx.obj["project_root"], ids, reject_all, accept=False)
+
+
+@security_lessons.command(name="suppress")
+@click.argument("rule")
+@click.argument("path_glob")
+@click.option("--reason", required=True, help="Why this is a false positive")
+@click.pass_context
+def security_lessons_suppress(ctx, rule, path_glob, reason):
+    """Mark RULE findings under PATH_GLOB as a known false positive."""
+    from local_coder.security.lessons import Lesson, LessonStore
+
+    added = LessonStore(ctx.obj["project_root"]).add(Lesson("suppress", reason, rule, path_glob))
+    console.print("[green]Added to SECURITY_LESSONS.md[/green]" if added else "[yellow]Already in SECURITY_LESSONS.md[/yellow]")
+
+
+@cli.command(name="validate-finding")
+@json_option
+@click.argument("finding", nargs=-1, required=True)
+@click.option("--path", "paths", multiple=True, help="File(s) the finding is in (repeatable)")
+@click.pass_context
+def validate_finding(ctx, finding, paths):
+    """Reproduce an already-identified security finding in this repo as a local PoC test.
+
+    Red-team companion to `security`: pass a finding it reported (with its file:line) to
+    confirm the vulnerability is real and get a test that fails once it is fixed.
+    Operates only on this project's own code.
+    """
+    _run_validate_finding(ctx.obj, " ".join(finding), list(paths))
 
 
 @cli.command()
@@ -191,6 +306,7 @@ def serve(ctx, host, port, token):
         RemoteControlServer(
             ctx.obj["project_root"], ctx.obj["config_path"], ctx.obj.get("model"),
             yolo=ctx.obj.get("yolo", False), token=token,
+            config_overrides=ctx.obj.get("config_overrides"), temperature=ctx.obj.get("temperature"),
         ).serve(host, port)
     except (OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -198,31 +314,33 @@ def serve(ctx, host, port, token):
 
 @cli.command(name="sessions")
 @json_option
+@click.argument("session_id", required=False)
 @click.pass_context
-def sessions(ctx):
-    """List resumable agent sessions."""
-    from local_coder.orchestrator.sessions import SessionStore
-
-    saved = SessionStore(ctx.obj["project_root"]).list()
-    if json_mode(ctx.obj):
-        emit(ctx.obj, {"sessions": saved})
-        return
-    for session in saved:
-        console.print(f"{session['session_id']}  {session.get('phase', 'unknown')}  {session.get('updated_at', '')}")
+def sessions(ctx, session_id):
+    """List saved sessions, or show one session's requests."""
+    if session_id:
+        _show_session(session_id, ctx.obj)
+    else:
+        _list_sessions(ctx.obj)
 
 
 @cli.command()
 @json_option
-@click.argument("session_id")
+@click.argument("session_id", required=False)
 @click.pass_context
 def resume(ctx, session_id):
-    """Resume a session's request from the local journal."""
-    from local_coder.orchestrator.sessions import SessionStore
+    """Pick up a session's unfinished request (the latest session by default)."""
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
 
-    session = SessionStore(ctx.obj["project_root"]).get(session_id)
-    if not session or not session.get("request"):
-        raise click.ClickException(f"Session not found or has no request: {session_id}")
-    _run_request(session["request"], ctx.obj)
+    if session_id:
+        try:
+            SessionStore(ctx.obj["project_root"]).open(session_id)
+        except SessionError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ctx.obj["session_id"] = session_id
+    else:
+        ctx.obj["resume"] = True
+    _run_request(None, ctx.obj)
 
 
 @cli.command()
@@ -240,6 +358,84 @@ def init(ctx):
         return
     console.print(f"Created [bold]{config_path}[/bold]")
     console.print("Edit the model_id and base_url, then run [bold]local-coder[/bold].")
+
+
+@cli.command(name="config")
+@json_option
+@click.pass_context
+def show_config(ctx):
+    """Show the effective config: files merged, models, routing and tool settings."""
+    from local_coder.models.router import fallback_chain
+    from local_coder.orchestrator.config_loader import user_config_path, validate_config
+    from local_coder.types import AgentRole
+
+    config = _load_config(ctx.obj)
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {
+            "sources": config.sources,
+            "user_config_path": str(user_config_path()),
+            "models": {
+                name: {
+                    "backend": m.backend.value, "model_id": m.model_id, "base_url": m.base_url,
+                    "temperature": m.temperature, "context_length": m.context_length,
+                    "api_key_env": m.api_key_env, "api_key_set": bool(m.api_key) if m.api_key_env else None,
+                }
+                for name, m in config.models.items()
+            },
+            "routing": {
+                role.value: {
+                    "model": (name := _resolve_model_name(config, role)),
+                    "fallbacks": fallback_chain(config, name)[1:] if name in config.models else [],
+                }
+                for role in AgentRole if role != AgentRole.ORCHESTRATOR
+            },
+            "escalate_to": config.routing.escalate_to,
+            "tools": {
+                "disabled": list(config.tools.disabled),
+                "command_timeout": config.tools.command_timeout,
+                "role_overrides": dict(config.tools.roles),
+            },
+            "problems": validate_config(config),
+        })
+        return
+    console.print("[bold]Config sources[/bold] (later wins): " + (", ".join(config.sources) or "none, using defaults"))
+    console.print(f"[dim]User config location: {user_config_path()}[/dim]")
+
+    models = Table(title="Models")
+    for column in ("Name", "Backend", "Model ID", "Endpoint", "Temp", "API key"):
+        models.add_column(column)
+    for name, model in config.models.items():
+        if model.api_key_env:
+            key = f"${model.api_key_env} ({'set' if model.api_key else 'NOT SET'})"
+        else:
+            key = "-"
+        models.add_row(name, model.backend.value, model.model_id, model.base_url, str(model.temperature), key)
+    console.print(models)
+
+    routing = Table(title="Routing")
+    for column in ("Role", "Model", "If unreachable"):
+        routing.add_column(column)
+    for role in AgentRole:
+        if role == AgentRole.ORCHESTRATOR:
+            continue
+        name = _resolve_model_name(config, role)
+        fallbacks = fallback_chain(config, name)[1:] if name in config.models else []
+        routing.add_row(role.value, name, ", ".join(fallbacks) or "-")
+    console.print(routing)
+    console.print(f"[bold]Escalate failed steps to:[/bold] {config.routing.escalate_to or 'off'}")
+
+    tools = config.tools
+    console.print(
+        f"[bold]Tools:[/bold] disabled={', '.join(tools.disabled) or 'none'}; "
+        f"command_timeout={tools.command_timeout or 'default (60s)'}; "
+        f"role overrides={', '.join(tools.roles) or 'none'}"
+    )
+
+    problems = validate_config(config)
+    for problem in problems:
+        console.print(f"[yellow]Warning:[/yellow] {problem}")
+    if not problems:
+        console.print("[green]No problems found.[/green]")
 
 
 @cli.command()
@@ -298,6 +494,23 @@ def rollback(ctx, checkpoint_id):
     console.print(f"Restored checkpoint [bold]{restored.checkpoint_id}[/bold]")
 
 
+@cli.command(name="map")
+@json_option
+@click.argument("query", nargs=-1)
+@click.option("--file", "-f", "files", multiple=True, help="File the work is about (repeatable)")
+@click.option("--tokens", "-t", default=1024, show_default=True, type=int, help="Approximate map size")
+@click.pass_context
+def repo_map(ctx, query, files, tokens):
+    """Print the ranked repo map agents see, optionally centered on QUERY."""
+    from local_coder.context.repo_map import RepoMap
+
+    text = RepoMap(ctx.obj["project_root"]).build(" ".join(query), list(files), tokens)
+    if json_mode(ctx.obj):
+        emit(ctx.obj, {"map": text})
+        return
+    click.echo(text or "No source files with definitions were found.")
+
+
 @cli.command(name="tools")
 @json_option
 @click.pass_context
@@ -337,20 +550,21 @@ def tools_command(ctx):
 def tool_command(ctx, name, pairs, args_json):
     """Run one agent tool directly, with no model involved.
 
+    \b
         local-coder tool run_tests --json
-
         local-coder tool grep -a pattern=TODO --json
+        local-coder tool code_search -a query="where auth is checked" --json
 
     Risky tools (run_command, git_commit, git_checkout) still ask for
     approval unless --yolo is set. Exits 1 when the tool reports failure.
     """
     from local_coder.types import AgentRole
 
-    arguments = _parse_tool_arguments(pairs, args_json)
     registry = _tool_registry(ctx.obj)
     known = [tool.name.value for tool in registry.get_tools_for_role(AgentRole.ORCHESTRATOR)]
     if name not in known:
         raise click.BadParameter(f"unknown tool {name!r}; available: {', '.join(known)}", param_hint="NAME")
+    arguments = _parse_tool_arguments(pairs, args_json)
     result = asyncio.run(registry.execute_tool(AgentRole.ORCHESTRATOR, name, arguments))
     if json_mode(ctx.obj):
         data = {"tool": name, "arguments": arguments, **result.model_dump(mode="json", exclude={"tool_call_id"})}
@@ -365,14 +579,14 @@ def tool_command(ctx, name, pairs, args_json):
         ctx.exit(1)
 
 
-def _parse_tool_arguments(pairs: tuple[str, ...], args_json: str | None) -> dict:
-    import json
+def _parse_tool_arguments(pairs, args_json):
+    import json as _json
 
-    arguments: dict = {}
+    arguments = {}
     if args_json:
         try:
-            arguments = json.loads(args_json)
-        except json.JSONDecodeError as exc:
+            arguments = _json.loads(args_json)
+        except _json.JSONDecodeError as exc:
             raise click.BadParameter(f"not valid JSON: {exc}", param_hint="--args") from exc
         if not isinstance(arguments, dict):
             raise click.BadParameter("must be a JSON object", param_hint="--args")
@@ -381,51 +595,54 @@ def _parse_tool_arguments(pairs: tuple[str, ...], args_json: str | None) -> dict
         if not sep or not key:
             raise click.BadParameter(f"expected KEY=VALUE, got {pair!r}", param_hint="--arg")
         try:
-            arguments[key] = json.loads(value)
-        except json.JSONDecodeError:
+            arguments[key] = _json.loads(value)
+        except _json.JSONDecodeError:
             arguments[key] = value
     return arguments
 
 
 def _tool_registry(ctx_obj: dict):
     """The same tool registry the agents get, with the CLI's approval wiring."""
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.tools import create_tool_registry
-    from local_coder.types import ApprovalConfig
 
-    try:
-        approval = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"]).approval
-    except Exception:
-        approval = ApprovalConfig()
+    config = _load_config(ctx_obj)
+    approval = config.approval
     if ctx_obj.get("yolo"):
         approval.require_approval_for_commands = False
         approval.require_approval_for_commits = False
         callback = None
     else:
-        callback = _json_approval_callback if json_mode(ctx_obj) else _cli_approval_callback
+        callback = _tool_approval_callback if json_mode(ctx_obj) else _cli_approval_callback
     return create_tool_registry(ctx_obj["project_root"], approval, callback)
 
 
-def _run_tests_details(result) -> dict:
+async def _tool_approval_callback(description: str) -> bool:
+    """Approval for `tool ... --json`: the prompt goes to stderr, and with no
+    terminal to ask on (a script), the action is denied rather than hanging."""
+    import sys as _sys
+
+    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+    if not _sys.stdin.isatty():
+        console.print("[yellow]Denied: no terminal to confirm on (use --yolo to auto-approve).[/yellow]")
+        return False
+    return click.confirm("Allow this action?", default=False, err=True)
+
+
+def _run_tests_details_text(output: str) -> dict:
     from local_coder.verification.failures import parse_failures
 
-    return {"failures": [{"test": f.test, "message": f.message} for f in parse_failures(result.output)]}
+    return {"failures": [{"test": f.test, "message": f.message} for f in parse_failures(output)]}
+
+
+def _TOOL_DETAILS_run_tests(result) -> dict:
+    return _run_tests_details_text(result.output)
 
 
 # Extra structure pulled out of a tool's text output for `tool NAME --json`.
-_TOOL_DETAILS = {
-    "run_tests": _run_tests_details,
-}
-
-
-def _checkpoint_json(item) -> dict:
-    from dataclasses import asdict
-
-    return asdict(item)
+_TOOL_DETAILS = {"run_tests": _TOOL_DETAILS_run_tests}
 
 
 @cli.group(name="local-server")
-@json_option
 def local_server_group():
     """Start, stop, and choose models for this machine's local inference server(s)."""
 
@@ -478,12 +695,12 @@ def local_server_status(ctx):
 
 
 @local_server_group.command(name="start")
-@json_option
 @click.option("--quant", default="q2_k", show_default=True, help="Which GGUF quant to load for the big model.")
 @click.option("--n-ctx", default=65536, show_default=True, type=int, help="Context length in tokens.")
 @click.option("--no-slot-cache", is_flag=True, help="Disable the disk-backed session cache (--slot-save-path).")
 @click.option("--no-draft", is_flag=True, help="Skip starting the small draft model.")
 @click.option("--wait/--no-wait", default=True, help="Wait for the server(s) to become healthy before returning.")
+@json_option
 @click.pass_context
 def local_server_start(ctx, quant, n_ctx, no_slot_cache, no_draft, wait):
     """Start the big model (and, by default, the draft model)."""
@@ -518,11 +735,11 @@ def _wait_for_big_model(local_server) -> bool:
 
 
 @local_server_group.command(name="switch")
-@json_option
 @click.option("--quant", required=True, help="Which GGUF quant to switch to.")
 @click.option("--n-ctx", default=65536, show_default=True, type=int)
 @click.option("--no-slot-cache", is_flag=True)
 @click.option("--wait/--no-wait", default=True)
+@json_option
 @click.pass_context
 def local_server_switch(ctx, quant, n_ctx, no_slot_cache, wait):
     """Stop the big model and restart it with a different quant (llama-server can't hot-swap weights)."""
@@ -536,9 +753,9 @@ def local_server_switch(ctx, quant, n_ctx, no_slot_cache, wait):
 
 
 @local_server_group.command(name="stop")
-@json_option
 @click.option("--big/--no-big", default=True)
 @click.option("--draft/--no-draft", default=True)
+@json_option
 @click.pass_context
 def local_server_stop(ctx, big, draft):
     """Stop the running server(s)."""
@@ -559,19 +776,15 @@ async def _cli_approval_callback(description: str) -> bool:
     """Prompt the user in the terminal for a risky action. Runs inline in
     the same event loop as the agent -- blocking on input here is fine
     since a single interactive session has nothing else to do meanwhile."""
-    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
-    return click.confirm("Allow this action?", default=False)
-
-
-async def _json_approval_callback(description: str) -> bool:
-    """Approval prompt for --json runs: the prompt goes to stderr so stdout
-    stays pure JSON, and with no terminal to ask (a script piping stdin)
-    the action is denied rather than aborting the whole run."""
-    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
-    if not sys.stdin.isatty():
-        console.print("[yellow]Denied: no terminal to confirm on (use --yolo to auto-approve).[/yellow]")
-        return False
-    return click.confirm("Allow this action?", default=False, err=True)
+    with ui.paused():
+        console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+        try:
+            with ui.sigint_raises():
+                return click.confirm("Allow this action?", default=False)
+        except click.Abort:
+            # Ctrl+C at the approval prompt cancels the whole request.
+            console.print()
+            raise KeyboardInterrupt from None
 
 
 def _build_coordinator(config, ctx_obj: dict):
@@ -584,92 +797,217 @@ def _build_coordinator(config, ctx_obj: dict):
         config.approval.require_approval_for_commands = False
         config.approval.require_approval_for_commits = False
         approval_callback = None
-    elif json_mode(ctx_obj):
-        approval_callback = _json_approval_callback
     else:
         approval_callback = _cli_approval_callback
 
     coordinator = Coordinator(
         config=config, project_root=ctx_obj["project_root"], approval_callback=approval_callback,
     )
-    coordinator.on_event(lambda event: _event_handler(event, ctx_obj))
+    coordinator.on_event(_event_handler)
+    _install_hooks(coordinator, ctx_obj)
     return coordinator
 
 
-def _agent_run_status(events: list[dict]) -> str:
-    """"completed" or "failed" from the coordinator's final event."""
-    for event in reversed(events):
-        if event["source"] == "ORCHESTRATOR" and event["event_type"] in ("task_completed", "task_failed"):
-            return "completed" if event["event_type"] == "task_completed" else "failed"
-    return "failed"
+def _open_session(ctx_obj: dict):
+    """The session this invocation runs in: the one named with --session
+    (created if new), the latest one with --resume, otherwise a new one."""
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
+
+    store = SessionStore(ctx_obj["project_root"])
+    try:
+        if ctx_obj.get("session_id"):
+            return store.open_or_create(ctx_obj["session_id"])
+        if ctx_obj.get("resume"):
+            session = store.latest()
+            if session is None:
+                raise click.ClickException("No saved session to resume. Run a request first.")
+            return session
+        return store.create()
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
-def _run_request(request: str, ctx_obj: dict):
-    _run_agent(
-        ctx_obj, request, request=request, phase="run",
-        heading=f"Running request: [bold]{request}[/bold]", title="Local Coder",
-        result_title="Result", border="cyan", result_border="green",
-    )
+def _resume_hint(session_id: str) -> str:
+    return f"[dim]Session {session_id} -- continue it with: local-coder --session {session_id} [request][/dim]"
 
 
-def _run_agent(
-    ctx_obj: dict, prompt: str, *, request: str, phase: str, heading: str, title: str,
-    result_title: str, border: str, result_border: str | None = None, save_session: bool = True,
-):
-    """Run one coordinator request and show (or, with --json, emit) the result."""
-    from local_coder.orchestrator.config_loader import load_config
-    from local_coder.orchestrator.sessions import SessionStore
+def _run_request(request: str | None, ctx_obj: dict):
+    """Run a request in a persistent session. With request=None, pick the
+    session's unfinished request back up from its last checkpoint."""
+    from local_coder.orchestrator.sessions import SessionError
 
-    console.print(Panel(heading, title=title, border_style=border))
+    session = _open_session(ctx_obj)
+    # Later requests in this process (the interactive prompt) stay in it.
+    ctx_obj["session_id"] = session.session_id
 
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-    if ctx_obj.get("model"):
-        from local_coder.types import AgentRole
-        config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
+    if request is None:
+        turn = session.unfinished_turn()
+        if turn is None:
+            raise click.ClickException(
+                f"Nothing to resume in session {session.session_id}: its last request finished. "
+                f"Add a new request to continue it: local-coder --session {session.session_id} \"...\""
+            )
+        done = ", ".join(turn["checkpoints"]) or "nothing yet"
+        console.print(Panel(
+            f"Resuming: [bold]{turn['request']}[/bold]\n[dim]Already done: {done}[/dim]",
+            title=f"Local Coder - session {session.session_id}", border_style="cyan",
+        ))
+    else:
+        if session.unfinished_turn() is not None:
+            console.print("[yellow]The previous request in this session never finished; starting the new one instead.[/yellow]")
+        console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
 
-    async def _run():
-        coordinator = _build_coordinator(config, ctx_obj)
+    config = _load_config(ctx_obj)
+
+    try:
+        session.acquire()
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        if request is None:
+            turn = session.unfinished_turn()
+            if turn is None:
+                raise click.ClickException(f"Session {session.session_id} has nothing left to resume.")
+            session.reopen_turn(turn)
+        else:
+            turn = session.start_turn(request)
+
+        json_events: list = []
+
+        async def _run():
+            coordinator = _build_coordinator(config, ctx_obj)
+            coordinator.on_event(session.record_event)
+            if json_mode(ctx_obj):
+                coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+            return await coordinator.run(
+                turn["request"], checkpoint=session.checkpoint(turn), history=turn["context"],
+            )
+
         try:
-            result = await coordinator.run(prompt)
+            with ui.progress(console, "request"):
+                result = asyncio.run(_run())
+        except KeyboardInterrupt:
+            session.finish_turn(turn, "interrupted", error="Interrupted")
+            console.print("[yellow]Interrupted. Finished phases are saved.[/yellow]")
+            console.print(_resume_hint(session.session_id))
+            raise
         except Exception as e:
+            session.finish_turn(turn, "failed", error=str(e))
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(_resume_hint(session.session_id))
             if ctx_obj.get("debug"):
                 import traceback
                 traceback.print_exc()
             raise click.ClickException(str(e)) from e
-
-        session_id = None
-        if save_session:
-            session_id = f"local-{uuid.uuid4().hex[:8]}"
-            SessionStore(ctx_obj["project_root"]).save(session_id, request=request, phase=phase, result=result)
+        session.finish_turn(turn, "completed", report=result)
         if json_mode(ctx_obj):
-            events = ctx_obj.get("events", [])
-            status = _agent_run_status(events)
-            errors = [e for e in events if e["event_type"].endswith("error")]
-            emit(ctx_obj, {
-                "request": request,
-                "phase": phase,
-                "status": status,
-                "session_id": session_id,
-                "result": result,
-                "errors": errors,
-                "events": events,
-            }, ok=status == "completed" and not any(e["event_type"] == "model_error" for e in errors))
+            _emit_run(ctx_obj, phase="run", request=turn["request"], result=result,
+                      events=json_events, session_id=session.session_id)
             return
-        console.print(Panel(Markdown(result), title=result_title, border_style=result_border or border))
+        console.print(Panel(Markdown(result), title="Result", border_style="green"))
+        console.print(_resume_hint(session.session_id))
+    finally:
+        session.release()
 
-    asyncio.run(_run())
+
+
+def _resume_or_interactive(ctx_obj: dict):
+    """--resume / --session with no request: pick up the session's
+    unfinished request if it has one, otherwise open the interactive prompt
+    attached to that session."""
+    session = _open_session(ctx_obj)
+    ctx_obj["session_id"] = session.session_id
+    if session.unfinished_turn() is not None:
+        _run_request(None, ctx_obj)
+    else:
+        console.print(f"[dim]Session {session.session_id} has nothing unfinished; new requests will continue it.[/dim]")
+        _interactive_mode(ctx_obj)
+
+
+def _list_sessions(ctx_obj: dict):
+    from local_coder.orchestrator.sessions import SessionStore
+
+    records = SessionStore(ctx_obj["project_root"]).list()
+    if json_mode(ctx_obj):
+        emit(ctx_obj, {"sessions": records})
+        return
+    if not records:
+        console.print("No sessions yet.")
+        return
+    table = Table(title="Sessions")
+    table.add_column("Session", style="cyan", no_wrap=True)
+    table.add_column("Status", style="magenta")
+    table.add_column("Requests", style="blue")
+    table.add_column("Last request", style="green")
+    table.add_column("Updated", style="dim")
+    for record in records:
+        request = str(record.get("request", ""))
+        table.add_row(
+            record["session_id"],
+            str(record.get("status") or record.get("phase", "")),
+            str(record.get("turns", 1)),
+            request[:60] + ("..." if len(request) > 60 else ""),
+            str(record.get("updated_at", ""))[:19],
+        )
+    console.print(table)
+
+
+def _show_session(session_id: str, ctx_obj: dict):
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
+
+    try:
+        session = SessionStore(ctx_obj["project_root"]).open(session_id)
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_mode(ctx_obj):
+        emit(ctx_obj, {"session_id": session_id, "turns": session.turns})
+        return
+    table = Table(title=f"Session {session_id}")
+    table.add_column("#", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Request", style="green")
+    table.add_column("Finished phases", style="dim")
+    for turn in session.turns:
+        table.add_row(str(turn["index"] + 1), turn["status"], turn["request"], ", ".join(turn["checkpoints"]))
+    console.print(table)
+    if session.unfinished_turn() is not None:
+        console.print(f"Resume the unfinished request with: [bold]local-coder resume {session_id}[/bold]")
+
+
+def _load_config(ctx_obj: dict):
+    """Load the layered config and apply this invocation's flags on top
+    (--set, --temperature, then --model, which routes every role)."""
+    from local_coder.orchestrator.config_loader import ConfigError, load_config
+    from local_coder.types import AgentRole
+
+    try:
+        config = load_config(
+            ctx_obj["config_path"],
+            project_root=ctx_obj["project_root"],
+            overrides=ctx_obj.get("config_overrides") or (),
+            temperature=ctx_obj.get("temperature"),
+        )
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if ctx_obj.get("model"):
+        config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
+    return config
 
 
 def _interactive_mode(ctx_obj: dict):
-    console.print(Panel("[bold cyan]Local Coding Agent[/bold cyan]\nType /help for commands, /quit to exit.", border_style="cyan"))
-    
+    console.print(Panel(ui.build_banner(ctx_obj, __version__), border_style="cyan", expand=False))
+    session = ui.PromptSession(console, ctx_obj["project_root"])
+    _setup_interactive_extensions(ctx_obj)
+
     while True:
+        user_input = session.read()
+        if user_input is None:  # Ctrl+D, or Ctrl+C twice at the prompt
+            break
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+        session.save_history()
         try:
-            user_input = console.input("[bold green]> [/bold green]").strip()
-            if not user_input:
-                continue
-                
             if user_input.startswith("/"):
                 cmd = user_input.split()[0].lower()
                 if cmd in ("/quit", "/exit", "/q"):
@@ -684,6 +1022,11 @@ def _interactive_mode(ctx_obj: dict):
                         console.print("[red]Please provide a request to plan.[/red]")
                 elif cmd == "/review":
                     _run_review(ctx_obj)
+                elif cmd == "/security":
+                    focus = user_input[len("/security"):].strip() or None
+                    _run_security(ctx_obj, [], focus, None)
+                elif cmd == "/validate-finding":
+                    _run_validate_finding(ctx_obj, user_input[len("/validate-finding"):].strip(), [])
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
                 elif cmd == "/checkpoint":
@@ -696,54 +1039,258 @@ def _interactive_mode(ctx_obj: dict):
                         _run_rollback(parts[1], ctx_obj)
                     else:
                         console.print("[red]Please provide a checkpoint ID.[/red]")
+                elif cmd == "/sessions":
+                    _list_sessions(ctx_obj)
+                elif cmd == "/new":
+                    ctx_obj["session_id"] = None
+                    ctx_obj["resume"] = False
+                    console.print("Next request starts a new session.")
+                elif cmd == "/resume":
+                    parts = user_input.split(maxsplit=1)
+                    ctx_obj["session_id"] = parts[1] if len(parts) == 2 else ctx_obj.get("session_id")
+                    ctx_obj["resume"] = True
+                    try:
+                        _run_request(None, ctx_obj)
+                    except click.ClickException as exc:
+                        console.print(f"[red]{exc.message}[/red]")
                 elif cmd == "/help":
-                    console.print("""
-Available commands:
-  /quit, /exit, /q : Exit the interactive mode
-  /status          : Show system status
-  /plan <request>  : Create a plan without executing
-  /review          : Review current uncommitted changes
-  /test            : Run tests and report results
-    /checkpoint      : Save the current working tree
-    /checkpoints     : List saved checkpoints
-    /rollback <id>   : Restore a checkpoint
-  /help            : Show this help message
-                    """)
-                else:
-                    console.print(f"[red]Unknown command:[/red] {cmd}")
+                    console.print(ui.build_help_table())
+                elif not _run_extension_command(user_input, ctx_obj):
+                    console.print(ui.unknown_command_message(cmd))
             else:
                 _run_request(user_input, ctx_obj)
-                
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
+
+        except BaseException as exc:
+            if ui.is_cancellation(exc):
+                console.print("[yellow]Request cancelled.[/yellow] Back at the prompt.")
+            elif isinstance(exc, click.ClickException):
+                pass  # already reported by the command; keep the REPL alive
+            elif isinstance(exc, Exception):
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+            else:
+                raise
+    session.save_history()
 
 
 def _run_plan(request: str, ctx_obj: dict):
-    _run_agent(
-        ctx_obj, f"Create a detailed plan for: {request}", request=request, phase="plan",
-        heading=f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan",
-        result_title="Plan", border="yellow",
-    )
+    from local_coder.orchestrator.sessions import SessionStore
+
+    console.print(Panel(f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan", border_style="yellow"))
+
+    config = _load_config(ctx_obj)
+
+    json_events: list = []
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        if json_mode(ctx_obj):
+            coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+        try:
+            result = await coordinator.run(f"Create a detailed plan for: {request}")
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=request, phase="plan", result=result
+            )
+            if json_mode(ctx_obj):
+                _emit_run(ctx_obj, phase="plan", request=request, result=result, events=json_events)
+                return
+            console.print(Panel(Markdown(result), title="Plan", border_style="yellow"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "plan"):
+        asyncio.run(_run())
 
 
 def _run_review(ctx_obj: dict):
-    request = "Review current uncommitted changes"
-    _run_agent(
-        ctx_obj, request, request=request, phase="review",
-        heading="Reviewing current changes", title="Local Coder - Review",
-        result_title="Review", border="white",
-    )
+    from local_coder.orchestrator.sessions import SessionStore
+
+    console.print(Panel("Reviewing current changes", title="Local Coder - Review", border_style="white"))
+
+    config = _load_config(ctx_obj)
+
+    json_events: list = []
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        if json_mode(ctx_obj):
+            coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+        try:
+            result = await coordinator.run("Review current uncommitted changes")
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request="Review current uncommitted changes", phase="review", result=result
+            )
+            if json_mode(ctx_obj):
+                _emit_run(ctx_obj, phase="review", request="Review current uncommitted changes", result=result, events=json_events)
+                return
+            console.print(Panel(Markdown(result), title="Review", border_style="white"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "review"):
+        asyncio.run(_run())
+
+
+def _run_security(ctx_obj: dict, paths: list[str], focus: str | None, batch_chars: int | None = None):
+    from local_coder.orchestrator.sessions import SessionStore
+
+    scope = ", ".join(paths) if paths else "whole project"
+    console.print(Panel(f"Security review: {scope}", title="Local Coder - Security", border_style="bright_red"))
+
+    config = _load_config(ctx_obj)
+
+    json_events: list = []
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        if json_mode(ctx_obj):
+            coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+        try:
+            result = await coordinator.security_review(paths, focus, batch_chars)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Security review: {focus or scope}", phase="security", result=result
+            )
+            if json_mode(ctx_obj):
+                _emit_run(ctx_obj, phase="security", request=f"Security review: {focus or scope}",
+                          result=result, events=json_events, extra={"scope": paths or "whole project", "focus": focus})
+                return
+            console.print(Panel(Markdown(result), title="Security Review", border_style="bright_red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "security review"):
+        asyncio.run(_run())
+
+
+def _show_security_lessons(project_root: str):
+    from local_coder.security.lessons import LESSONS_FILE, LessonStore
+
+    store = LessonStore(project_root)
+    accepted, pending = store.load(), store.pending()
+    if accepted:
+        table = Table(title=LESSONS_FILE)
+        table.add_column("Kind")
+        table.add_column("Lesson")
+        for lesson in accepted:
+            table.add_row(lesson.kind, escape(lesson.render()[2:]))
+        console.print(table)
+    else:
+        console.print(f"[dim]No {LESSONS_FILE} yet.[/dim]")
+    if pending:
+        table = Table(title="Proposed lessons (pending review)")
+        table.add_column("Id", style="cyan")
+        table.add_column("Kind")
+        table.add_column("Lesson")
+        for lesson in pending:
+            table.add_row(lesson.id, lesson.kind, escape(lesson.render()[2:]))
+        console.print(table)
+        console.print("Accept with [bold]local-coder security-lessons accept ID...[/bold] (or --all), reject with [bold]reject[/bold].")
+    else:
+        console.print("[dim]No proposals waiting.[/dim]")
+
+
+def _decide_security_lessons(project_root: str, ids: tuple[str, ...], everything: bool, accept: bool):
+    from local_coder.security.lessons import LESSONS_FILE, LessonStore
+
+    if not ids and not everything:
+        raise click.UsageError("Pass proposal ids, or --all.")
+    store = LessonStore(project_root)
+    chosen = (store.accept if accept else store.reject)(None if everything else list(ids))
+    missing = set(ids) - {lesson.id for lesson in chosen}
+    verb = f"Accepted into {LESSONS_FILE}" if accept else "Rejected"
+    for lesson in chosen:
+        console.print(f"{verb}: {escape(lesson.render()[2:])}")
+    if missing:
+        console.print(f"[yellow]No pending proposal with id: {', '.join(sorted(missing))}[/yellow]")
+
+
+def _run_validate_finding(ctx_obj: dict, finding: str, paths: list[str]):
+    from local_coder.orchestrator.sessions import SessionStore
+
+    if not finding.strip():
+        if json_mode(ctx_obj):
+            raise click.UsageError("Provide the finding to validate, e.g. the file:line and what is wrong.")
+        console.print("[red]Provide the finding to validate, e.g. the file:line and what is wrong.[/red]")
+        return
+
+    console.print(Panel("Validating a security finding (local PoC)", title="Local Coder - Validate Finding", border_style="red"))
+
+    config = _load_config(ctx_obj)
+
+    json_events: list = []
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        if json_mode(ctx_obj):
+            coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+        try:
+            result = await coordinator.validate_finding(finding, paths)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Validate finding: {finding[:80]}", phase="validate-finding", result=result
+            )
+            if json_mode(ctx_obj):
+                _emit_run(ctx_obj, phase="validate-finding", request=f"Validate finding: {finding[:80]}",
+                          result=result, events=json_events)
+                return
+            console.print(Panel(Markdown(result), title="Finding Validation", border_style="red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "finding validation"):
+        asyncio.run(_run())
 
 
 def _run_tests(ctx_obj: dict):
-    request = "Run project tests and report results"
-    _run_agent(
-        ctx_obj, request, request=request, phase="test",
-        heading="Running tests", title="Local Coder - Test",
-        result_title="Test Results", border="magenta", save_session=False,
-    )
+    from rich.text import Text
+
+    console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
+
+    config = _load_config(ctx_obj)
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        try:
+            result = await coordinator.run_tests_only()
+            if json_mode(ctx_obj):
+                emit(ctx_obj, {"phase": "test", "result": result,
+                               "details": _run_tests_details_text(result)})
+                return
+            # Plain text: the report's line layout matters and it may contain [brackets].
+            console.print(Panel(Text(result), title="Test Results", border_style="magenta"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "tests"):
+        asyncio.run(_run())
+
+
+def _checkpoint_json(item) -> dict:
+    from dataclasses import asdict
+
+    return asdict(item)
+
+
+def _run_status_from_events(events: list) -> str:
+    """"completed" or "failed" from the coordinator's final event; defaults
+    to "completed" when the run returned without a terminal event."""
+    for event in reversed(events):
+        if event["source"] == "ORCHESTRATOR" and event["event_type"] in ("task_completed", "task_failed"):
+            return "completed" if event["event_type"] == "task_completed" else "failed"
+    return "completed"
+
+
+def _emit_run(ctx_obj, *, phase, request, result, events, session_id=None, extra=None):
+    status = _run_status_from_events(events)
+    errors = [e for e in events if e["event_type"].endswith("error")]
+    data = {"request": request, "phase": phase, "status": status, "session_id": session_id,
+            "result": result, "errors": errors, "events": events}
+    if extra:
+        data.update(extra)
+    emit(ctx_obj, data, ok=status == "completed" and not any(e["event_type"] == "model_error" for e in errors))
 
 
 def _run_checkpoint(ctx_obj: dict):
@@ -781,21 +1328,16 @@ def _run_rollback(checkpoint_id: str, ctx_obj: dict):
 
 def _run_status(ctx_obj: dict):
     import subprocess
-    from local_coder.orchestrator.config_loader import load_config
 
     as_json = json_mode(ctx_obj)
-    data = {
-        "project_root": ctx_obj["project_root"],
-        "models_configured": None,
-        "config_error": None,
-        "git_branch": None,
-        "ollama": {"reachable": False, "status_code": None},
-    }
+    data = {"project_root": ctx_obj["project_root"], "models_configured": None,
+            "config_error": None, "git_branch": None,
+            "ollama": {"reachable": False, "status_code": None}}
     if not as_json:
         console.print(Panel("System Status", title="Local Coder", border_style="cyan"))
 
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
         data["models_configured"] = len(config.models)
         if not as_json:
             console.print(f"[bold]Models Configured:[/bold] {len(config.models)}")
@@ -819,7 +1361,6 @@ def _run_status(ctx_obj: dict):
         if not as_json:
             console.print("[bold]Git Branch:[/bold] Not a git repository or git not found")
 
-    # Try to check Ollama connectivity
     try:
         import httpx
         with httpx.Client(timeout=2.0) as client:
@@ -841,32 +1382,27 @@ def _run_status(ctx_obj: dict):
 
 
 def _resolve_model_name(config, role) -> str:
-    """Mirror ModelManager.get_model's routing so this display is accurate."""
-    role_name = role.value
-    configured = config.agentic.role_models.get(role_name)
-    if configured and configured in config.models:
-        return configured
-    if role_name in config.models:
-        return role_name
-    if "default" in config.models:
-        return "default"
-    if config.models:
-        return next(iter(config.models))
-    return "[not configured]"
+    """Same routing ModelManager.get_model uses, so this display is accurate."""
+    from local_coder.models.router import resolve_model_name
+
+    try:
+        return resolve_model_name(config, role)
+    except ValueError as exc:
+        return f"[invalid: {exc}]"
+    except RuntimeError:
+        return "[not configured]"
 
 
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
-        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, TesterAgent,
+        CoderAgent, DebuggerAgent, ExplorerAgent, ExploitValidatorAgent, PlannerAgent, ReviewerAgent,
+        SecurityAgent, TesterAgent,
     )
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.types import AgentRole
 
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
     except Exception as e:
-        if json_mode(ctx_obj):
-            raise click.ClickException(f"Failed to load config: {e}") from e
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
 
@@ -877,15 +1413,14 @@ def _show_agents(ctx_obj: dict):
         AgentRole.DEBUGGER: DebuggerAgent,
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
+        AgentRole.SECURITY: SecurityAgent,
+        AgentRole.EXPLOIT_VALIDATOR: ExploitValidatorAgent,
     }
 
     if json_mode(ctx_obj):
         emit(ctx_obj, {"agents": [
-            {
-                "role": role.value,
-                "model": model if (model := _resolve_model_name(config, role)) in config.models else None,
-                "system_prompt": agent_cls.system_prompt.strip().splitlines()[0],
-            }
+            {"role": role.value, "model": _resolve_model_name(config, role),
+             "system_prompt": agent_cls.system_prompt.strip().splitlines()[0]}
             for role, agent_cls in agent_classes.items()
         ]})
         return
@@ -905,26 +1440,17 @@ def _show_agents(ctx_obj: dict):
 
 
 def _show_models(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
     except Exception as e:
-        if json_mode(ctx_obj):
-            raise click.ClickException(f"Failed to load config: {e}") from e
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
 
     if json_mode(ctx_obj):
         emit(ctx_obj, {"models": [
-            {
-                "name": name,
-                "backend": model.backend.value,
-                "model_id": model.model_id,
-                "base_url": model.base_url,
-                "context_length": model.context_length,
-                "temperature": model.temperature,
-                "max_tokens": model.max_tokens,
-            }
+            {"name": name, "backend": model.backend.value, "model_id": model.model_id,
+             "base_url": model.base_url, "context_length": model.context_length,
+             "temperature": model.temperature, "max_tokens": model.max_tokens}
             for name, model in config.models.items()
         ]})
         return
@@ -943,4 +1469,167 @@ def _show_models(ctx_obj: dict):
             str(model.context_length)
         )
 
+    console.print(table)
+
+
+# === Custom commands and hooks =============================================
+
+def _load_custom_commands(ctx_obj: dict, warn: bool = False):
+    from local_coder import custom_commands
+
+    commands, warnings = custom_commands.discover(ctx_obj["project_root"], reserved=ui.builtin_names())
+    if warn:
+        for warning in warnings:
+            console.print(f"[yellow]Custom command skipped:[/yellow] {warning}")
+    return {c.name: c for c in commands}
+
+
+def _run_extension_command(user_input: str, ctx_obj: dict) -> bool:
+    """Run a custom command or /hooks. False if ``user_input`` is neither."""
+    from local_coder import custom_commands
+
+    name, arguments = custom_commands.split_invocation(user_input)
+    if name == "/hooks":
+        _show_hooks(ctx_obj)
+        return True
+    # Re-read on every use so edits to a command file apply without a restart.
+    command = _load_custom_commands(ctx_obj).get(name)
+    if command is None:
+        return False
+    prompt = command.expand(arguments)
+    if command.mode == "plan":
+        _run_plan(prompt, ctx_obj)
+    else:
+        _run_request(prompt, ctx_obj)
+    return True
+
+
+def _setup_interactive_extensions(ctx_obj: dict) -> None:
+    """Load custom commands into /help and Tab completion, and offer to
+    trust this project's hooks if it has untrusted ones."""
+    from local_coder import hooks
+
+    ui.set_custom_commands(_load_custom_commands(ctx_obj, warn=True).values())
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    for error in config.errors:
+        console.print(f"[yellow]Hook skipped:[/yellow] {error}")
+    if config.hooks and not hooks.is_trusted(config, ctx_obj["project_root"]):
+        console.print(f"[bold yellow]{config.source} defines hooks that run shell commands:[/bold yellow]")
+        console.print(_hooks_table(config))
+        try:
+            answer = click.confirm("Trust and run these hooks in this project?", default=False)
+        except click.Abort:
+            console.print()
+            answer = False
+        if answer:
+            hooks.trust(config, ctx_obj["project_root"])
+            console.print("[green]Hooks trusted.[/green] They will ask again if they change.")
+        else:
+            console.print("[dim]Hooks will not run. Trust them later with `local-coder hooks trust`.[/dim]")
+
+
+def _install_hooks(coordinator, ctx_obj: dict) -> None:
+    """Attach trusted hooks to the coordinator's tool registry."""
+    from local_coder import hooks
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    if not config.hooks:
+        return
+    if not hooks.is_trusted(config, ctx_obj["project_root"]):
+        if not ctx_obj.get("_warned_untrusted_hooks"):
+            console.print(
+                f"[yellow]Hooks in {config.source} are not trusted, so they will not run.[/yellow] "
+                "Review them with `local-coder hooks`, then run `local-coder hooks trust`."
+            )
+            ctx_obj["_warned_untrusted_hooks"] = True
+        return
+    hooks.install(coordinator.tool_registry, hooks.HookRunner(config, ctx_obj["project_root"]))
+
+
+def _hooks_table(config) -> Table:
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("Event", style="cyan", no_wrap=True)
+    table.add_column("Tools", style="dim")
+    table.add_column("Command")
+    for hook in config.hooks:
+        table.add_row(hook.event, ", ".join(sorted(hook.tools)) or "all", hook.command)
+    return table
+
+
+def _show_hooks(ctx_obj: dict) -> None:
+    from local_coder import hooks
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    for error in config.errors:
+        console.print(f"[yellow]Hook skipped:[/yellow] {error}")
+    if not config.hooks:
+        where = config.source or "the project config"
+        console.print(f"No hooks configured. Add a `hooks:` section to {where}.")
+        return
+    trusted = hooks.is_trusted(config, ctx_obj["project_root"])
+    state = "[green]trusted[/green]" if trusted else "[yellow]not trusted, will not run[/yellow] (local-coder hooks trust)"
+    console.print(f"Hooks from {config.source}: {state}")
+    console.print(_hooks_table(config))
+
+
+@cli.group(name="hooks", invoke_without_command=True)
+@click.pass_context
+def hooks_group(ctx):
+    """Show, trust or untrust this project's lifecycle hooks."""
+    if ctx.invoked_subcommand is None:
+        _show_hooks(ctx.obj)
+
+
+@hooks_group.command(name="trust")
+@click.option("--yes", "-y", is_flag=True, help="Trust without asking")
+@click.pass_context
+def hooks_trust(ctx, yes):
+    """Allow the hooks currently configured here to run."""
+    from local_coder import hooks
+
+    ctx_obj = ctx.obj
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    if not config.hooks:
+        console.print("No hooks configured, nothing to trust.")
+        return
+    console.print(_hooks_table(config))
+    if not yes and not click.confirm(f"Trust these hooks from {config.source}?", default=False):
+        return
+    hooks.trust(config, ctx_obj["project_root"])
+    console.print("[green]Hooks trusted.[/green] Changing them will require trusting them again.")
+
+
+@hooks_group.command(name="untrust")
+@click.pass_context
+def hooks_untrust(ctx):
+    """Stop running this project's hooks."""
+    from local_coder import hooks
+
+    if hooks.untrust(ctx.obj["project_root"]):
+        console.print("Hooks for this project are no longer trusted.")
+    else:
+        console.print("This project's hooks were not trusted.")
+
+
+@cli.command(name="commands")
+@click.pass_context
+def commands_cmd(ctx):
+    """List custom slash commands from .local-coder/commands/."""
+    from local_coder import custom_commands
+
+    commands = _load_custom_commands(ctx.obj, warn=True)
+    if not commands:
+        console.print(
+            f"No custom commands. Add Markdown files to {custom_commands.project_commands_dir(ctx.obj['project_root'])}"
+            f" or {custom_commands.user_commands_dir()}."
+        )
+        return
+    table = Table(title="Custom commands", title_justify="left")
+    table.add_column("Command", style="bold cyan", no_wrap=True)
+    table.add_column("Description")
+    table.add_column("Mode", style="dim")
+    table.add_column("File", style="dim")
+    for c in commands.values():
+        table.add_row(f"{c.name} {c.argument_hint}".rstrip(), c.description, c.mode, f"{c.path} ({c.scope})")
     console.print(table)

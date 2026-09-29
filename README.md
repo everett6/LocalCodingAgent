@@ -61,8 +61,178 @@ The envelope and each command's fields are documented in
 [docs/json-output.md](docs/json-output.md).
 
 Running `local-coder` with no arguments opens the interactive terminal mode.
+Type a request to run it, or a slash command (`/plan <request>`, `/review`,
+`/test`, `/status`, `/checkpoint`, `/checkpoints`, `/rollback <id>`, `/help`,
+`/quit`); Tab completes slash commands and input history is kept in
+`.local-coder/history`. While a request runs a spinner shows the active agent
+and elapsed time; Ctrl+C cancels the request and returns to the prompt, and
+Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
+
+## Configuration
+
+Settings are read from YAML files, merged in this order (later wins):
+
+1. `~/.config/local-coder/config.yaml` (or `$XDG_CONFIG_HOME/local-coder/config.yaml`):
+   your own endpoints and defaults, shared by every project.
+2. The project file: `--config PATH` if given, otherwise the first of
+   `.local-coder/config.yaml`, `.local-coder.yaml`, `config/config.yaml`.
+   Nested sections merge, so a project can change one field of a model the
+   user file defines.
+3. Command-line flags: `--set KEY=VALUE` (repeatable, dotted keys, values
+   parsed as YAML), `--temperature`, then `--model`.
+
+```bash
+local-coder --set models.coder.temperature=0.5 --set tools.command_timeout=300 "Fix the tests"
+local-coder config   # show the merged config, routing, and any problems
+```
+
+```yaml
+model_defaults:            # merged into every entry under models
+  backend: openai_compatible
+  max_tokens: 4096
+
+models:
+  fast:
+    model_id: Qwen2.5-Coder-7B-Instruct
+    base_url: http://localhost:8091/v1
+    temperature: 0.2
+  strong:
+    model_id: Qwen3-30B-A3B-Instruct-2507
+    base_url: http://localhost:8090/v1
+  hosted:
+    model_id: some-hosted-model
+    base_url: https://api.example.com/v1
+    api_key_env: EXAMPLE_API_KEY   # or api_key: "${EXAMPLE_API_KEY}"
+
+routing:
+  roles:                   # which model each agent role uses
+    explorer: fast
+    planner: strong
+    coder: strong
+    debugger: strong
+    tester: fast
+    reviewer: fast
+  escalate_to: strong      # rerun a failed step on this model
+  fallbacks:               # if a model's server is unreachable, use the next
+    strong: [hosted, fast]
+
+tools:
+  disabled: [git_commit]   # removed for every role
+  command_timeout: 120     # run_command default, in seconds
+  roles:                   # replace a role's full tool list
+    reviewer: [read_file, list_files, grep, git_diff]
+```
+
+API keys are never read from the file itself. A literal `api_key` value in
+any config file (or passed with `--set`) is refused with an error; name an
+environment variable with `api_key_env` instead. The key is sent as a
+`Authorization: Bearer` header and is kept out of `local-coder config`
+output and session logs.
+
+**Routing** picks a model for each step in this order: a task's own
+`model_name` from the plan, `escalate_to` when the step is a retry, the
+`routing.roles` entry (`agentic.role_models` is the older spelling of the same
+map), a model named after the role, a model named `default`, then the first
+model. With `escalate_to` set, a plan task that fails is rerun once on that
+model (seeing whatever files the first attempt already changed), and the
+second and later fix-loop attempts use it for the debugger. `fallbacks` are
+only probed for models that list them, once per run.
+
+## Custom commands
+
+Save prompts you use often as Markdown files and run them as slash commands.
+Project commands live in `.local-coder/commands/`, personal ones in
+`~/.config/local-coder/commands/` (a project command wins on a name clash).
+The file name is the command: `review-auth.md` is `/review-auth`, and a
+subfolder adds a prefix, so `sec/triage.md` is `/sec:triage`.
+
+```markdown
+---
+description: Check a module for injection bugs
+argument-hint: <path>
+mode: run            # or "plan" to only produce a plan
+---
+Review $ARGUMENTS for SQL and command injection. Start with $1 and report
+each finding with its file:line.
+```
+
+`$ARGUMENTS` is everything typed after the command and `$1`..`$9` are its
+words; a template with neither gets the arguments appended. Custom commands
+appear in `/help` and Tab completion, are re-read on every use, and cannot
+replace a built-in command. Outside interactive mode run one with
+`local-coder run "/review-auth src/auth.py"`, and list them with
+`local-coder commands`. A command file is only a prompt: nothing in it is
+executed, and the request goes through the usual approval prompts.
+
+## Hooks
+
+Hooks run your own shell commands around the agent's tool calls, for
+example to format every file it edits or to veto commands you never want
+it to run. Add a `hooks:` section to the project config
+(`.local-coder/config.yaml`, `config/config.yaml`, or `--config`):
+
+```yaml
+hooks:
+  after_edit:
+    - command: ruff format "$LOCAL_CODER_FILE"
+      timeout: 30
+  after_tests: notify-send "local-coder: tests finished"
+  before_tool:
+    - tools: [run_command]
+      command: ./scripts/audit-command.sh
+```
+
+| Event | Runs around |
+| --- | --- |
+| `before_tool`, `after_tool` | every tool call (narrow with `tools:`) |
+| `before_edit`, `after_edit` | `write_file`, `edit_file`, `apply_patch` |
+| `after_tests` | `run_tests` |
+
+A hook runs in the project root with `LOCAL_CODER_EVENT`, `LOCAL_CODER_TOOL`,
+`LOCAL_CODER_FILE`, `LOCAL_CODER_SUCCESS` (after hooks) and
+`LOCAL_CODER_PROJECT_ROOT` set, and receives the call as JSON on stdin
+(`event`, `tool`, `arguments`, plus `success` and `output` for after hooks).
+If a `before_*` hook exits non-zero the call is blocked and the hook's output
+is returned to the model as the reason. A failing `after_*` hook doesn't
+change the result, but its output is appended so the model sees it. Hooks
+time out after 60 seconds unless `timeout:` says otherwise.
+
+Because a config file can come with a cloned repository, hooks do not run
+until you trust them: interactive mode asks once, or run `local-coder hooks`
+to review them and `local-coder hooks trust` to approve. The approval is
+stored in `~/.config/local-coder/trusted-hooks.json`, keyed by project and a
+hash of the hooks, so any change to them needs approving again;
+`local-coder hooks untrust` revokes it. `/hooks` shows the current state.
+Hooks apply to CLI runs; `local-coder serve` does not run them.
+
+### Sessions and resume
+
+Every request runs in a session saved under `.local-coder/sessions/<id>/`, so
+work can span several invocations instead of starting cold each time:
+
+```bash
+local-coder "Add OAuth login"          # new session; its id is printed at the end
+local-coder --resume                   # pick the latest session's unfinished request back up
+local-coder --resume "Now add tests"   # follow-up request in the latest session
+local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
+local-coder resume auth                # pick up auth's unfinished request
+local-coder sessions                   # list sessions
+local-coder sessions auth              # show a session's requests and finished phases
+```
+
+The coordinator checkpoints each phase as it finishes (exploration, plan, each
+completed plan task, review, every test run and fix attempt). If a run crashes,
+errors, or is stopped with Ctrl+C, resuming skips the finished phases and
+continues from the next one, running only the plan tasks that had not finished. A follow-up
+request gets the earlier requests in the session and their results (the last
+five, each trimmed) as context. `state.json` in the session folder holds the
+turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
+two terminals from running the same session at once. In the interactive
+prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
+manage it. `POST /run` on the remote server uses the same sessions, so repeating
+a `session_id` there continues it too.
 
 ## Local model server
 
@@ -142,14 +312,11 @@ multiple projects sharing one server don't collide.
 The framework follows a plan, execute, review, verify loop. A planner can
 assign smaller tasks to coder, tester, debugger, or reviewer agents through the
 task DAG, and each task may select a different configured model with
-`model_name`. Role defaults can be configured in `.local-coder/config.yaml`:
+`model_name`. Role defaults come from `routing.roles` (see
+[Configuration](#configuration)); context sizes from `agentic`:
 
 ```yaml
 agentic:
-	role_models:
-		planner: reasoning-model
-		coder: coding-model
-		reviewer: review-model
 	context_window_chars: 24000
 	compact_context_chars: 12000
 ```
@@ -166,6 +333,107 @@ system message telling the model to stop repeating the call and try
 something else; after 5 it gives up on the task rather than silently
 burning the rest of the iteration budget on a call that has never once
 succeeded.
+
+**Targeted edits:** Coder, Debugger, and Tester agents get an `edit_file`
+tool that replaces an exact snippet of a file (`old_string` -> `new_string`,
+optionally `replace_all`), alongside `write_file` and `apply_patch`. Small
+local models get whole-file rewrites and unified diffs wrong far more often
+than a copy-and-replace, so the prompts steer them to `edit_file` for changes
+to existing files. A failed edit explains how to recover: an ambiguous match
+lists every matching line, and a match that differs only in whitespace
+names the line to re-read. CRLF files keep their line endings. `apply_patch`
+now reports which files it changed, so patch edits show up in task summaries
+and in the drafter's accept/reject signal like other edits do.
+
+**Lint and format:** `lint` runs the project's linter and reports problems
+without touching files; `format_code` formats in place and reports which
+files it rewrote. Both auto-detect the language from its marker file
+(`pyproject.toml`, `package.json`, `go.mod`, `Cargo.toml`) and pick the first
+installed tool -- ruff or flake8, eslint, go vet, clippy for linting; ruff
+format or black, prettier, gofmt, cargo fmt for formatting -- preferring a
+project-local `node_modules/.bin` binary over `PATH`. The model can name one
+of those tools and pass workspace paths, but never an arbitrary command, so
+neither needs the shell approval flow. Review roles get `lint` only.
+
+## Security review (red and blue team)
+
+`local-coder security` runs a read-only security agent over the project
+(`/security` in interactive mode):
+
+```bash
+local-coder security                          # whole project
+local-coder security src/api --focus "auth and injection in request handlers"
+```
+
+The agent works both sides: it maps the attack surface and traces untrusted
+input to dangerous sinks (injection, path traversal, SSRF, unsafe
+deserialization, missing authorization, secrets), verifies scanner hits by
+reading the code, and reports each finding with `file:line`, how it is
+exploitable, its impact, and a concrete fix, plus hardening recommendations
+and the false positives it dismissed. Route it to its own model with
+`agentic.role_models.security`.
+
+Its `security_scan` tool (also available to the coder, debugger, and
+reviewer roles) combines:
+
+- a built-in secret scanner (private keys, AWS/GitHub/Slack/Google/Stripe/
+  Anthropic/OpenAI-style keys, hard-coded passwords and tokens) that needs no
+  dependencies and redacts every matched value in its output;
+- `bandit` for Python, when installed;
+- `semgrep`, when installed **and** the project has its own rules
+  (`.semgrep.yml`, `.semgrep.yaml`, or `.semgrep/`). Remote rule packs are
+  never fetched and metrics are off, so scanning stays offline.
+
+Everything is scoped to the local workspace: the security role cannot edit
+project files, run shell commands, or contact other hosts.
+
+### How the review learns (SECURITY_LESSONS.md)
+
+Each review gets better at *this* project without the agent changing its own
+code. `SECURITY_LESSONS.md`, a markdown file you commit like `AGENTS.md`,
+holds what earlier reviews established:
+
+```markdown
+## Suppress
+- secrets/hardcoded-credential | tests/** | Fixtures use fake credentials.
+
+## Confirmed
+- B602 | src/jobs.py | shell=True with the job name from the request.
+
+## Patterns
+- Every HTTP handler must call auth.require_user; one that does not is a finding.
+```
+
+Every review loads it. `security_scan` drops findings a `Suppress` entry
+covers, merges the same `path:line` reported by several scanners, and marks
+findings `[new]` when the previous completed review did not see them
+(fingerprints use the flagged line's text, so moving code does not make an
+old finding look new).
+
+The agent never edits the file. While it works it records findings with
+`record_finding` (file:line, exploit path, fix, a 1-10 confidence; findings
+under 8 stay out of the report). At the end, disproved scanner hits,
+confirmed findings (including ones `validate-finding` reproduced) and
+reusable patterns become *proposals* that you review:
+
+```bash
+local-coder security-lessons                  # accepted lessons + pending proposals
+local-coder security-lessons accept 3f9a1c    # or --all
+local-coder security-lessons reject 77b2e0
+local-coder security-lessons suppress B101 "tests/**" --reason "asserts in tests"
+```
+
+### Long reviews and context compaction
+
+Recorded findings live in `.local-coder/security/ledger.json`, outside the
+conversation. When the conversation is compacted, the ledger is pinned back
+in word for word, so a summary cannot lose a `file:line` or an exploit path.
+A scope larger than `--batch-chars` of source (default: twice
+`agentic.context_window_chars`) is reviewed in batches, riskiest files first
+(subprocess, deserialization, SQL, request handlers). Each batch starts a
+fresh conversation seeded with the ledger so far, and the final report is
+built from the ledger. See `docs/security-review-research.md` for where these
+ideas come from.
 
 Independent tasks in a plan (no `depends_on` between them) run concurrently,
 bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
@@ -314,6 +582,45 @@ repo's Python code; the retry still helps for genuinely transient failures
 (a real sampling glitch, a momentary server hiccup), just not this specific
 deterministic one.
 
+## Context budget (token efficiency)
+
+A small local model's window fills fast, and every token of history is
+re-sent (and, on a cache miss, re-prefilled) on every turn. The agent loop
+keeps the conversation small in the same layered way opencode does, cheapest
+step first (`context/compression.py`):
+
+1. **Tool-output truncation.** One tool result is capped to
+   `max_tool_output_chars` (default: an eighth of `context_window_chars`,
+   between 2000 and 16000) and 400 lines. The head and tail are kept, since
+   errors and test failures usually sit at the end. The full text is saved to
+   `.local-coder/tool-output/<tool>-<call id>.txt` and the notice tells the
+   model to page through it with `read_file` or `grep`.
+2. **Paged reads.** `read_file` returns up to 1000 lines or 10000 characters,
+   clips lines over 1000 characters, and ends a partial page with the
+   `start_line` to continue from. Before, it cut at 10000 characters with no
+   way to ask for the rest. `grep` clips matching lines over 300 characters.
+3. **Pruning.** Once the conversation is over budget, older tool results are
+   replaced by a one-line placeholder. A read, grep, listing or git call that
+   was later repeated with the same arguments goes first, then anything past
+   the newest `compact_context_chars / 2` of tool output. No model call is
+   needed, and message structure and tool-call ids are kept.
+4. **Summarization.** If pruning isn't enough, the model summarizes the
+   middle of the history (files, facts learned, commands run, what's left).
+   That summary replaces it, and the system prompt, task and newest turns
+   stay verbatim. The cut never leaves a tool result without its tool call.
+   If summarization fails, the old character-budget trimming is the fallback.
+
+Compaction triggers when history passes `context_window_chars`, **or** when
+the prompt size the server reported last turn passes 85% of the model's
+`context_length` minus `max_tokens`. Chars per token varies a lot between
+code and prose, so the real count is the reliable signal. History is only
+rewritten when a trigger fires. Between compactions the prompt is
+append-only, so llama-server's prefix cache is reused on every turn.
+
+Past tool calls are now sent back as real JSON (compact separators) instead
+of a Python `repr`, so the model sees its own calls in the shape it wrote
+them.
+
 ## Architecture
 
 - `src/local_coder/agents/`: role-specific agents and the bounded tool loop
@@ -329,3 +636,24 @@ Run the tests with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+**Small-model guardrails:** three more checks in the same loop, for mistakes
+local models make far more often than frontier ones.
+
+- *Tool-call repair* (`agents/tool_repair.py`). A call written as text
+  (`<tool_call>{...}</tool_call>`, `<function=name>{...}</function>`, or a
+  message that is only a JSON call) is run as a real call. Arguments with
+  single quotes, `True`, a trailing comma, or a missing closing brace are
+  repaired; arguments that can't be repaired are reported back to the model
+  instead of silently running the tool with none. Near-miss names
+  (`ReadFile`, `bash`), aliased argument names (`file_path` for `path`), and
+  string-typed booleans and integers are mapped onto the schema, and the
+  tool result says what was reinterpreted.
+- *Read before overwrite.* `write_file` refuses to replace an existing file
+  the agent hasn't read (or written) in the current task.
+- *Syntax check after edits* (`verification/syntax.py`). Any `.py`, `.json`,
+  `.toml`, or `.yaml` file an edit touches is parsed in-process; if it no
+  longer parses, the edit's tool result carries the error and the lines
+  around it.
+
+Each can be turned off per agent class with `parse_text_tool_calls`,
+`require_read_before_overwrite`, and `check_syntax_after_edits`.

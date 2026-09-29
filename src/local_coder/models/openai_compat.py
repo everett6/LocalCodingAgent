@@ -7,7 +7,7 @@ from typing import AsyncIterator
 import httpx
 
 from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
-from local_coder.models.base import BaseModelBackend
+from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 
 
 class OpenAICompatibleBackend(BaseModelBackend):
@@ -15,7 +15,10 @@ class OpenAICompatibleBackend(BaseModelBackend):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0)
+        # api_key comes from the environment (api_key_env in the config), for
+        # hosted OpenAI-compatible endpoints or a server behind an auth proxy.
+        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else None
+        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0, headers=headers)
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """Convert standard tools dict to OpenAI format if needed."""
@@ -75,12 +78,8 @@ class OpenAICompatibleBackend(BaseModelBackend):
         if "tool_calls" in msg_data and msg_data["tool_calls"]:
             for tc in msg_data["tool_calls"]:
                 func = tc.get("function", {})
-                args_str = func.get("arguments", "{}")
-                try:
-                    args = json.loads(args_str)
-                except json.JSONDecodeError:
-                    args = {}
-                    
+                args = decode_tool_arguments(func.get("arguments", "{}"))
+
                 parsed_tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
                     name=func.get("name", ""),

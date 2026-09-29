@@ -17,6 +17,8 @@ class AgentRole(str, enum.Enum):
     DEBUGGER = "debugger"
     TESTER = "tester"
     REVIEWER = "reviewer"
+    SECURITY = "security"
+    EXPLOIT_VALIDATOR = "exploit_validator"
 
 
 class TaskStatus(str, enum.Enum):
@@ -50,10 +52,13 @@ class ModelBackend(str, enum.Enum):
 class ToolName(str, enum.Enum):
     READ_FILE = "read_file"
     WRITE_FILE = "write_file"
+    EDIT_FILE = "edit_file"
     APPLY_PATCH = "apply_patch"
     LIST_FILES = "list_files"
     SEARCH_FILES = "search_files"
     GREP = "grep"
+    CODE_SEARCH = "code_search"
+    REPO_MAP = "repo_map"
     GIT_STATUS = "git_status"
     GIT_DIFF = "git_diff"
     GIT_LOG = "git_log"
@@ -64,6 +69,8 @@ class ToolName(str, enum.Enum):
     BUILD = "build"
     LINT = "lint"
     FORMAT_CODE = "format_code"
+    SECURITY_SCAN = "security_scan"
+    RECORD_FINDING = "record_finding"
 
 
 # === Messages ===
@@ -121,6 +128,11 @@ class ModelConfig(BaseModel):
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
+    # Resolved from the environment at load time (config files name the
+    # variable via api_key_env, never the key itself). Kept out of repr and
+    # model_dump so it never lands in logs, session files or `config` output.
+    api_key: str | None = Field(default=None, repr=False, exclude=True)
+    api_key_env: str | None = None
 
 
 # === Agent Protocol ===
@@ -145,6 +157,8 @@ class AgentTask(BaseModel):
 class TaskContext(BaseModel):
     """Context provided to an agent for a task."""
     architecture: str = ""
+    guidelines: str = ""
+    security_lessons: str = ""  # SECURITY_LESSONS.md, for security roles
     relevant_symbols: list[str] = Field(default_factory=list)
     previous_findings: list[str] = Field(default_factory=list)
     file_contents: dict[str, str] = Field(default_factory=dict)
@@ -301,6 +315,34 @@ class AgenticConfig(BaseModel):
     # support and is a no-op (silently ignored) otherwise. See README.md's
     # "Local model server" section.
     session_cache: bool = False
+    # Size in tokens of the ranked repo map given to agents at the start of
+    # a task (0 turns it off). See context/repo_map.py.
+    repo_map_tokens: int = 1024
+
+
+class RoutingConfig(BaseModel):
+    """Multi-model routing beyond the per-role map in AgenticConfig.role_models.
+
+    escalate_to: model a step is rerun on after it fails (a failed plan task,
+    or the second and later debugger attempts in the fix loop).
+    fallbacks: model name -> ordered alternatives to use when that model's
+    server is unreachable.
+    """
+    escalate_to: str | None = None
+    fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ToolSettings(BaseModel):
+    """Tool settings from the config file's `tools:` section.
+
+    Tool names are kept as plain strings so a config written for a newer
+    tool set still loads; names this build doesn't know are ignored.
+    """
+    disabled: list[str] = Field(default_factory=list)
+    command_timeout: int | None = None
+    # role -> the complete list of tools that role may use (replaces the
+    # built-in default for that role).
+    roles: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class ProjectConfig(BaseModel):
@@ -311,6 +353,10 @@ class ProjectConfig(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     agentic: AgenticConfig = Field(default_factory=AgenticConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    tools: ToolSettings = Field(default_factory=ToolSettings)
+    # Config files that were merged to build this config, lowest priority first.
+    sources: list[str] = Field(default_factory=list)
     project_root: str = "."
     log_level: str = "INFO"
     log_dir: str = ".local-coder/logs"

@@ -33,7 +33,7 @@ it (`local-coder status --json`). With it:
 negative result in `data`: a tool that failed, tests that failed, an agent
 run that did not finish.
 
-## Agent runs: `run`, `plan`, `review`, `test`, `resume`
+## Agent runs: `run`, `plan`, `review`, `security`, `validate-finding`, `resume`
 
 ```json
 {
@@ -50,16 +50,23 @@ run that did not finish.
 }
 ```
 
-- `phase` is `run`, `plan`, `review` or `test` (`resume` re-runs as `run`).
+- `phase` is `run`, `plan`, `review`, `security` or `validate-finding`
+  (`resume` re-runs as `run`).
 - `status` is `completed` or `failed`, from the coordinator's final event.
-- `session_id` is the journal entry (see `sessions`); `null` for `test`,
-  which does not save one.
+- `session_id` is the session this run belongs to (see `sessions`); `null`
+  for the phases that do not run inside a persistent session (`plan`,
+  `review`, `security`, `validate-finding`).
 - `result` is the same Markdown report the terminal shows.
 - `errors` is every event whose `event_type` ends in `error`
   (`model_error`, `plan_error`, `fix_loop_error`, ...).
 - `events` is the full progress log in order.
+- `security` also carries `scope` and `focus`.
 - `ok` is true only when `status` is `completed` and no `model_error`
   occurred (a model call that failed after all retries).
+
+`test` is separate: it runs the project's tests directly (no model) and
+emits `{"phase": "test", "result": ..., "details": {"failures": [...]}}`,
+with `ok` true whenever the command ran.
 
 Approval prompts for risky actions are written to stderr. If stdin is not a
 terminal, a risky action is denied (and the denial shows up in the events)
@@ -97,8 +104,15 @@ the whole argument object; `-a` values are applied on top of it.
 for tools that have a parser (`run_tests` today, giving each failing test
 and its message) and `null` otherwise. An unknown tool name or bad
 `--args` is an `error` (`BadParameter`). Any tool registered in
-`local_coder.tools.create_tool_registry` is reachable this way, so new tools
-get JSON output without extra CLI code.
+`local_coder.tools.create_tool_registry` is reachable this way, so tools
+such as `lint`, `format_code`, `code_search`, `security_scan` and
+`repo_map` get JSON output without extra CLI code:
+
+```bash
+local-coder tool lint --json
+local-coder tool code_search -a query="where auth is checked" --json
+local-coder tool security_scan --json
+```
 
 ## `tools`
 
@@ -117,7 +131,9 @@ roles allowed to call the tool.
 | `status` | `{"project_root", "models_configured": int or null, "config_error": str or null, "git_branch": str or null, "ollama": {"reachable": bool, "status_code": int or null}}` |
 | `agents` | `{"agents": [{"role", "model": str or null, "system_prompt"}]}`; `system_prompt` is the prompt's first line |
 | `models` | `{"models": [{"name", "backend", "model_id", "base_url", "context_length", "temperature", "max_tokens"}]}` |
-| `sessions` | `{"sessions": [ {"session_id", "request", "phase", "result", "updated_at", ...} ]}`, newest first |
+| `config` | `{"sources", "user_config_path", "models": {name: {...}}, "routing": {role: {"model", "fallbacks"}}, "escalate_to", "tools", "problems": [str]}` |
+| `sessions` | `{"sessions": [ {"session_id", "status", "request", "turns", "updated_at", ...} ]}`, newest first; `sessions <id>` gives `{"session_id", "turns": [...]}` |
+| `map` | `{"map": str}` (the ranked repo map text) |
 | `init` | `{"config_path"}` |
 | `checkpoint`, `rollback` | `{"checkpoint": {"checkpoint_id", "created_at", "head", "patch_file", "untracked_dir"}}` |
 | `checkpoints` | `{"checkpoints": [ ...same shape... ]}`, newest first |
