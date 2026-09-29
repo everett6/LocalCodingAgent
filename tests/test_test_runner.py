@@ -480,8 +480,9 @@ def test_tool_runs_unittest(tmp_path):
         """)
     result = run(RunTestsTool(str(tmp_path)).execute(framework="unittest"))
     assert result.success is False
-    assert result.output.splitlines() == [
-        "unittest: did not pass (1 failed, 1 passed in 0.0s)",
+    head, *rest = result.output.splitlines()
+    assert head.startswith("unittest: did not pass (1 failed, 1 passed in ")
+    assert rest == [
         "FAILED test_u.T.test_bad - AssertionError: 1 != 2",
         "  at tests/test_u.py:8",
     ]
