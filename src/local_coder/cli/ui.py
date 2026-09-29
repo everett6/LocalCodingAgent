@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
@@ -93,7 +94,8 @@ def build_help_table(commands: tuple[SlashCommand, ...] = COMMANDS) -> Table:
         usage = f"{c.name} {c.args}".rstrip()
         if c.aliases:
             usage += ", " + ", ".join(c.aliases)
-        table.add_row(usage, c.help)
+        # escape: "[focus]" would otherwise be parsed as rich markup and vanish.
+        table.add_row(escape(usage), c.help)
     table.add_row("[dim]<anything else>[/dim]", "[dim]Run it as a coding request[/dim]")
     return table
 

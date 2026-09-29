@@ -323,3 +323,9 @@ def test_history_is_not_written_through_a_symlink(tmp_path, monkeypatch):
     session.readline_enabled = True
     session.save_history()
     assert victim.read_text() == "original"
+
+
+def test_help_shows_bracketed_arguments():
+    console = Console(file=io.StringIO(), width=120)
+    console.print(ui.build_help_table())
+    assert "/security [focus]" in console.file.getvalue()
