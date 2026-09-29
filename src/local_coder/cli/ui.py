@@ -34,6 +34,7 @@ class SlashCommand:
     help: str
     args: str = ""
     aliases: tuple[str, ...] = field(default_factory=tuple)
+    custom: bool = False  # loaded from a command file, not built in
 
 
 COMMANDS: tuple[SlashCommand, ...] = (
@@ -44,19 +45,43 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/checkpoint", "Save the current working tree"),
     SlashCommand("/checkpoints", "List saved checkpoints"),
     SlashCommand("/rollback", "Restore a checkpoint", args="<id>"),
+    SlashCommand("/hooks", "Show configured hooks and whether they are trusted"),
     SlashCommand("/help", "Show this help message"),
     SlashCommand("/quit", "Exit interactive mode", aliases=("/exit", "/q")),
 )
 
 
-def command_names(commands: tuple[SlashCommand, ...] = COMMANDS) -> list[str]:
+# Custom commands from .local-coder/commands/ (see local_coder.custom_commands),
+# set once the REPL has loaded them. Kept separate from COMMANDS so built-ins
+# stay a constant and always come first in /help.
+_custom_commands: tuple[SlashCommand, ...] = ()
+
+
+def set_custom_commands(commands) -> None:
+    """Register loaded CustomCommand objects for /help and completion."""
+    global _custom_commands
+    _custom_commands = tuple(
+        SlashCommand(c.name, c.description, args=c.argument_hint, custom=True) for c in commands
+    )
+
+
+def all_commands() -> tuple[SlashCommand, ...]:
+    return COMMANDS + _custom_commands
+
+
+def builtin_names() -> frozenset[str]:
+    return frozenset(command_names(COMMANDS))
+
+
+def command_names(commands: tuple[SlashCommand, ...] | None = None) -> list[str]:
     """Every accepted slash command, primary names first, then aliases."""
+    commands = all_commands() if commands is None else commands
     names = [c.name for c in commands]
     names += [alias for c in commands for alias in c.aliases]
     return names
 
 
-def complete_command(text: str, commands: tuple[SlashCommand, ...] = COMMANDS) -> list[str]:
+def complete_command(text: str, commands: tuple[SlashCommand, ...] | None = None) -> list[str]:
     """Slash commands (including aliases) starting with ``text``, sorted."""
     if not text.startswith("/"):
         return []
@@ -64,7 +89,7 @@ def complete_command(text: str, commands: tuple[SlashCommand, ...] = COMMANDS) -
     return sorted(n for n in command_names(commands) if n.startswith(text))
 
 
-def suggest_command(cmd: str, commands: tuple[SlashCommand, ...] = COMMANDS) -> Optional[str]:
+def suggest_command(cmd: str, commands: tuple[SlashCommand, ...] | None = None) -> Optional[str]:
     """Closest known slash command to a mistyped one, or None."""
     cmd = cmd.lower()
     names = command_names(commands)
@@ -83,11 +108,17 @@ def unknown_command_message(cmd: str) -> str:
     return message + "  [dim](type /help for the list)[/dim]"
 
 
-def build_help_table(commands: tuple[SlashCommand, ...] = COMMANDS) -> Table:
+def build_help_table(commands: tuple[SlashCommand, ...] | None = None) -> Table:
+    commands = all_commands() if commands is None else commands
     table = Table(title="Commands", title_justify="left", box=None, padding=(0, 2), show_header=False)
     table.add_column("Command", style="bold cyan", no_wrap=True)
     table.add_column("Description")
+    custom_heading_done = False
     for c in commands:
+        if c.custom and not custom_heading_done:
+            table.add_row("", "")
+            table.add_row("[bold]Custom[/bold]", "[dim].local-coder/commands/[/dim]")
+            custom_heading_done = True
         usage = f"{c.name} {c.args}".rstrip()
         if c.aliases:
             usage += ", " + ", ".join(c.aliases)
