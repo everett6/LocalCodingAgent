@@ -543,4 +543,5 @@ class CodeIndex:
         """
         if refresh:
             self.refresh()
-        return {rel: list(entry.get("chunks", [])) for rel, entry in list(self._files.items())}
+        with self._lock:
+            return {rel: list(entry.get("chunks", [])) for rel, entry in list(self._files.items())}
