@@ -46,6 +46,76 @@ Running `local-coder` with no arguments opens the interactive terminal mode.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
 
+## Configuration
+
+Settings are read from YAML files, merged in this order (later wins):
+
+1. `~/.config/local-coder/config.yaml` (or `$XDG_CONFIG_HOME/local-coder/config.yaml`):
+   your own endpoints and defaults, shared by every project.
+2. The project file: `--config PATH` if given, otherwise the first of
+   `.local-coder/config.yaml`, `.local-coder.yaml`, `config/config.yaml`.
+   Nested sections merge, so a project can change one field of a model the
+   user file defines.
+3. Command-line flags: `--set KEY=VALUE` (repeatable, dotted keys, values
+   parsed as YAML), `--temperature`, then `--model`.
+
+```bash
+local-coder --set models.coder.temperature=0.5 --set tools.command_timeout=300 "Fix the tests"
+local-coder config   # show the merged config, routing, and any problems
+```
+
+```yaml
+model_defaults:            # merged into every entry under models
+  backend: openai_compatible
+  max_tokens: 4096
+
+models:
+  fast:
+    model_id: Qwen2.5-Coder-7B-Instruct
+    base_url: http://localhost:8091/v1
+    temperature: 0.2
+  strong:
+    model_id: Qwen3-30B-A3B-Instruct-2507
+    base_url: http://localhost:8090/v1
+  hosted:
+    model_id: some-hosted-model
+    base_url: https://api.example.com/v1
+    api_key_env: EXAMPLE_API_KEY   # or api_key: "${EXAMPLE_API_KEY}"
+
+routing:
+  roles:                   # which model each agent role uses
+    explorer: fast
+    planner: strong
+    coder: strong
+    debugger: strong
+    tester: fast
+    reviewer: fast
+  escalate_to: strong      # rerun a failed step on this model
+  fallbacks:               # if a model's server is unreachable, use the next
+    strong: [hosted, fast]
+
+tools:
+  disabled: [git_commit]   # removed for every role
+  command_timeout: 120     # run_command default, in seconds
+  roles:                   # replace a role's full tool list
+    reviewer: [read_file, list_files, grep, git_diff]
+```
+
+API keys are never read from the file itself. A literal `api_key` value in
+any config file (or passed with `--set`) is refused with an error; name an
+environment variable with `api_key_env` instead. The key is sent as a
+`Authorization: Bearer` header and is kept out of `local-coder config`
+output and session logs.
+
+**Routing** picks a model for each step in this order: a task's own
+`model_name` from the plan, `escalate_to` when the step is a retry, the
+`routing.roles` entry (`agentic.role_models` is the older spelling of the same
+map), a model named after the role, a model named `default`, then the first
+model. With `escalate_to` set, a plan task that fails is rerun once on that
+model (seeing whatever files the first attempt already changed), and the
+second and later fix-loop attempts use it for the debugger. `fallbacks` are
+only probed for models that list them, once per run.
+
 ## Local model server
 
 This repo's own `config/config.yaml` is set up for the local llama.cpp stack
@@ -124,14 +194,11 @@ multiple projects sharing one server don't collide.
 The framework follows a plan, execute, review, verify loop. A planner can
 assign smaller tasks to coder, tester, debugger, or reviewer agents through the
 task DAG, and each task may select a different configured model with
-`model_name`. Role defaults can be configured in `.local-coder/config.yaml`:
+`model_name`. Role defaults come from `routing.roles` (see
+[Configuration](#configuration)); context sizes from `agentic`:
 
 ```yaml
 agentic:
-	role_models:
-		planner: reasoning-model
-		coder: coding-model
-		reviewer: review-model
 	context_window_chars: 24000
 	compact_context_chars: 12000
 ```

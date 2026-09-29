@@ -4,7 +4,7 @@ import abc
 import time
 from typing import Any
 
-from local_coder.types import ToolResult, ToolName, AgentRole
+from local_coder.types import ToolResult, ToolName, AgentRole, ToolSettings
 
 
 class Tool(abc.ABC):
@@ -95,6 +95,31 @@ class ToolRegistry:
         """Check if a role has permission to execute a tool."""
         return tool_name in self._permissions.get(role, set())
     
+    def apply_settings(self, settings: ToolSettings) -> None:
+        """Apply the config file's `tools:` section.
+
+        Tool names this build doesn't know are skipped rather than rejected,
+        so a config written for a newer tool set still loads.
+        """
+        known = {tool.value: tool for tool in ToolName}
+        for role_name, tool_names in settings.roles.items():
+            try:
+                role = AgentRole(role_name)
+            except ValueError:
+                continue
+            self._permissions[role] = {known[n] for n in tool_names if n in known}
+        for name in settings.disabled:
+            tool = known.get(name)
+            if tool is None:
+                continue
+            self._tools.pop(tool, None)
+            for allowed in self._permissions.values():
+                allowed.discard(tool)
+        if settings.command_timeout is not None:
+            for tool in self._tools.values():
+                if hasattr(tool, "default_timeout"):
+                    tool.default_timeout = settings.command_timeout
+
     async def execute_tool(
         self, role: AgentRole, tool_name: str, arguments: dict[str, Any]
     ) -> ToolResult:

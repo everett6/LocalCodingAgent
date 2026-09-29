@@ -15,7 +15,10 @@ class OpenAICompatibleBackend(BaseModelBackend):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0)
+        # api_key comes from the environment (api_key_env in the config), for
+        # hosted OpenAI-compatible endpoints or a server behind an auth proxy.
+        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else None
+        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0, headers=headers)
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """Convert standard tools dict to OpenAI format if needed."""

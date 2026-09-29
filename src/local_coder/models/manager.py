@@ -7,6 +7,7 @@ from local_coder.types import ProjectConfig, ModelConfig, AgentRole, ModelBacken
 from local_coder.models.base import LocalModel
 from local_coder.models.ollama import OllamaBackend
 from local_coder.models.openai_compat import OpenAICompatibleBackend
+from local_coder.models.router import fallback_chain, resolve_model_name
 
 
 class ModelManager:
@@ -16,6 +17,8 @@ class ModelManager:
         self.config = config
         self._models: Dict[str, LocalModel] = {}
         self._lock = asyncio.Lock()
+        # Reachability of models that have fallbacks, probed once per manager.
+        self._availability: Dict[str, bool] = {}
         
         # Concurrency limit logic
         total_slots = config.resources.max_concurrent_gpu_agents + config.resources.max_concurrent_cpu_agents
@@ -40,30 +43,43 @@ class ModelManager:
         else:
             raise ValueError(f"Unsupported backend type: {config.backend}")
 
-    async def get_model(self, role: AgentRole | str, model_name: str | None = None) -> LocalModel:
-        """Get the appropriate model for an agent role."""
+    async def get_model(
+        self,
+        role: AgentRole | str,
+        model_name: str | None = None,
+        *,
+        escalate: bool = False,
+    ) -> LocalModel:
+        """Get the model for an agent role (see models.router for the order).
+
+        escalate=True asks for routing.escalate_to, used when a step is being
+        retried after a failure. When routing.fallbacks lists alternatives
+        for the chosen model, its server is probed once per run and the first
+        reachable model in the chain is used instead.
+        """
         if not self._models:
             await self.initialize()
 
+        selected = resolve_model_name(self.config, role, model_name, escalate=escalate)
+        chain = fallback_chain(self.config, selected)
+        if len(chain) == 1:
+            return self._models[selected]
+        for name in chain:
+            if await self._is_reachable(name):
+                return self._models[name]
+        return self._models[selected]
+
+    async def _is_reachable(self, name: str) -> bool:
         async with self._lock:
-            # Map role to model name if possible, else fallback to 'default' or first available
-            # Explicit task routing wins, followed by configured role routing.
-            role_name = role.value if isinstance(role, AgentRole) else role
-            selected_name = model_name or self.config.agentic.role_models.get(role_name)
-            if selected_name is not None and selected_name not in self.config.models:
-                raise ValueError(f"Model not configured: {selected_name}")
-            if selected_name in self.config.models:
-                model_name = selected_name
-            elif role_name in self.config.models:
-                model_name = role_name
-            elif "default" in self.config.models:
-                model_name = "default"
-            elif self._models:
-                model_name = next(iter(self._models.keys()))
-            else:
-                raise RuntimeError("No models configured.")
-                
-            return self._models[model_name]
+            if name in self._availability:
+                return self._availability[name]
+        try:
+            available = bool(await self._models[name].is_available())
+        except Exception:
+            available = False
+        async with self._lock:
+            self._availability[name] = available
+        return available
 
     async def check_gpu_status(self) -> GPUStatus:
         """Check GPU status via nvidia-smi if available."""

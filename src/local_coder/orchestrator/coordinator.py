@@ -13,6 +13,7 @@ from local_coder.agents import create_agent
 from local_coder.tools import create_tool_registry
 from local_coder.models.cache import PromptCache
 from local_coder.models.manager import ModelManager
+from local_coder.models.router import resolve_model_name
 from local_coder.memory.store import MemoryStore
 from local_coder.context.repository import RepositoryContext
 from local_coder.scheduler.dag import TaskDAG
@@ -42,6 +43,7 @@ class Coordinator:
         self.tool_registry = create_tool_registry(
             project_root, approval=config.approval, approval_callback=approval_callback,
         )
+        self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config)
         self.resource_manager = ResourceManager(config.resources)
         self._event_handlers: list[Callable] = []
@@ -117,7 +119,9 @@ class Coordinator:
             fix_iterations = 0
             while not test_result.tests_passed and fix_iterations < self.config.verification.max_fix_iterations:
                 self._emit("ORCHESTRATOR", "fix_loop", f"Fixing failures (attempt {fix_iterations + 1})...")
-                last_fix_result = await self._fix_failures(test_result)
+                # The first attempt uses the debugger's own model; later ones
+                # move to routing.escalate_to (if set) since the first failed.
+                last_fix_result = await self._fix_failures(test_result, escalate=fix_iterations > 0)
                 fix_iterations += 1
                 if last_fix_result.status == TaskStatus.FAILED:
                     self._emit(
@@ -336,49 +340,81 @@ class Coordinator:
     async def _run_dag_task(self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore) -> None:
         """Run one DAG-scheduled task, bounded by the parallelism semaphore,
         and record its outcome on the DAG. Concurrent siblings in the same
-        wave call this independently via asyncio.gather in _execute_plan."""
-        async with semaphore:
-            try:
-                drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
-                agent = create_agent(
-                    task.role,
-                    await self.model_manager.get_model(task.role, task.model_name),
-                    self.tool_registry,
-                    self._dispatch,
-                    context_window_chars=self.config.agentic.context_window_chars,
-                    compact_context_chars=self.config.agentic.compact_context_chars,
-                    drafter=drafter,
-                )
-                if agent:
-                    response = await agent.execute(task)
-                else:
-                    response = AgentResponse(
-                        task_id=task.task_id,
-                        status=TaskStatus.COMPLETED,
-                        summary=f"Executed {task.task_id}",
-                        files_changed=[],
-                        tests_run=[],
-                        tests_passed=True,
-                        issues=[],
-                        follow_up_required=False
-                    )
+        wave call this independently via asyncio.gather in _execute_plan.
 
-                if response.status == TaskStatus.FAILED or not response.tests_passed:
-                    dag.mark_failed(task.task_id, response)
-                else:
-                    dag.mark_completed(task.task_id, response)
-            except Exception as e:
-                response = AgentResponse(
+        When routing.escalate_to names a different model than the one that
+        just failed, the task is rerun once on that model before it is
+        recorded as failed."""
+        async with semaphore:
+            response = await self._attempt_dag_task(task, escalate=False)
+            if self._failed(response) and self._can_escalate(task.role, task.model_name):
+                self._emit(
+                    "ORCHESTRATOR", "escalate",
+                    f"Retrying {task.task_id} on {self.config.routing.escalate_to} after: {response.summary[:200]}",
                     task_id=task.task_id,
-                    status=TaskStatus.FAILED,
-                    summary=str(e),
-                    files_changed=[],
-                    tests_run=[],
-                    tests_passed=False,
-                    issues=[str(e)],
-                    follow_up_required=True
                 )
+                response = await self._attempt_dag_task(task, escalate=True)
+            if self._failed(response):
                 dag.mark_failed(task.task_id, response)
+            else:
+                dag.mark_completed(task.task_id, response)
+
+    async def _model_for(self, role: AgentRole, model_name: str | None = None, escalate: bool = False):
+        if escalate:
+            return await self.model_manager.get_model(role, model_name, escalate=True)
+        if model_name is None:
+            return await self.model_manager.get_model(role)
+        return await self.model_manager.get_model(role, model_name)
+
+    @staticmethod
+    def _failed(response: AgentResponse) -> bool:
+        return response.status == TaskStatus.FAILED or not response.tests_passed
+
+    def _can_escalate(self, role: AgentRole, model_name: str | None = None) -> bool:
+        """True when a retry would actually run on a different model."""
+        target = self.config.routing.escalate_to
+        if not target or target not in self.config.models or model_name:
+            return False
+        try:
+            return resolve_model_name(self.config, role) != target
+        except (ValueError, RuntimeError):
+            return False
+
+    async def _attempt_dag_task(self, task: AgentTask, escalate: bool) -> AgentResponse:
+        try:
+            drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
+            agent = create_agent(
+                task.role,
+                await self._model_for(task.role, task.model_name, escalate=escalate),
+                self.tool_registry,
+                self._dispatch,
+                context_window_chars=self.config.agentic.context_window_chars,
+                compact_context_chars=self.config.agentic.compact_context_chars,
+                drafter=drafter,
+            )
+            if agent:
+                return await agent.execute(task)
+            return AgentResponse(
+                task_id=task.task_id,
+                status=TaskStatus.COMPLETED,
+                summary=f"Executed {task.task_id}",
+                files_changed=[],
+                tests_run=[],
+                tests_passed=True,
+                issues=[],
+                follow_up_required=False
+            )
+        except Exception as e:
+            return AgentResponse(
+                task_id=task.task_id,
+                status=TaskStatus.FAILED,
+                summary=str(e),
+                files_changed=[],
+                tests_run=[],
+                tests_passed=False,
+                issues=[str(e)],
+                follow_up_required=True
+            )
 
     async def _review(self, result: AgentResponse) -> str:
         reviewer = create_agent(AgentRole.REVIEWER, await self.model_manager.get_model(AgentRole.REVIEWER), self.tool_registry, self._dispatch)
@@ -405,10 +441,12 @@ class Coordinator:
             follow_up_required=False
         )
         
-    async def _fix_failures(self, test_result: AgentResponse) -> AgentResponse:
+    async def _fix_failures(self, test_result: AgentResponse, escalate: bool = False) -> AgentResponse:
+        if escalate and self._can_escalate(AgentRole.DEBUGGER):
+            self._emit("ORCHESTRATOR", "escalate", f"Escalating the fix to {self.config.routing.escalate_to}")
         debugger = create_agent(
             AgentRole.DEBUGGER,
-            await self.model_manager.get_model(AgentRole.DEBUGGER),
+            await self._model_for(AgentRole.DEBUGGER, escalate=escalate),
             self.tool_registry,
             self._dispatch,
             drafter=await self._get_drafter(),

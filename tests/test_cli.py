@@ -95,3 +95,41 @@ def test_local_server_models_command_does_not_crash(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["local-server", "models"])
 
     assert result.exit_code == 0
+
+def test_config_command_shows_routing_and_hides_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_CODER_USER_CONFIG", str(tmp_path / "none.yaml"))
+    monkeypatch.setenv("TEST_LC_CLI_KEY", "sk-do-not-print")
+    monkeypatch.setenv("COLUMNS", "200")
+    config_path = tmp_path / ".local-coder" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "models:\n"
+        "  fast: {model_id: small, api_key_env: TEST_LC_CLI_KEY}\n"
+        "  strong: {model_id: big}\n"
+        "routing:\n"
+        "  roles: {planner: strong}\n"
+        "  escalate_to: strong\n"
+    )
+
+    result = CliRunner().invoke(
+        cli, ["--project", str(tmp_path), "--set", "tools.command_timeout=90", "config"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "sk-do-not-print" not in result.output
+    assert "$TEST_LC_CLI_KEY (set)" in result.output
+    assert "Escalate failed steps to: strong" in result.output
+    assert "command_timeout=90" in result.output
+    assert "No problems found" in result.output
+
+
+def test_config_errors_are_reported_without_traceback(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_CODER_USER_CONFIG", str(tmp_path / "none.yaml"))
+    config_path = tmp_path / ".local-coder" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("models:\n  m: {model_id: x, api_key: sk-plain}\n")
+
+    result = CliRunner().invoke(cli, ["--project", str(tmp_path), "config"])
+
+    assert result.exit_code != 0
+    assert "plaintext key" in result.output

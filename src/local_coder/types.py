@@ -121,6 +121,11 @@ class ModelConfig(BaseModel):
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
+    # Resolved from the environment at load time (config files name the
+    # variable via api_key_env, never the key itself). Kept out of repr and
+    # model_dump so it never lands in logs, session files or `config` output.
+    api_key: str | None = Field(default=None, repr=False, exclude=True)
+    api_key_env: str | None = None
 
 
 # === Agent Protocol ===
@@ -303,6 +308,31 @@ class AgenticConfig(BaseModel):
     session_cache: bool = False
 
 
+class RoutingConfig(BaseModel):
+    """Multi-model routing beyond the per-role map in AgenticConfig.role_models.
+
+    escalate_to: model a step is rerun on after it fails (a failed plan task,
+    or the second and later debugger attempts in the fix loop).
+    fallbacks: model name -> ordered alternatives to use when that model's
+    server is unreachable.
+    """
+    escalate_to: str | None = None
+    fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ToolSettings(BaseModel):
+    """Tool settings from the config file's `tools:` section.
+
+    Tool names are kept as plain strings so a config written for a newer
+    tool set still loads; names this build doesn't know are ignored.
+    """
+    disabled: list[str] = Field(default_factory=list)
+    command_timeout: int | None = None
+    # role -> the complete list of tools that role may use (replaces the
+    # built-in default for that role).
+    roles: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class ProjectConfig(BaseModel):
     """Top-level project configuration."""
     models: dict[str, ModelConfig] = Field(default_factory=dict)
@@ -311,6 +341,10 @@ class ProjectConfig(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     agentic: AgenticConfig = Field(default_factory=AgenticConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    tools: ToolSettings = Field(default_factory=ToolSettings)
+    # Config files that were merged to build this config, lowest priority first.
+    sources: list[str] = Field(default_factory=list)
     project_root: str = "."
     log_level: str = "INFO"
     log_dir: str = ".local-coder/logs"

@@ -22,6 +22,15 @@ models:
         context_length: 8192
         temperature: 0.2
         max_tokens: 4096
+        # For a hosted endpoint, name the env var holding the key (never the key):
+        # api_key_env: MY_API_KEY
+routing:
+    roles:
+        planner: coder
+        coder: coder
+    # escalate_to: strong-model   # rerun failed steps on a stronger model
+tools:
+    command_timeout: 60
 verification:
     run_tests_after_changes: true
     max_fix_iterations: 3
@@ -63,6 +72,11 @@ def _event_handler(event):
 @click.option("--config", "-c", type=click.Path(), help="Config file path")
 @click.option("--project", "-p", type=click.Path(), help="Project root directory")
 @click.option("--model", help="Use this configured model for every agent in the run")
+@click.option("--temperature", type=float, help="Override the sampling temperature of every model")
+@click.option(
+    "--set", "config_overrides", multiple=True, metavar="KEY=VALUE",
+    help="Override a config value for this run, e.g. --set models.coder.temperature=0.5 (repeatable)",
+)
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option(
     "--yolo", is_flag=True,
@@ -70,7 +84,7 @@ def _event_handler(event):
 )
 @click.version_option(version=__version__, prog_name="local-coder")
 @click.pass_context
-def cli(ctx, config, project, model, debug, yolo):
+def cli(ctx, config, project, model, temperature, config_overrides, debug, yolo):
     """Local Coding Agent - AI-powered local code assistant.
 
     Run with a request to execute it:
@@ -88,6 +102,8 @@ def cli(ctx, config, project, model, debug, yolo):
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
     ctx.obj["model"] = model
+    ctx.obj["temperature"] = temperature
+    ctx.obj["config_overrides"] = list(config_overrides)
     ctx.obj["yolo"] = yolo
     
     if ctx.invoked_subcommand is None:
@@ -174,6 +190,7 @@ def serve(ctx, host, port, token):
         RemoteControlServer(
             ctx.obj["project_root"], ctx.obj["config_path"], ctx.obj.get("model"),
             yolo=ctx.obj.get("yolo", False), token=token,
+            config_overrides=ctx.obj.get("config_overrides"), temperature=ctx.obj.get("temperature"),
         ).serve(host, port)
     except (OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -213,6 +230,55 @@ def init(ctx):
     config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
     console.print(f"Created [bold]{config_path}[/bold]")
     console.print("Edit the model_id and base_url, then run [bold]local-coder[/bold].")
+
+
+@cli.command(name="config")
+@click.pass_context
+def show_config(ctx):
+    """Show the effective config: files merged, models, routing and tool settings."""
+    from local_coder.models.router import fallback_chain
+    from local_coder.orchestrator.config_loader import user_config_path, validate_config
+    from local_coder.types import AgentRole
+
+    config = _load_config(ctx.obj)
+    console.print("[bold]Config sources[/bold] (later wins): " + (", ".join(config.sources) or "none, using defaults"))
+    console.print(f"[dim]User config location: {user_config_path()}[/dim]")
+
+    models = Table(title="Models")
+    for column in ("Name", "Backend", "Model ID", "Endpoint", "Temp", "API key"):
+        models.add_column(column)
+    for name, model in config.models.items():
+        if model.api_key_env:
+            key = f"${model.api_key_env} ({'set' if model.api_key else 'NOT SET'})"
+        else:
+            key = "-"
+        models.add_row(name, model.backend.value, model.model_id, model.base_url, str(model.temperature), key)
+    console.print(models)
+
+    routing = Table(title="Routing")
+    for column in ("Role", "Model", "If unreachable"):
+        routing.add_column(column)
+    for role in AgentRole:
+        if role == AgentRole.ORCHESTRATOR:
+            continue
+        name = _resolve_model_name(config, role)
+        fallbacks = fallback_chain(config, name)[1:] if name in config.models else []
+        routing.add_row(role.value, name, ", ".join(fallbacks) or "-")
+    console.print(routing)
+    console.print(f"[bold]Escalate failed steps to:[/bold] {config.routing.escalate_to or 'off'}")
+
+    tools = config.tools
+    console.print(
+        f"[bold]Tools:[/bold] disabled={', '.join(tools.disabled) or 'none'}; "
+        f"command_timeout={tools.command_timeout or 'default (60s)'}; "
+        f"role overrides={', '.join(tools.roles) or 'none'}"
+    )
+
+    problems = validate_config(config)
+    for problem in problems:
+        console.print(f"[yellow]Warning:[/yellow] {problem}")
+    if not problems:
+        console.print("[green]No problems found.[/green]")
 
 
 @cli.command()
@@ -390,15 +456,11 @@ def _build_coordinator(config, ctx_obj: dict):
 
 
 def _run_request(request: str, ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.sessions import SessionStore
 
     console.print(Panel(f"Running request: [bold]{request}[/bold]", title="Local Coder", border_style="cyan"))
 
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
-    if ctx_obj.get("model"):
-        from local_coder.types import AgentRole
-        config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
+    config = _load_config(ctx_obj)
 
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
@@ -417,6 +479,26 @@ def _run_request(request: str, ctx_obj: dict):
             raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
+
+
+def _load_config(ctx_obj: dict):
+    """Load the layered config and apply this invocation's flags on top
+    (--set, --temperature, then --model, which routes every role)."""
+    from local_coder.orchestrator.config_loader import ConfigError, load_config
+    from local_coder.types import AgentRole
+
+    try:
+        config = load_config(
+            ctx_obj["config_path"],
+            project_root=ctx_obj["project_root"],
+            overrides=ctx_obj.get("config_overrides") or (),
+            temperature=ctx_obj.get("temperature"),
+        )
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if ctx_obj.get("model"):
+        config.agentic.role_models = {role.value: ctx_obj["model"] for role in AgentRole}
+    return config
 
 
 def _interactive_mode(ctx_obj: dict):
@@ -479,12 +561,11 @@ Available commands:
 
 
 def _run_plan(request: str, ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.sessions import SessionStore
 
     console.print(Panel(f"Planning request: [bold]{request}[/bold]", title="Local Coder - Plan", border_style="yellow"))
 
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+    config = _load_config(ctx_obj)
 
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
@@ -503,12 +584,11 @@ def _run_plan(request: str, ctx_obj: dict):
 
 
 def _run_review(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.sessions import SessionStore
 
     console.print(Panel("Reviewing current changes", title="Local Coder - Review", border_style="white"))
 
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+    config = _load_config(ctx_obj)
 
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
@@ -526,11 +606,10 @@ def _run_review(ctx_obj: dict):
 
 
 def _run_tests(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
 
     console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
 
-    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+    config = _load_config(ctx_obj)
 
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
@@ -579,12 +658,11 @@ def _run_rollback(checkpoint_id: str, ctx_obj: dict):
 
 def _run_status(ctx_obj: dict):
     import subprocess
-    from local_coder.orchestrator.config_loader import load_config
     
     console.print(Panel("System Status", title="Local Coder", border_style="cyan"))
     
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
         console.print(f"[bold]Models Configured:[/bold] {len(config.models)}")
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
@@ -613,29 +691,25 @@ def _run_status(ctx_obj: dict):
 
 
 def _resolve_model_name(config, role) -> str:
-    """Mirror ModelManager.get_model's routing so this display is accurate."""
-    role_name = role.value
-    configured = config.agentic.role_models.get(role_name)
-    if configured and configured in config.models:
-        return configured
-    if role_name in config.models:
-        return role_name
-    if "default" in config.models:
-        return "default"
-    if config.models:
-        return next(iter(config.models))
-    return "[not configured]"
+    """Same routing ModelManager.get_model uses, so this display is accurate."""
+    from local_coder.models.router import resolve_model_name
+
+    try:
+        return resolve_model_name(config, role)
+    except ValueError as exc:
+        return f"[invalid: {exc}]"
+    except RuntimeError:
+        return "[not configured]"
 
 
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
         CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, TesterAgent,
     )
-    from local_coder.orchestrator.config_loader import load_config
     from local_coder.types import AgentRole
 
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
@@ -664,9 +738,8 @@ def _show_agents(ctx_obj: dict):
 
 
 def _show_models(ctx_obj: dict):
-    from local_coder.orchestrator.config_loader import load_config
     try:
-        config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+        config = _load_config(ctx_obj)
     except Exception as e:
         console.print(f"[red]Failed to load config:[/red] {e}")
         return
