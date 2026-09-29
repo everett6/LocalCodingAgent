@@ -35,7 +35,7 @@ SUMMARY_PREFIX = "Summary of earlier work (older messages were compacted to save
 # Tools whose result depends only on their arguments and current repository
 # state, so an identical later call makes an earlier result redundant.
 IDEMPOTENT_TOOLS = frozenset({
-    "read_file", "list_files", "search_files", "grep",
+    "read_file", "list_files", "search_files", "grep", "code_search",
     "git_status", "git_diff", "git_log",
 })
 
