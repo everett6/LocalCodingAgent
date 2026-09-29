@@ -270,12 +270,12 @@ class BaseAgent:
                 if tc.name == "run_tests":
                     self.state.phase = AgentPhase.VERIFYING
                     self.state.test_runs += 1
-                    self._tests_run.append(tc.arguments.get("test_path") or "project tests")
+                    self._tests_run.append(tc.arguments.get("target") or tc.arguments.get("test_path") or "project tests")
                     self._tests_passed = self._tests_passed and result.success
                     if not result.success:
                         self.state.phase = AgentPhase.REFLECTING
                     self.state.test_results.append(TestResult(
-                        test_name=tc.arguments.get("test_path") or "project tests",
+                        test_name=tc.arguments.get("target") or tc.arguments.get("test_path") or "project tests",
                         passed=result.success,
                         duration_ms=result.duration_ms or 0.0,
                         error_message=None if result.success else result.output,

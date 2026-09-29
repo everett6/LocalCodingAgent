@@ -14,7 +14,8 @@ class TesterAgent(BaseAgent):
 Your tasks may involve running existing test suites, analyzing results, or writing new tests.
 
 Guidelines:
-- Use tools to execute tests (e.g., pytest, jest, etc.).
+- Use the run_tests tool to execute tests; it detects the framework and reports each failure's file:line.
+- After a change, rerun just the affected tests with run_tests target/filter (or rerun_failed) before the full suite.
 - If writing new tests, look at existing test files to match the testing framework and patterns.
 - Focus on edge cases, mocking external dependencies, and high coverage.
 

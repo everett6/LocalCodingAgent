@@ -526,6 +526,7 @@ def _run_review(ctx_obj: dict):
 
 
 def _run_tests(ctx_obj: dict):
+    from rich.text import Text
     from local_coder.orchestrator.config_loader import load_config
 
     console.print(Panel("Running tests", title="Local Coder - Test", border_style="magenta"))
@@ -535,8 +536,9 @@ def _run_tests(ctx_obj: dict):
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
         try:
-            result = await coordinator.run("Run project tests and report results")
-            console.print(Panel(Markdown(result), title="Test Results", border_style="magenta"))
+            result = await coordinator.run_tests_only()
+            # Plain text: the report's line layout matters and it may contain [brackets].
+            console.print(Panel(Text(result), title="Test Results", border_style="magenta"))
         except Exception as e:
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
