@@ -23,7 +23,7 @@ class RunCommandTool(Tool):
         "properties": {
             "command": {"type": "string", "description": "Command to run"},
             "working_dir": {"type": "string", "description": "Optional working dir"},
-            "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)"}
+            "timeout": {"type": "integer", "description": "Timeout in seconds (optional)"}
         },
         "required": ["command"]
     }
@@ -38,9 +38,14 @@ class RunCommandTool(Tool):
         self.policy = CommandPolicy()
         self.approval = approval or ApprovalConfig()
         self.approval_callback = approval_callback
+        # Used when the model doesn't pass a timeout; set from the config's
+        # tools.command_timeout by ToolRegistry.apply_settings.
+        self.default_timeout = 60
 
-    async def execute(self, command: str, working_dir: str | None = None, timeout: int = 60, **kwargs: Any) -> ToolResult:
+    async def execute(self, command: str, working_dir: str | None = None, timeout: int | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
+        if timeout is None:
+            timeout = self.default_timeout
         try:
             risk = self.policy.classify(command)
             if risk == CommandRisk.BLOCK:

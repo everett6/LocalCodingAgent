@@ -36,10 +36,15 @@ class RemoteControlServer:
         model_name: str | None = None,
         yolo: bool = False,
         token: str | None = None,
+        config_overrides: list[str] | None = None,
+        temperature: float | None = None,
     ):
         self.project_root = project_root
         self.config_path = config_path
         self.model_name = model_name
+        # --set / --temperature from the command line that started the server.
+        self.config_overrides = list(config_overrides or [])
+        self.temperature = temperature
         # The HTTP server has no terminal to prompt with, so there is never
         # an interactive approval callback here -- ASK-risk actions are
         # denied unless the operator explicitly opted into --yolo when
@@ -64,7 +69,10 @@ class RemoteControlServer:
             self.events.append(payload)
 
     def _coordinator(self) -> Coordinator:
-        config = load_config(self.config_path, project_root=self.project_root)
+        config = load_config(
+            self.config_path, project_root=self.project_root,
+            overrides=self.config_overrides, temperature=self.temperature,
+        )
         if self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
         if self.yolo:
