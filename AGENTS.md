@@ -33,6 +33,12 @@ or target external hosts or networks.
   when installed. Reports `path:line` findings.
 - `local-coder security` (agent role `security`) — blue-team review: find vulnerabilities in
   this project's code and propose fixes. Read-only.
+- `record_finding` — write a finding (file:line, exploit path, fix, 1-10 confidence, status) to
+  the review ledger. Record findings as soon as there is evidence: the ledger survives context
+  compaction and the conversation may not. It writes only `.local-coder/security/ledger.json`.
+- `SECURITY_LESSONS.md` — reviewed lessons from earlier reviews (false positives to suppress,
+  confirmed findings, project patterns). Apply them; never re-report a suppressed finding. Only a
+  person edits this file; the review proposes additions for `local-coder security-lessons`.
 - `local-coder validate-finding` (agent role `exploit_validator`) — red-team companion: take a
   vulnerability the security review already found in this project's own code and write a
   proof-of-concept reproduction, run as a local test, so the fix can be verified. It operates

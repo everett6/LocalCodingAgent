@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import json
+from pathlib import Path
 from typing import Callable
 
 from local_coder.approval import ApprovalCallback
@@ -16,6 +17,10 @@ from local_coder.models.manager import ModelManager
 from local_coder.memory.store import MemoryStore
 from local_coder.context.repository import RepositoryContext
 from local_coder.scheduler.dag import TaskDAG
+from local_coder.security.batching import collect_files, plan_batches, total_chars
+from local_coder.security.ledger import FindingsLedger, render_ledger_report
+from local_coder.security.lessons import LessonStore
+from local_coder.security.triage import LAST_SCAN_FILE, promote_last_scan
 from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
@@ -478,25 +483,93 @@ class Coordinator:
             follow_up_required=False
         ))
     
-    async def security_review(self, paths: list[str] | None = None, focus: str | None = None) -> str:
-        """Run a read-only red/blue team security review of the local project."""
-        agent = create_agent(
-            AgentRole.SECURITY, await self.model_manager.get_model(AgentRole.SECURITY), self.tool_registry, self._dispatch
+    async def security_review(
+        self, paths: list[str] | None = None, focus: str | None = None, batch_chars: int | None = None,
+    ) -> str:
+        """Run a read-only red/blue team security review of the local project.
+
+        The review learns across runs without changing its own code: it loads
+        the maintainers' SECURITY_LESSONS.md, records findings in a ledger
+        that survives compaction, and ends by proposing lessons (false
+        positives to suppress, confirmed findings, patterns) that a person
+        accepts with `local-coder security-lessons`. A scope larger than
+        batch_chars of source is reviewed in batches, each in a fresh
+        conversation seeded with the ledger so far.
+        """
+        root = Path(self.project_root)
+        lessons = LessonStore(root)
+        ledger = FindingsLedger.for_project(root)
+        ledger.reset()
+        (root / LAST_SCAN_FILE).unlink(missing_ok=True)
+        context = TaskContext(
+            guidelines=await self.repo_context.get_agent_guidelines(),
+            security_lessons=lessons.render_for_prompt(),
         )
-        objective = "Perform a security review of this project: find exploitable vulnerabilities and propose fixes."
-        if focus:
-            objective += f" Focus: {focus}"
-        task = AgentTask(
-            role=AgentRole.SECURITY,
-            objective=objective,
-            files=paths or [],
-            constraints=[
-                "Read-only: do not modify files.",
-                "Analyze only the local workspace; do not contact external hosts.",
-            ],
+
+        batch_chars = batch_chars or max(self.config.agentic.context_window_chars * 2, 20000)
+        files = collect_files(root, paths)
+        batches = plan_batches(root, files, batch_chars) if total_chars(root, files) > batch_chars else []
+        focus_note = f" Focus: {focus}" if focus else ""
+        constraints = [
+            "Read-only: do not modify project files (record_finding writes only the review ledger).",
+            "Analyze only the local workspace; do not contact external hosts.",
+        ]
+
+        if len(batches) <= 1:
+            response = await (await self._security_agent()).execute(AgentTask(
+                role=AgentRole.SECURITY,
+                objective="Perform a security review of this project: find exploitable vulnerabilities and propose fixes." + focus_note,
+                files=paths or [],
+                constraints=constraints,
+                context=context,
+            ))
+            report = response.summary
+        else:
+            notes = []
+            for number, batch in enumerate(batches, start=1):
+                self._emit("ORCHESTRATOR", "phase", f"Security review batch {number}/{len(batches)} ({len(batch)} files)")
+                ledger.load()
+                batch_context = context.model_copy(update={
+                    "previous_findings": [e.render(120) for e in sorted(ledger.entries, key=lambda e: e.sort_key())][:40],
+                })
+                response = await (await self._security_agent()).execute(AgentTask(
+                    role=AgentRole.SECURITY,
+                    objective=(
+                        f"Security review, batch {number} of {len(batches)}: review the files listed below for "
+                        "exploitable vulnerabilities, following data flow into other files only as far as needed. "
+                        "Record every finding with record_finding. Earlier batches' findings are listed under "
+                        "Previous Findings; update them if this batch changes the picture, don't re-report them."
+                        + focus_note
+                    ),
+                    files=batch,
+                    constraints=constraints,
+                    context=batch_context,
+                ))
+                notes.append(response.summary)
+            ledger.load()
+            report = render_ledger_report(ledger, len(batches), len(files), notes)
+
+        ledger.load()
+        proposed = lessons.propose(ledger.proposed_lessons())
+        promote_last_scan(root)
+        if proposed:
+            report += (
+                f"\n\n## Proposed lessons ({len(proposed)})\n"
+                + "\n".join(f"- `{lesson.id}` {lesson.kind}: {lesson.render()[2:]}" for lesson in proposed)
+                + "\n\nReview them with `local-coder security-lessons`; accepted lessons go into "
+                "SECURITY_LESSONS.md and shape every later review."
+            )
+        return report
+
+    async def _security_agent(self):
+        return create_agent(
+            AgentRole.SECURITY,
+            await self.model_manager.get_model(AgentRole.SECURITY),
+            self.tool_registry,
+            self._dispatch,
+            context_window_chars=self.config.agentic.context_window_chars,
+            compact_context_chars=self.config.agentic.compact_context_chars,
         )
-        response = await agent.execute(task)
-        return response.summary
 
     async def validate_finding(self, finding: str, paths: list[str] | None = None) -> str:
         """Red-team companion to the reviewer: reproduce an already-identified
@@ -530,7 +603,20 @@ class Coordinator:
             ],
         )
         response = await agent.execute(task)
-        return response.summary
+        report = response.summary
+        # A reproduced finding is worth remembering; queue it for review.
+        confirmed = [
+            lesson for lesson in FindingsLedger.for_project(self.project_root).proposed_lessons()
+            if lesson.kind == "confirmed"
+        ]
+        proposed = LessonStore(self.project_root).propose(confirmed)
+        if proposed:
+            report += (
+                "\n\n## Proposed lessons\n"
+                + "\n".join(f"- `{lesson.id}` {lesson.render()[2:]}" for lesson in proposed)
+                + "\n\nAccept with `local-coder security-lessons accept`."
+            )
+        return report
 
     async def run_tests_only(self) -> str:
         """Just run tests and report."""

@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
+from rich.markup import escape
 from local_coder import __version__
 
 console = Console()
@@ -84,6 +85,7 @@ def cli(ctx, config, project, model, debug, yolo):
         local-coder plan "Refactor auth"
         local-coder review
         local-coder security
+        local-coder security-lessons
         local-coder validate-finding "SQL injection in ..."
         local-coder test
     """
@@ -132,10 +134,59 @@ def review(ctx):
 @cli.command()
 @click.argument("paths", nargs=-1)
 @click.option("--focus", help="What to concentrate on, e.g. 'auth' or 'injection in the API handlers'")
+@click.option("--batch-chars", type=int, default=None,
+              help="Review scopes larger than this many characters of source in batches (default: twice the context window)")
 @click.pass_context
-def security(ctx, paths, focus):
-    """Red/blue team security review of the project (read-only)."""
-    _run_security(ctx.obj, list(paths), focus)
+def security(ctx, paths, focus, batch_chars):
+    """Red/blue team security review of the project (read-only).
+
+    Loads SECURITY_LESSONS.md, records findings in a ledger that survives
+    context compaction, and ends by proposing new lessons for you to review
+    with `local-coder security-lessons`.
+    """
+    _run_security(ctx.obj, list(paths), focus, batch_chars)
+
+
+@cli.group(name="security-lessons", invoke_without_command=True)
+@click.pass_context
+def security_lessons(ctx):
+    """Review what the security review learned (SECURITY_LESSONS.md).
+
+    With no subcommand, lists accepted lessons and pending proposals.
+    """
+    if ctx.invoked_subcommand is None:
+        _show_security_lessons(ctx.obj["project_root"])
+
+
+@security_lessons.command(name="accept")
+@click.argument("ids", nargs=-1)
+@click.option("--all", "accept_all", is_flag=True, help="Accept every pending proposal")
+@click.pass_context
+def security_lessons_accept(ctx, ids, accept_all):
+    """Move proposed lessons into SECURITY_LESSONS.md."""
+    _decide_security_lessons(ctx.obj["project_root"], ids, accept_all, accept=True)
+
+
+@security_lessons.command(name="reject")
+@click.argument("ids", nargs=-1)
+@click.option("--all", "reject_all", is_flag=True, help="Reject every pending proposal")
+@click.pass_context
+def security_lessons_reject(ctx, ids, reject_all):
+    """Discard proposed lessons."""
+    _decide_security_lessons(ctx.obj["project_root"], ids, reject_all, accept=False)
+
+
+@security_lessons.command(name="suppress")
+@click.argument("rule")
+@click.argument("path_glob")
+@click.option("--reason", required=True, help="Why this is a false positive")
+@click.pass_context
+def security_lessons_suppress(ctx, rule, path_glob, reason):
+    """Mark RULE findings under PATH_GLOB as a known false positive."""
+    from local_coder.security.lessons import Lesson, LessonStore
+
+    added = LessonStore(ctx.obj["project_root"]).add(Lesson("suppress", reason, rule, path_glob))
+    console.print("[green]Added to SECURITY_LESSONS.md[/green]" if added else "[yellow]Already in SECURITY_LESSONS.md[/yellow]")
 
 
 @cli.command(name="validate-finding")
@@ -471,7 +522,7 @@ def _interactive_mode(ctx_obj: dict):
                     _run_review(ctx_obj)
                 elif cmd == "/security":
                     focus = user_input[len("/security"):].strip() or None
-                    _run_security(ctx_obj, [], focus)
+                    _run_security(ctx_obj, [], focus, None)
                 elif cmd == "/validate-finding":
                     _run_validate_finding(ctx_obj, user_input[len("/validate-finding"):].strip(), [])
                 elif cmd == "/test":
@@ -559,7 +610,7 @@ def _run_review(ctx_obj: dict):
     asyncio.run(_run())
 
 
-def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
+def _run_security(ctx_obj: dict, paths: list[str], focus: str | None, batch_chars: int | None = None):
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.orchestrator.sessions import SessionStore
 
@@ -571,7 +622,7 @@ def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
     async def _run():
         coordinator = _build_coordinator(config, ctx_obj)
         try:
-            result = await coordinator.security_review(paths, focus)
+            result = await coordinator.security_review(paths, focus, batch_chars)
             SessionStore(ctx_obj["project_root"]).save(
                 f"local-{uuid.uuid4().hex[:8]}", request=f"Security review: {focus or scope}", phase="security", result=result
             )
@@ -581,6 +632,48 @@ def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
             raise click.ClickException(str(e)) from e
 
     asyncio.run(_run())
+
+
+def _show_security_lessons(project_root: str):
+    from local_coder.security.lessons import LESSONS_FILE, LessonStore
+
+    store = LessonStore(project_root)
+    accepted, pending = store.load(), store.pending()
+    if accepted:
+        table = Table(title=LESSONS_FILE)
+        table.add_column("Kind")
+        table.add_column("Lesson")
+        for lesson in accepted:
+            table.add_row(lesson.kind, escape(lesson.render()[2:]))
+        console.print(table)
+    else:
+        console.print(f"[dim]No {LESSONS_FILE} yet.[/dim]")
+    if pending:
+        table = Table(title="Proposed lessons (pending review)")
+        table.add_column("Id", style="cyan")
+        table.add_column("Kind")
+        table.add_column("Lesson")
+        for lesson in pending:
+            table.add_row(lesson.id, lesson.kind, escape(lesson.render()[2:]))
+        console.print(table)
+        console.print("Accept with [bold]local-coder security-lessons accept ID...[/bold] (or --all), reject with [bold]reject[/bold].")
+    else:
+        console.print("[dim]No proposals waiting.[/dim]")
+
+
+def _decide_security_lessons(project_root: str, ids: tuple[str, ...], everything: bool, accept: bool):
+    from local_coder.security.lessons import LESSONS_FILE, LessonStore
+
+    if not ids and not everything:
+        raise click.UsageError("Pass proposal ids, or --all.")
+    store = LessonStore(project_root)
+    chosen = (store.accept if accept else store.reject)(None if everything else list(ids))
+    missing = set(ids) - {lesson.id for lesson in chosen}
+    verb = f"Accepted into {LESSONS_FILE}" if accept else "Rejected"
+    for lesson in chosen:
+        console.print(f"{verb}: {escape(lesson.render()[2:])}")
+    if missing:
+        console.print(f"[yellow]No pending proposal with id: {', '.join(sorted(missing))}[/yellow]")
 
 
 def _run_validate_finding(ctx_obj: dict, finding: str, paths: list[str]):

@@ -14,6 +14,8 @@ from local_coder.context.compression import compress_messages
 
 logger = logging.getLogger(__name__)
 
+PINNED_PREFIX = "Pinned notes (kept verbatim through context compaction):\n"
+
 
 class BaseAgent:
     """Base agent with model interaction and tool-calling loop."""
@@ -138,6 +140,7 @@ class BaseAgent:
         for iteration in range(self.max_iterations):
             if sum(len(message.content) for message in messages) > self.context_window_chars:
                 messages = compress_messages(messages, self.compact_context_chars)
+                messages = self._repin(messages)
                 self.state.messages = list(messages)
             self.state.iteration = iteration + 1
             self._emit_event(
@@ -367,6 +370,24 @@ class BaseAgent:
             issues=["Exceeded maximum tool-calling iterations"],
         )
     
+    def _pinned_context(self) -> str:
+        """Notes that must survive context compaction word for word. Empty
+        by default; a role that keeps structured state outside the
+        conversation (the security reviewer's findings ledger) overrides it."""
+        return ""
+
+    def _repin(self, messages: list[Message]) -> list[Message]:
+        """After compaction, put the current pinned notes back right after
+        the task preamble, replacing any older copy, so a lossy summary can't
+        drop them."""
+        pinned = self._pinned_context()
+        messages = [m for m in messages if not m.content.startswith(PINNED_PREFIX)]
+        if not pinned:
+            return messages
+        head_end = next((i for i, m in enumerate(messages) if m.role in {"assistant", "tool"}), len(messages))
+        note = Message(role="user", content=PINNED_PREFIX + pinned)
+        return messages[:head_end] + [note] + messages[head_end:]
+
     def _build_messages(self, task: AgentTask) -> list[Message]:
         """Build the initial message list for a task."""
         messages = [Message(role="system", content=self.system_prompt)]

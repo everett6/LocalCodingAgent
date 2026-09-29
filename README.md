@@ -200,7 +200,55 @@ reviewer roles) combines:
   never fetched and metrics are off, so scanning stays offline.
 
 Everything is scoped to the local workspace: the security role cannot edit
-files, run shell commands, or contact other hosts.
+project files, run shell commands, or contact other hosts.
+
+### How the review learns (SECURITY_LESSONS.md)
+
+Each review gets better at *this* project without the agent changing its own
+code. `SECURITY_LESSONS.md`, a markdown file you commit like `AGENTS.md`,
+holds what earlier reviews established:
+
+```markdown
+## Suppress
+- secrets/hardcoded-credential | tests/** | Fixtures use fake credentials.
+
+## Confirmed
+- B602 | src/jobs.py | shell=True with the job name from the request.
+
+## Patterns
+- Every HTTP handler must call auth.require_user; one that does not is a finding.
+```
+
+Every review loads it. `security_scan` drops findings a `Suppress` entry
+covers, merges the same `path:line` reported by several scanners, and marks
+findings `[new]` when the previous completed review did not see them
+(fingerprints use the flagged line's text, so moving code does not make an
+old finding look new).
+
+The agent never edits the file. While it works it records findings with
+`record_finding` (file:line, exploit path, fix, a 1-10 confidence; findings
+under 8 stay out of the report). At the end, disproved scanner hits,
+confirmed findings (including ones `validate-finding` reproduced) and
+reusable patterns become *proposals* that you review:
+
+```bash
+local-coder security-lessons                  # accepted lessons + pending proposals
+local-coder security-lessons accept 3f9a1c    # or --all
+local-coder security-lessons reject 77b2e0
+local-coder security-lessons suppress B101 "tests/**" --reason "asserts in tests"
+```
+
+### Long reviews and context compaction
+
+Recorded findings live in `.local-coder/security/ledger.json`, outside the
+conversation. When the conversation is compacted, the ledger is pinned back
+in word for word, so a summary cannot lose a `file:line` or an exploit path.
+A scope larger than `--batch-chars` of source (default: twice
+`agentic.context_window_chars`) is reviewed in batches, riskiest files first
+(subprocess, deserialization, SQL, request handlers). Each batch starts a
+fresh conversation seeded with the ledger so far, and the final report is
+built from the ledger. See `docs/security-review-research.md` for where these
+ideas come from.
 
 Independent tasks in a plan (no `depends_on` between them) run concurrently,
 bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
