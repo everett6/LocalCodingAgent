@@ -22,6 +22,7 @@ reuse working for the iterations in between.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -104,7 +105,11 @@ def truncate_tool_output(
     if spill_path is not None:
         try:
             spill_path.parent.mkdir(parents=True, exist_ok=True)
-            spill_path.write_text(text, encoding="utf-8")
+            # O_NOFOLLOW: the spill file sits in the user's checkout, and a
+            # symlink planted there must not redirect this write elsewhere.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(spill_path, flags, 0o600), "w", encoding="utf-8") as f:
+                f.write(text)
             notice += (
                 f"; full output saved to {spill_display or spill_path} -- use read_file with "
                 "start_line/end_line, or grep, to see the omitted part"

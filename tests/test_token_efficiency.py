@@ -300,3 +300,47 @@ def test_tool_call_arguments_are_sent_as_json():
     encoded = Backend(config)._build_messages([message])[0]["tool_calls"][0]["function"]["arguments"]
     assert json.loads(encoded) == {"path": "a.py"}
     assert OllamaBackend(config)._build_messages([message])[0]["tool_calls"][0]["function"]["arguments"] == {"path": "a.py"}
+
+
+def test_spill_is_gitignored_and_never_follows_symlinks(tmp_path):
+    registry = create_tool_registry(str(tmp_path))
+    agent = LoopAgent(ScriptedModel([]), registry, max_tool_output_chars=1000)
+    big = "\n".join(str(i) for i in range(5000))
+
+    agent._fit_tool_output(call("abc", "run_tests"), big)
+    assert (tmp_path / ".local-coder" / ".gitignore").read_text().strip().endswith("*")
+
+    # A repo that plants a symlink where the spill file goes must not get
+    # the write redirected outside the workspace.
+    victim = tmp_path.parent / f"{tmp_path.name}-victim.txt"
+    victim.write_text("original")
+    (tmp_path / ".local-coder" / "tool-output" / "run_tests-evil.txt").symlink_to(victim)
+    text = agent._fit_tool_output(call("evil", "run_tests"), big)
+    assert victim.read_text() == "original"
+    assert "full output saved" not in text
+
+    # Same for a symlinked directory.
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / ".local-coder").symlink_to(outside)
+    agent2 = LoopAgent(ScriptedModel([]), create_tool_registry(str(other)), max_tool_output_chars=1000)
+    agent2._fit_tool_output(call("x", "run_tests"), big)
+    assert list(outside.iterdir()) == []
+
+
+def test_capped_read_file_points_at_the_next_unread_line(tmp_path):
+    (tmp_path / "big.py").write_text("".join(f"line {i:04d} {'x' * 40}\n" for i in range(1, 2001)))
+    registry = create_tool_registry(str(tmp_path))
+    agent = LoopAgent(ScriptedModel([]), registry, max_tool_output_chars=2000)
+
+    page = run(registry.execute_tool(AgentRole.CODER, "read_file", {"path": "big.py", "start_line": 101})).output
+    text = agent._fit_tool_output(call("r1", "read_file", path="big.py", start_line=101), page)
+
+    assert len(text) <= 2000
+    assert text.startswith("line 0101 ")
+    shown = [line for line in text.splitlines() if line.startswith("line ")]
+    last = int(shown[-1].split()[1])
+    assert f"start_line={last + 1} " in text
+    assert not (tmp_path / ".local-coder" / "tool-output").exists()

@@ -18,6 +18,7 @@ from local_coder.context.compression import (
     summarize_history,
     truncate_tool_output,
 )
+from local_coder.statedir import state_path
 
 logger = logging.getLogger(__name__)
 
@@ -460,18 +461,50 @@ class BaseAgent:
     def _fit_tool_output(self, tool_call, output: str) -> str:
         """Cap one tool result to the per-result budget, saving the full
         text where read_file can page through it when possible."""
+        if tool_call.name == ToolName.READ_FILE.value:
+            return self._fit_read_file(tool_call, output)
         spill_path = spill_display = None
         root = self._project_root()
         if root is not None:
             safe_id = "".join(ch for ch in str(tool_call.id) if ch.isalnum() or ch in "-_") or "call"
             spill_display = f"{self.tool_output_dir}/{tool_call.name}-{safe_id}.txt"
-            spill_path = root / spill_display
+            try:
+                spill_path = state_path(root, spill_display)
+            except (OSError, ValueError) as exc:
+                logger.warning("Not saving truncated tool output: %s", exc)
+                spill_display = None
         return truncate_tool_output(
             output,
             max_chars=self.max_tool_output_chars,
             max_lines=self.max_tool_output_lines,
             spill_path=spill_path,
             spill_display=spill_display,
+        )
+
+    def _fit_read_file(self, tool_call, output: str) -> str:
+        """read_file is already paged, so spilling its output would only
+        produce another file to page through, and a head/tail cut would
+        leave its "continue at start_line=N" hint skipping the dropped
+        middle. Keep a head of whole lines and point at the next line."""
+        lines = output.splitlines(keepends=True)
+        if len(output) <= self.max_tool_output_chars and len(lines) <= self.max_tool_output_lines:
+            return output
+        try:
+            first = max(1, int(tool_call.arguments.get("start_line") or 1))
+        except (TypeError, ValueError):
+            first = 1
+        budget = self.max_tool_output_chars - 200  # room for the notice
+        page: list[str] = []
+        used = 0
+        for line in lines:
+            if page and (len(page) >= self.max_tool_output_lines or used + len(line) > budget):
+                break
+            page.append(line[:budget])
+            used += len(page[-1])
+        last = first + len(page) - 1
+        return "".join(page).rstrip("\n") + (
+            f"\n[Showing lines {first}-{last}; the rest was cut to fit the context budget. "
+            f"Call read_file with start_line={last + 1} to continue.]"
         )
 
     def _project_root(self) -> Path | None:
