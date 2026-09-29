@@ -76,6 +76,10 @@ def _iter_files(root: Path, targets: list[Path]):
             rel = path.relative_to(root)
             if any(part in EXCLUDED_DIRS for part in rel.parts) or not path.is_file():
                 continue
+            # A committed symlink can point anywhere (~/.aws/credentials); the
+            # scan must not read, or leak redacted prefixes of, files outside.
+            if not path.resolve().is_relative_to(root):
+                continue
             yield path, str(rel)
 
 
