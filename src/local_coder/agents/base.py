@@ -4,15 +4,30 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from local_coder.types import (
     AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus,
-    Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
+    Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult, ToolName,
 )
-from local_coder.context.compression import compress_messages
+from local_coder.context.compression import (
+    compress_messages,
+    message_chars,
+    prune_tool_outputs,
+    summarize_history,
+    truncate_tool_output,
+)
+from local_coder.statedir import state_path
+from local_coder.agents.tool_repair import (
+    RepairedCall, extract_text_tool_calls, repair_tool_call, schemas_by_name,
+)
+from local_coder.verification.syntax import check_syntax
+from local_coder.workspace import Workspace
 
 logger = logging.getLogger(__name__)
+
+PINNED_PREFIX = "Pinned notes (kept verbatim through context compaction):\n"
 
 
 class BaseAgent:
@@ -39,6 +54,23 @@ class BaseAgent:
     # backoff) before giving up on the whole task over one glitch.
     generation_retry_limit: int = 2
     generation_retry_backoff_seconds: float = 0.5
+    # Small-model guardrails (see tool_repair.py and verification/syntax.py):
+    # accept tool calls written as text when no native call was made, refuse
+    # to let write_file clobber an existing file the agent never read, and
+    # parse-check every file an edit touches so a syntax error surfaces in
+    # the same turn instead of in a test run several turns later.
+    parse_text_tool_calls: bool = True
+    require_read_before_overwrite: bool = True
+    check_syntax_after_edits: bool = True
+    # Context budget. A single tool result is capped to a slice of the
+    # window (the rest is saved to disk, see truncate_tool_output), and the
+    # conversation is compacted once the server reports the prompt within
+    # this fraction of its real token limit, even if the character budget
+    # still looks fine -- chars/token varies a lot between code and prose.
+    max_tool_output_lines: int = 400
+    context_token_threshold: float = 0.85
+    max_summary_tokens: int = 1024
+    tool_output_dir = ".local-coder/tool-output"
 
     def __init__(
         self,
@@ -48,6 +80,7 @@ class BaseAgent:
         context_window_chars: int = 24000,
         compact_context_chars: int = 12000,
         drafter=None,  # Optional[SpeculativeDrafter]
+        max_tool_output_chars: int | None = None,
     ):
         self.model = model
         self.tool_registry = tool_registry
@@ -64,6 +97,8 @@ class BaseAgent:
         self._repeated_failure_count: int = 0
         self._stagnation_warned: bool = False
         self.drafter = drafter
+        self.max_tool_output_chars = max_tool_output_chars or max(2000, min(16000, context_window_chars // 8))
+        self._last_prompt_tokens = 0
 
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop, optionally primed
@@ -124,6 +159,7 @@ class BaseAgent:
         self._last_failing_call_signature = None
         self._repeated_failure_count = 0
         self._stagnation_warned = False
+        self._last_prompt_tokens = 0
         self.state = AgentState(
             task_id=task.task_id,
             objective=task.objective,
@@ -136,8 +172,9 @@ class BaseAgent:
         self.state.messages = list(messages)
         
         for iteration in range(self.max_iterations):
-            if sum(len(message.content) for message in messages) > self.context_window_chars:
-                messages = compress_messages(messages, self.compact_context_chars)
+            if self._needs_compaction(messages):
+                messages = await self._compact(messages, task)
+                messages = self._repin(messages)
                 self.state.messages = list(messages)
             self.state.iteration = iteration + 1
             self._emit_event(
@@ -147,6 +184,7 @@ class BaseAgent:
             )
 
             base_temperature = self.model.config.temperature if hasattr(self.model, "config") else 0.2
+            tool_schemas = self.tool_registry.get_schemas_for_role(self.role)
             response = None
             generation_error: Exception | None = None
             for attempt in range(self.generation_retry_limit + 1):
@@ -163,7 +201,7 @@ class BaseAgent:
                         messages,
                         temperature=retry_temperature,
                         max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
-                        tools=self.tool_registry.get_schemas_for_role(self.role),
+                        tools=tool_schemas,
                     )
                     generation_error = None
                     break
@@ -197,7 +235,10 @@ class BaseAgent:
             self._metrics.prompt_tokens += response.prompt_tokens
             self._metrics.completion_tokens += response.completion_tokens
             self._metrics.latency_ms += response.latency_ms
-            
+            self._last_prompt_tokens = response.prompt_tokens + response.completion_tokens
+
+            response, repairs = self._repair_tool_calls(response, tool_schemas, task)
+
             # If no tool calls, we're done
             if not response.tool_calls:
                 self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
@@ -246,17 +287,28 @@ class BaseAgent:
                     task_id=task.task_id,
                 )
                 
-                try:
-                    result = await self.tool_registry.execute_tool(
-                        self.role, tc.name, tc.arguments
-                    )
-                except Exception as exc:
-                    result = ToolResult(
-                        tool_call_id=tc.id,
-                        success=False,
-                        output=f"Tool execution failed: {exc}",
-                    )
-                
+                repair = repairs.get(tc.id)
+                blocked = repair.error if repair is not None else None
+                if blocked is None:
+                    blocked = self._check_overwrite(tc, task)
+                if blocked is not None:
+                    result = ToolResult(tool_call_id=tc.id, success=False, output=blocked)
+                else:
+                    try:
+                        result = await self.tool_registry.execute_tool(
+                            self.role, tc.name, tc.arguments
+                        )
+                    except Exception as exc:
+                        result = ToolResult(
+                            tool_call_id=tc.id,
+                            success=False,
+                            output=f"Tool execution failed: {exc}",
+                        )
+                    if result.success and result.files_changed:
+                        self._append_syntax_errors(result, task)
+                if repair is not None and repair.notes:
+                    result.output = f"[Note: {'; '.join(repair.notes)}]\n{result.output}"
+
                 self._metrics.tool_calls += 1
                 self.state.tool_calls_used += 1
                 if tc.name in {"read_file", "search_files", "grep"}:
@@ -270,12 +322,12 @@ class BaseAgent:
                 if tc.name == "run_tests":
                     self.state.phase = AgentPhase.VERIFYING
                     self.state.test_runs += 1
-                    self._tests_run.append(tc.arguments.get("test_path") or "project tests")
+                    self._tests_run.append(tc.arguments.get("target") or tc.arguments.get("test_path") or "project tests")
                     self._tests_passed = self._tests_passed and result.success
                     if not result.success:
                         self.state.phase = AgentPhase.REFLECTING
                     self.state.test_results.append(TestResult(
-                        test_name=tc.arguments.get("test_path") or "project tests",
+                        test_name=tc.arguments.get("target") or tc.arguments.get("test_path") or "project tests",
                         passed=result.success,
                         duration_ms=result.duration_ms or 0.0,
                         error_message=None if result.success else result.output,
@@ -306,7 +358,7 @@ class BaseAgent:
 
                 messages.append(Message(
                     role="tool",
-                    content=tool_output or "Tool completed without output.",
+                    content=self._fit_tool_output(tc, tool_output or "Tool completed without output."),
                     tool_call_id=tc.id,
                     name=tc.name,
                 ))
@@ -367,6 +419,253 @@ class BaseAgent:
             issues=["Exceeded maximum tool-calling iterations"],
         )
     
+    def _pinned_context(self) -> str:
+        """Notes that must survive context compaction word for word. Empty
+        by default; a role that keeps structured state outside the
+        conversation (the security reviewer's findings ledger) overrides it."""
+        return ""
+
+    def _repin(self, messages: list[Message]) -> list[Message]:
+        """After compaction, put the current pinned notes back right after
+        the task preamble, replacing any older copy, so a lossy summary can't
+        drop them."""
+        pinned = self._pinned_context()
+        messages = [m for m in messages if not m.content.startswith(PINNED_PREFIX)]
+        if not pinned:
+            return messages
+        head_end = next((i for i, m in enumerate(messages) if m.role in {"assistant", "tool"}), len(messages))
+        note = Message(role="user", content=PINNED_PREFIX + pinned)
+        return messages[:head_end] + [note] + messages[head_end:]
+
+    def _repair_tool_calls(
+        self, response: ModelResponse, tool_schemas: list[dict], task: AgentTask
+    ) -> tuple[ModelResponse, dict[str, RepairedCall]]:
+        """Recover text-only tool calls and fix near-miss names/arguments."""
+        schemas = schemas_by_name(tool_schemas)
+        tool_calls = list(response.tool_calls)
+        if not tool_calls and self.parse_text_tool_calls and schemas:
+            tool_calls = extract_text_tool_calls(response.content, set(schemas))
+            if tool_calls:
+                self._emit_event(
+                    "tool_calls_from_text",
+                    f"Recovered {len(tool_calls)} tool call(s) written as text",
+                    task_id=task.task_id,
+                )
+        if not tool_calls:
+            return response, {}
+        repairs = {tc.id: repair_tool_call(tc, schemas) for tc in tool_calls}
+        repaired_calls = [repairs[tc.id].call for tc in tool_calls]
+        if repaired_calls != response.tool_calls:
+            response = response.model_copy(update={"tool_calls": repaired_calls})
+        return response, repairs
+
+    def _workspace(self) -> Workspace | None:
+        """The workspace this agent's file tools are rooted at, if known."""
+        get_tool = getattr(self.tool_registry, "get_tool", None)
+        if get_tool is None:
+            return None
+        for name in (ToolName.WRITE_FILE, ToolName.READ_FILE):
+            try:
+                root = getattr(get_tool(name), "project_root", None)
+            except Exception:
+                root = None
+            if root:
+                return Workspace(root)
+        return None
+
+    def _check_overwrite(self, tc, task: AgentTask) -> str | None:
+        """Refuse a write_file that would replace an existing file the agent
+        hasn't seen in this task: a small model rewriting a file from memory
+        silently drops whatever it didn't remember."""
+        if not self.require_read_before_overwrite or tc.name != ToolName.WRITE_FILE.value:
+            return None
+        path = tc.arguments.get("path")
+        workspace = self._workspace()
+        if not isinstance(path, str) or workspace is None:
+            return None
+        try:
+            target = workspace.resolve(path)
+        except (ValueError, OSError):
+            return None  # write_file reports the bad path itself
+        if not target.is_file():
+            return None
+        seen: set[Path] = set()
+        known = set(self._files_changed) | set(task.context.file_contents)
+        if self.state is not None:
+            known |= self.state.files_read
+        for candidate in known:
+            try:
+                seen.add(workspace.resolve(candidate))
+            except (ValueError, OSError):
+                continue
+        if target in seen:
+            return None
+        return (
+            f"Refusing to overwrite {path}: it already exists and you have not read it in this task. "
+            "Call read_file on it first, then make the change -- prefer a targeted edit over "
+            "rewriting the whole file."
+        )
+
+    def _append_syntax_errors(self, result: ToolResult, task: AgentTask) -> None:
+        """Add a parse error for any edited file that no longer parses."""
+        if not self.check_syntax_after_edits:
+            return
+        workspace = self._workspace()
+        if workspace is None:
+            return
+        problems = []
+        for changed in result.files_changed:
+            try:
+                problem = check_syntax(workspace.resolve(changed), display_path=changed)
+            except (ValueError, OSError):
+                continue
+            if problem:
+                problems.append(problem)
+        if not problems:
+            return
+        result.output = (
+            f"{result.output}\n\nWarning: the edit was saved but the file no longer parses:\n"
+            + "\n\n".join(problems)
+            + "\nFix this before doing anything else."
+        ).strip()
+        self._emit_event(
+            "syntax_error",
+            f"Edit left {len(problems)} file(s) unparseable",
+            task_id=task.task_id,
+        )
+    def _token_limit(self) -> int | None:
+        config = getattr(self.model, "config", None)
+        context_length = getattr(config, "context_length", None)
+        max_tokens = getattr(config, "max_tokens", None)
+        if not isinstance(context_length, int) or context_length <= 0:
+            return None
+        reserve = max_tokens if isinstance(max_tokens, int) else 0
+        return max(int(context_length * self.context_token_threshold) - reserve, context_length // 4)
+
+    def _needs_compaction(self, messages: list[Message]) -> bool:
+        if message_chars(messages) > self.context_window_chars:
+            return True
+        limit = self._token_limit()
+        return limit is not None and self._last_prompt_tokens > limit
+
+    async def _compact(self, messages: list[Message], task: AgentTask) -> list[Message]:
+        """Bring the conversation back under budget, cheapest step first:
+        clear old tool output, then have the model summarize the middle of
+        the history, then (if that fails) drop it with compress_messages."""
+        before = message_chars(messages)
+        target = self.compact_context_chars
+        limit = self._token_limit()
+        if limit is not None and self._last_prompt_tokens > limit:
+            # The server says we're out of tokens even though the character
+            # count may look fine, so aim below the current size instead.
+            target = min(target, int(before * limit / self._last_prompt_tokens * 0.7))
+        # Compaction changes the prompt, so the last reported size no longer
+        # applies; the next generate() call reports the new one.
+        self._last_prompt_tokens = 0
+
+        messages, freed = prune_tool_outputs(messages, protect_chars=target // 2)
+        if freed:
+            self._emit_event(
+                "context_pruned",
+                f"Cleared {freed} chars of old tool output",
+                task_id=task.task_id,
+            )
+        if message_chars(messages) <= target:
+            return messages
+
+        try:
+            summarized = await summarize_history(
+                self.model,
+                messages,
+                keep_recent_chars=target // 2,
+                max_input_chars=max(self.context_window_chars - target // 2, 4000),
+                max_summary_tokens=self.max_summary_tokens,
+            )
+        except Exception as exc:
+            logger.warning("Context summarization failed: %s", exc)
+            summarized = None
+        if summarized is not None:
+            compacted, response = summarized
+            self._metrics.model_calls += 1
+            self._metrics.prompt_tokens += response.prompt_tokens
+            self._metrics.completion_tokens += response.completion_tokens
+            self._metrics.latency_ms += response.latency_ms
+            if message_chars(compacted) <= target:
+                self._emit_event(
+                    "context_summarized",
+                    f"Summarized earlier history ({before} -> {message_chars(compacted)} chars)",
+                    task_id=task.task_id,
+                )
+                return compacted
+            messages = compacted
+
+        self._emit_event("context_compacted", "Dropped earlier history to fit the context budget", task_id=task.task_id)
+        return compress_messages(messages, target)
+
+    def _fit_tool_output(self, tool_call, output: str) -> str:
+        """Cap one tool result to the per-result budget, saving the full
+        text where read_file can page through it when possible."""
+        if tool_call.name == ToolName.READ_FILE.value:
+            return self._fit_read_file(tool_call, output)
+        spill_path = spill_display = None
+        root = self._project_root()
+        if root is not None:
+            safe_id = "".join(ch for ch in str(tool_call.id) if ch.isalnum() or ch in "-_") or "call"
+            spill_display = f"{self.tool_output_dir}/{tool_call.name}-{safe_id}.txt"
+            try:
+                spill_path = state_path(root, spill_display)
+            except (OSError, ValueError) as exc:
+                logger.warning("Not saving truncated tool output: %s", exc)
+                spill_display = None
+        return truncate_tool_output(
+            output,
+            max_chars=self.max_tool_output_chars,
+            max_lines=self.max_tool_output_lines,
+            spill_path=spill_path,
+            spill_display=spill_display,
+        )
+
+    def _fit_read_file(self, tool_call, output: str) -> str:
+        """read_file is already paged, so spilling its output would only
+        produce another file to page through, and a head/tail cut would
+        leave its "continue at start_line=N" hint skipping the dropped
+        middle. Keep a head of whole lines and point at the next line."""
+        lines = output.splitlines(keepends=True)
+        if len(output) <= self.max_tool_output_chars and len(lines) <= self.max_tool_output_lines:
+            return output
+        try:
+            first = max(1, int(tool_call.arguments.get("start_line") or 1))
+        except (TypeError, ValueError):
+            first = 1
+        budget = self.max_tool_output_chars - 200  # room for the notice
+        page: list[str] = []
+        used = 0
+        for line in lines:
+            if page and (len(page) >= self.max_tool_output_lines or used + len(line) > budget):
+                break
+            page.append(line[:budget])
+            used += len(page[-1])
+        last = first + len(page) - 1
+        return "".join(page).rstrip("\n") + (
+            f"\n[Showing lines {first}-{last}; the rest was cut to fit the context budget. "
+            f"Call read_file with start_line={last + 1} to continue.]"
+        )
+
+    def _project_root(self) -> Path | None:
+        """The workspace read_file is rooted at, or None if this agent can't
+        use read_file -- a saved output it can't read back is useless."""
+        get_tool = getattr(self.tool_registry, "get_tool", None)
+        has_permission = getattr(self.tool_registry, "has_permission", None)
+        if get_tool is None or has_permission is None:
+            return None
+        try:
+            if not has_permission(self.role, ToolName.READ_FILE):
+                return None
+            root = getattr(get_tool(ToolName.READ_FILE), "project_root", None)
+        except Exception:
+            return None
+        return Path(root) if isinstance(root, str) else None
+
     def _build_messages(self, task: AgentTask) -> list[Message]:
         """Build the initial message list for a task."""
         messages = [Message(role="system", content=self.system_prompt)]
@@ -380,7 +679,10 @@ class BaseAgent:
     def _format_task(self, task: AgentTask) -> str:
         """Format a task into a user message. Override in subclasses for custom formatting."""
         parts = [f"## Objective\n{task.objective}"]
-        
+
+        if task.context.guidelines:
+            parts.append("## Project Guidelines (AGENTS.md)\n" + task.context.guidelines)
+
         if task.files:
             parts.append("## Relevant Files\n" + "\n".join(f"- {f}" for f in task.files))
         
@@ -390,6 +692,9 @@ class BaseAgent:
         if task.success_criteria:
             parts.append("## Success Criteria\n" + "\n".join(f"- {s}" for s in task.success_criteria))
         
+        if task.context.architecture:
+            parts.append(f"## Repository Map\n{task.context.architecture}")
+
         if task.context.file_contents:
             parts.append("## File Contents")
             for path, content in task.context.file_contents.items():

@@ -7,7 +7,7 @@ from typing import AsyncIterator
 import httpx
 
 from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
-from local_coder.models.base import BaseModelBackend
+from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 
 
 class OpenAICompatibleBackend(BaseModelBackend):
@@ -78,12 +78,8 @@ class OpenAICompatibleBackend(BaseModelBackend):
         if "tool_calls" in msg_data and msg_data["tool_calls"]:
             for tc in msg_data["tool_calls"]:
                 func = tc.get("function", {})
-                args_str = func.get("arguments", "{}")
-                try:
-                    args = json.loads(args_str)
-                except json.JSONDecodeError:
-                    args = {}
-                    
+                args = decode_tool_arguments(func.get("arguments", "{}"))
+
                 parsed_tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
                     name=func.get("name", ""),
