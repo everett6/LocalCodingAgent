@@ -187,7 +187,12 @@ class PromptSession:
             return
         try:
             self.history_file.parent.mkdir(parents=True, exist_ok=True)
+            # The history can hold anything typed at the prompt, so keep it
+            # private and never write it through a symlink the repo planted.
+            if self.history_file.is_symlink() or self.history_file.parent.is_symlink():
+                return
             _readline.write_history_file(str(self.history_file))
+            os.chmod(self.history_file, 0o600)
         except Exception:
             pass  # read-only checkout, permissions, etc. -- history is optional.
 

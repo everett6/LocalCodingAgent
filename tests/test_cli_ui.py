@@ -296,3 +296,30 @@ def test_interactive_request_error_does_not_kill_repl(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert calls == ["first", "cancel me", "third"]
     assert "Request cancelled" in result.output
+
+
+def _fake_readline(monkeypatch):
+    def write(path):
+        with open(path, "w") as f:
+            f.write("typed secret\n")
+    monkeypatch.setattr(ui, "_readline", type("R", (), {"write_history_file": staticmethod(write)}))
+
+
+def test_saved_history_is_private(tmp_path, monkeypatch):
+    _fake_readline(monkeypatch)
+    session = ui.PromptSession(Console(), tmp_path, input_func=lambda p: "")
+    session.readline_enabled = True
+    session.save_history()
+    assert (ui.history_path(tmp_path).stat().st_mode & 0o777) == 0o600
+
+
+def test_history_is_not_written_through_a_symlink(tmp_path, monkeypatch):
+    _fake_readline(monkeypatch)
+    victim = tmp_path / "victim"
+    victim.write_text("original")
+    (tmp_path / ".local-coder").mkdir()
+    ui.history_path(tmp_path).symlink_to(victim)
+    session = ui.PromptSession(Console(), tmp_path, input_func=lambda p: "")
+    session.readline_enabled = True
+    session.save_history()
+    assert victim.read_text() == "original"
