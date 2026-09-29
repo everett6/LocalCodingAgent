@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
@@ -40,12 +41,17 @@ class SlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/plan", "Create a plan without executing", args="<request>"),
     SlashCommand("/review", "Review current uncommitted changes"),
+    SlashCommand("/security", "Red/blue team security review (read-only)", args="[focus]"),
+    SlashCommand("/validate-finding", "Reproduce an identified finding as a local PoC test", args="<finding>"),
     SlashCommand("/test", "Run tests and report results"),
     SlashCommand("/status", "Show system status"),
     SlashCommand("/checkpoint", "Save the current working tree"),
     SlashCommand("/checkpoints", "List saved checkpoints"),
     SlashCommand("/rollback", "Restore a checkpoint", args="<id>"),
     SlashCommand("/hooks", "Show configured hooks and whether they are trusted"),
+    SlashCommand("/sessions", "List saved sessions"),
+    SlashCommand("/resume", "Pick up a session's unfinished request", args="[id]"),
+    SlashCommand("/new", "Start a new session for the next request"),
     SlashCommand("/help", "Show this help message"),
     SlashCommand("/quit", "Exit interactive mode", aliases=("/exit", "/q")),
 )
@@ -122,7 +128,8 @@ def build_help_table(commands: tuple[SlashCommand, ...] | None = None) -> Table:
         usage = f"{c.name} {c.args}".rstrip()
         if c.aliases:
             usage += ", " + ", ".join(c.aliases)
-        table.add_row(usage, c.help)
+        # escape: "[focus]" would otherwise be parsed as rich markup and vanish.
+        table.add_row(escape(usage), c.help)
     table.add_row("[dim]<anything else>[/dim]", "[dim]Run it as a coding request[/dim]")
     return table
 
@@ -218,7 +225,12 @@ class PromptSession:
             return
         try:
             self.history_file.parent.mkdir(parents=True, exist_ok=True)
+            # The history can hold anything typed at the prompt, so keep it
+            # private and never write it through a symlink the repo planted.
+            if self.history_file.is_symlink() or self.history_file.parent.is_symlink():
+                return
             _readline.write_history_file(str(self.history_file))
+            os.chmod(self.history_file, 0o600)
         except Exception:
             pass  # read-only checkout, permissions, etc. -- history is optional.
 
@@ -320,6 +332,8 @@ ROLE_STYLES = {
     "debugger": "red",
     "tester": "magenta",
     "reviewer": "white",
+    "security": "bright_red",
+    "exploit_validator": "red",
 }
 ROLE_LABELS = {
     "orchestrator": "orch",
@@ -329,6 +343,8 @@ ROLE_LABELS = {
     "debugger": "debug",
     "tester": "test",
     "reviewer": "review",
+    "security": "sec",
+    "exploit_validator": "poc",
 }
 _LABEL_WIDTH = max(len(v) for v in ROLE_LABELS.values())
 
