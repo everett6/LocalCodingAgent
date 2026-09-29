@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
 from local_coder import __version__
+from local_coder.cli import ui
 
 console = Console()
 
@@ -44,19 +45,8 @@ def _get_project_root() -> str:
 
 
 def _event_handler(event):
-    """Handle agent events for display."""
-    timestamp = event.timestamp.strftime("%H:%M:%S")
-    source_colors = {
-        "ORCHESTRATOR": "bold cyan",
-        "EXPLORER": "bold green",
-        "PLANNER": "bold yellow",
-        "CODER": "bold blue",
-        "DEBUGGER": "bold red",
-        "TESTER": "bold magenta",
-        "REVIEWER": "bold white",
-    }
-    color = source_colors.get(event.source, "white")
-    console.print(f"[dim]{timestamp}[/dim] [{color}][{event.source}][/{color}] {event.message}")
+    """Handle agent events for display (routed to the live progress view)."""
+    ui.render_event(console, event)
 
 
 class _RequestGroup(click.Group):
@@ -102,6 +92,8 @@ def cli(ctx, config, project, model, debug, resume, session_id, yolo):
     \b
         local-coder plan "Refactor auth"
         local-coder review
+        local-coder security
+        local-coder validate-finding "SQL injection in ..."
         local-coder test
 
     Every run is saved as a session, so an interrupted or failed run can
@@ -155,6 +147,29 @@ def plan(ctx, request):
 def review(ctx):
     """Review current uncommitted changes."""
     _run_review(ctx.obj)
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+@click.option("--focus", help="What to concentrate on, e.g. 'auth' or 'injection in the API handlers'")
+@click.pass_context
+def security(ctx, paths, focus):
+    """Red/blue team security review of the project (read-only)."""
+    _run_security(ctx.obj, list(paths), focus)
+
+
+@cli.command(name="validate-finding")
+@click.argument("finding", nargs=-1, required=True)
+@click.option("--path", "paths", multiple=True, help="File(s) the finding is in (repeatable)")
+@click.pass_context
+def validate_finding(ctx, finding, paths):
+    """Reproduce an already-identified security finding in this repo as a local PoC test.
+
+    Red-team companion to `security`: pass a finding it reported (with its file:line) to
+    confirm the vulnerability is real and get a test that fails once it is fixed.
+    Operates only on this project's own code.
+    """
+    _run_validate_finding(ctx.obj, " ".join(finding), list(paths))
 
 
 @cli.command()
@@ -403,8 +418,15 @@ async def _cli_approval_callback(description: str) -> bool:
     """Prompt the user in the terminal for a risky action. Runs inline in
     the same event loop as the agent -- blocking on input here is fine
     since a single interactive session has nothing else to do meanwhile."""
-    console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
-    return click.confirm("Allow this action?", default=False)
+    with ui.paused():
+        console.print(f"[bold yellow]Approval required:[/bold yellow] {description}")
+        try:
+            with ui.sigint_raises():
+                return click.confirm("Allow this action?", default=False)
+        except click.Abort:
+            # Ctrl+C at the approval prompt cancels the whole request.
+            console.print()
+            raise KeyboardInterrupt from None
 
 
 def _build_coordinator(config, ctx_obj: dict):
@@ -503,7 +525,8 @@ def _run_request(request: str | None, ctx_obj: dict):
             )
 
         try:
-            result = asyncio.run(_run())
+            with ui.progress(console, "request"):
+                result = asyncio.run(_run())
         except KeyboardInterrupt:
             session.finish_turn(turn, "interrupted", error="Interrupted")
             console.print("[yellow]Interrupted. Finished phases are saved.[/yellow]")
@@ -522,6 +545,7 @@ def _run_request(request: str | None, ctx_obj: dict):
         console.print(_resume_hint(session.session_id))
     finally:
         session.release()
+
 
 
 def _resume_or_interactive(ctx_obj: dict):
@@ -582,14 +606,18 @@ def _show_session(session_id: str, ctx_obj: dict):
 
 
 def _interactive_mode(ctx_obj: dict):
-    console.print(Panel("[bold cyan]Local Coding Agent[/bold cyan]\nType /help for commands, /quit to exit.", border_style="cyan"))
-    
+    console.print(Panel(ui.build_banner(ctx_obj, __version__), border_style="cyan", expand=False))
+    session = ui.PromptSession(console, ctx_obj["project_root"])
+
     while True:
+        user_input = session.read()
+        if user_input is None:  # Ctrl+D, or Ctrl+C twice at the prompt
+            break
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+        session.save_history()
         try:
-            user_input = console.input("[bold green]> [/bold green]").strip()
-            if not user_input:
-                continue
-                
             if user_input.startswith("/"):
                 cmd = user_input.split()[0].lower()
                 if cmd in ("/quit", "/exit", "/q"):
@@ -604,6 +632,11 @@ def _interactive_mode(ctx_obj: dict):
                         console.print("[red]Please provide a request to plan.[/red]")
                 elif cmd == "/review":
                     _run_review(ctx_obj)
+                elif cmd == "/security":
+                    focus = user_input[len("/security"):].strip() or None
+                    _run_security(ctx_obj, [], focus)
+                elif cmd == "/validate-finding":
+                    _run_validate_finding(ctx_obj, user_input[len("/validate-finding"):].strip(), [])
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
                 elif cmd == "/checkpoint":
@@ -631,30 +664,22 @@ def _interactive_mode(ctx_obj: dict):
                     except click.ClickException as exc:
                         console.print(f"[red]{exc.message}[/red]")
                 elif cmd == "/help":
-                    console.print("""
-Available commands:
-  /quit, /exit, /q : Exit the interactive mode
-  /status          : Show system status
-  /plan <request>  : Create a plan without executing
-  /review          : Review current uncommitted changes
-  /test            : Run tests and report results
-    /checkpoint      : Save the current working tree
-    /checkpoints     : List saved checkpoints
-    /rollback <id>   : Restore a checkpoint
-    /sessions        : List saved sessions
-    /resume [id]     : Pick up a session's unfinished request
-    /new             : Start a new session for the next request
-  /help            : Show this help message
-                    """)
+                    console.print(ui.build_help_table())
                 else:
-                    console.print(f"[red]Unknown command:[/red] {cmd}")
+                    console.print(ui.unknown_command_message(cmd))
             else:
                 _run_request(user_input, ctx_obj)
-                
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
+
+        except BaseException as exc:
+            if ui.is_cancellation(exc):
+                console.print("[yellow]Request cancelled.[/yellow] Back at the prompt.")
+            elif isinstance(exc, click.ClickException):
+                pass  # already reported by the command; keep the REPL alive
+            elif isinstance(exc, Exception):
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+            else:
+                raise
+    session.save_history()
 
 
 def _run_plan(request: str, ctx_obj: dict):
@@ -678,7 +703,8 @@ def _run_plan(request: str, ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "plan"):
+        asyncio.run(_run())
 
 
 def _run_review(ctx_obj: dict):
@@ -701,7 +727,61 @@ def _run_review(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "review"):
+        asyncio.run(_run())
+
+
+def _run_security(ctx_obj: dict, paths: list[str], focus: str | None):
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionStore
+
+    scope = ", ".join(paths) if paths else "whole project"
+    console.print(Panel(f"Security review: {scope}", title="Local Coder - Security", border_style="bright_red"))
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        try:
+            result = await coordinator.security_review(paths, focus)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Security review: {focus or scope}", phase="security", result=result
+            )
+            console.print(Panel(Markdown(result), title="Security Review", border_style="bright_red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "security review"):
+        asyncio.run(_run())
+
+
+def _run_validate_finding(ctx_obj: dict, finding: str, paths: list[str]):
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionStore
+
+    if not finding.strip():
+        console.print("[red]Provide the finding to validate, e.g. the file:line and what is wrong.[/red]")
+        return
+
+    console.print(Panel("Validating a security finding (local PoC)", title="Local Coder - Validate Finding", border_style="red"))
+
+    config = load_config(ctx_obj["config_path"], project_root=ctx_obj["project_root"])
+
+    async def _run():
+        coordinator = _build_coordinator(config, ctx_obj)
+        try:
+            result = await coordinator.validate_finding(finding, paths)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=f"Validate finding: {finding[:80]}", phase="validate-finding", result=result
+            )
+            console.print(Panel(Markdown(result), title="Finding Validation", border_style="red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    with ui.progress(console, "finding validation"):
+        asyncio.run(_run())
 
 
 def _run_tests(ctx_obj: dict):
@@ -720,7 +800,8 @@ def _run_tests(ctx_obj: dict):
             console.print(f"[bold red]Error:[/bold red] {str(e)}")
             raise click.ClickException(str(e)) from e
 
-    asyncio.run(_run())
+    with ui.progress(console, "tests"):
+        asyncio.run(_run())
 
 
 def _run_checkpoint(ctx_obj: dict):
@@ -808,7 +889,8 @@ def _resolve_model_name(config, role) -> str:
 
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
-        CoderAgent, DebuggerAgent, ExplorerAgent, PlannerAgent, ReviewerAgent, TesterAgent,
+        CoderAgent, DebuggerAgent, ExplorerAgent, ExploitValidatorAgent, PlannerAgent, ReviewerAgent,
+        SecurityAgent, TesterAgent,
     )
     from local_coder.orchestrator.config_loader import load_config
     from local_coder.types import AgentRole
@@ -826,6 +908,8 @@ def _show_agents(ctx_obj: dict):
         AgentRole.DEBUGGER: DebuggerAgent,
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
+        AgentRole.SECURITY: SecurityAgent,
+        AgentRole.EXPLOIT_VALIDATOR: ExploitValidatorAgent,
     }
 
     table = Table(title="Configured Agents")

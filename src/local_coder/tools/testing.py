@@ -15,7 +15,7 @@ class RunTestsTool(Tool):
         "type": "object",
         "properties": {
             "test_path": {"type": "string", "description": "Optional test path"},
-            "framework": {"type": "string", "description": "Framework (auto, pytest, jest, etc)"},
+            "framework": {"type": "string", "enum": ["auto", "pytest", "npm test", "make test"], "description": "Test runner (default auto)"},
             "verbose": {"type": "boolean", "description": "Verbose output"}
         }
     }
@@ -39,6 +39,20 @@ class RunTestsTool(Tool):
                 else:
                     framework = "pytest" # Default fallback
                     
+            if framework not in ("pytest", "npm test", "make test"):
+                # This tool needs no approval, so it must not become a way to
+                # run arbitrary commands (framework="bash -c ..."); read-only
+                # roles like the reviewer have it. run_command asks first.
+                return ToolResult(
+                    success=False,
+                    output=f"Unknown framework {framework!r}. Use auto, pytest, 'npm test' or 'make test'; "
+                           "other commands go through run_command.",
+                    duration_ms=int((time.time()-start_t)*1000),
+                )
+            if test_path and test_path.startswith("-"):
+                return ToolResult(success=False, output=f"Invalid test_path: {test_path}",
+                                  duration_ms=int((time.time()-start_t)*1000))
+
             if framework == "pytest":
                 cmd = ["pytest"]
                 if verbose:
@@ -49,10 +63,8 @@ class RunTestsTool(Tool):
                 cmd = ["npm", "test"]
                 if test_path:
                     cmd.extend(["--", test_path])
-            elif framework == "make test":
-                cmd = ["make", "test"]
             else:
-                cmd = framework.split()
+                cmd = ["make", "test"]
                 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
