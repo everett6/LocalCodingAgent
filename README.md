@@ -52,6 +52,73 @@ Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
 
+## Custom commands
+
+Save prompts you use often as Markdown files and run them as slash commands.
+Project commands live in `.local-coder/commands/`, personal ones in
+`~/.config/local-coder/commands/` (a project command wins on a name clash).
+The file name is the command: `review-auth.md` is `/review-auth`, and a
+subfolder adds a prefix, so `sec/triage.md` is `/sec:triage`.
+
+```markdown
+---
+description: Check a module for injection bugs
+argument-hint: <path>
+mode: run            # or "plan" to only produce a plan
+---
+Review $ARGUMENTS for SQL and command injection. Start with $1 and report
+each finding with its file:line.
+```
+
+`$ARGUMENTS` is everything typed after the command and `$1`..`$9` are its
+words; a template with neither gets the arguments appended. Custom commands
+appear in `/help` and Tab completion, are re-read on every use, and cannot
+replace a built-in command. Outside interactive mode run one with
+`local-coder run "/review-auth src/auth.py"`, and list them with
+`local-coder commands`. A command file is only a prompt: nothing in it is
+executed, and the request goes through the usual approval prompts.
+
+## Hooks
+
+Hooks run your own shell commands around the agent's tool calls, for
+example to format every file it edits or to veto commands you never want
+it to run. Add a `hooks:` section to the project config
+(`.local-coder/config.yaml`, `config/config.yaml`, or `--config`):
+
+```yaml
+hooks:
+  after_edit:
+    - command: ruff format "$LOCAL_CODER_FILE"
+      timeout: 30
+  after_tests: notify-send "local-coder: tests finished"
+  before_tool:
+    - tools: [run_command]
+      command: ./scripts/audit-command.sh
+```
+
+| Event | Runs around |
+| --- | --- |
+| `before_tool`, `after_tool` | every tool call (narrow with `tools:`) |
+| `before_edit`, `after_edit` | `write_file`, `edit_file`, `apply_patch` |
+| `after_tests` | `run_tests` |
+
+A hook runs in the project root with `LOCAL_CODER_EVENT`, `LOCAL_CODER_TOOL`,
+`LOCAL_CODER_FILE`, `LOCAL_CODER_SUCCESS` (after hooks) and
+`LOCAL_CODER_PROJECT_ROOT` set, and receives the call as JSON on stdin
+(`event`, `tool`, `arguments`, plus `success` and `output` for after hooks).
+If a `before_*` hook exits non-zero the call is blocked and the hook's output
+is returned to the model as the reason. A failing `after_*` hook doesn't
+change the result, but its output is appended so the model sees it. Hooks
+time out after 60 seconds unless `timeout:` says otherwise.
+
+Because a config file can come with a cloned repository, hooks do not run
+until you trust them: interactive mode asks once, or run `local-coder hooks`
+to review them and `local-coder hooks trust` to approve. The approval is
+stored in `~/.config/local-coder/trusted-hooks.json`, keyed by project and a
+hash of the hooks, so any change to them needs approving again;
+`local-coder hooks untrust` revokes it. `/hooks` shows the current state.
+Hooks apply to CLI runs; `local-coder serve` does not run them.
+
 ### Sessions and resume
 
 Every request runs in a session saved under `.local-coder/sessions/<id>/`, so

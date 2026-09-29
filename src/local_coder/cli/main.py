@@ -130,9 +130,10 @@ def cli(ctx, config, project, model, debug, resume, session_id, yolo):
 @click.argument("request", nargs=-1, required=True)
 @click.pass_context
 def run(ctx, request):
-    """Execute a coding request."""
+    """Execute a coding request, or a custom command such as "/fix-issue 42"."""
     request_str = " ".join(request)
-    _run_request(request_str, ctx.obj)
+    if not (request_str.startswith("/") and _run_extension_command(request_str, ctx.obj)):
+        _run_request(request_str, ctx.obj)
 
 
 @cli.command()
@@ -510,6 +511,7 @@ def _build_coordinator(config, ctx_obj: dict):
         config=config, project_root=ctx_obj["project_root"], approval_callback=approval_callback,
     )
     coordinator.on_event(_event_handler)
+    _install_hooks(coordinator, ctx_obj)
     return coordinator
 
 
@@ -672,6 +674,7 @@ def _show_session(session_id: str, ctx_obj: dict):
 def _interactive_mode(ctx_obj: dict):
     console.print(Panel(ui.build_banner(ctx_obj, __version__), border_style="cyan", expand=False))
     session = ui.PromptSession(console, ctx_obj["project_root"])
+    _setup_interactive_extensions(ctx_obj)
 
     while True:
         user_input = session.read()
@@ -729,7 +732,7 @@ def _interactive_mode(ctx_obj: dict):
                         console.print(f"[red]{exc.message}[/red]")
                 elif cmd == "/help":
                     console.print(ui.build_help_table())
-                else:
+                elif not _run_extension_command(user_input, ctx_obj):
                     console.print(ui.unknown_command_message(cmd))
             else:
                 _run_request(user_input, ctx_obj)
@@ -1056,4 +1059,167 @@ def _show_models(ctx_obj: dict):
             str(model.context_length)
         )
 
+    console.print(table)
+
+
+# === Custom commands and hooks =============================================
+
+def _load_custom_commands(ctx_obj: dict, warn: bool = False):
+    from local_coder import custom_commands
+
+    commands, warnings = custom_commands.discover(ctx_obj["project_root"], reserved=ui.builtin_names())
+    if warn:
+        for warning in warnings:
+            console.print(f"[yellow]Custom command skipped:[/yellow] {warning}")
+    return {c.name: c for c in commands}
+
+
+def _run_extension_command(user_input: str, ctx_obj: dict) -> bool:
+    """Run a custom command or /hooks. False if ``user_input`` is neither."""
+    from local_coder import custom_commands
+
+    name, arguments = custom_commands.split_invocation(user_input)
+    if name == "/hooks":
+        _show_hooks(ctx_obj)
+        return True
+    # Re-read on every use so edits to a command file apply without a restart.
+    command = _load_custom_commands(ctx_obj).get(name)
+    if command is None:
+        return False
+    prompt = command.expand(arguments)
+    if command.mode == "plan":
+        _run_plan(prompt, ctx_obj)
+    else:
+        _run_request(prompt, ctx_obj)
+    return True
+
+
+def _setup_interactive_extensions(ctx_obj: dict) -> None:
+    """Load custom commands into /help and Tab completion, and offer to
+    trust this project's hooks if it has untrusted ones."""
+    from local_coder import hooks
+
+    ui.set_custom_commands(_load_custom_commands(ctx_obj, warn=True).values())
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    for error in config.errors:
+        console.print(f"[yellow]Hook skipped:[/yellow] {error}")
+    if config.hooks and not hooks.is_trusted(config, ctx_obj["project_root"]):
+        console.print(f"[bold yellow]{config.source} defines hooks that run shell commands:[/bold yellow]")
+        console.print(_hooks_table(config))
+        try:
+            answer = click.confirm("Trust and run these hooks in this project?", default=False)
+        except click.Abort:
+            console.print()
+            answer = False
+        if answer:
+            hooks.trust(config, ctx_obj["project_root"])
+            console.print("[green]Hooks trusted.[/green] They will ask again if they change.")
+        else:
+            console.print("[dim]Hooks will not run. Trust them later with `local-coder hooks trust`.[/dim]")
+
+
+def _install_hooks(coordinator, ctx_obj: dict) -> None:
+    """Attach trusted hooks to the coordinator's tool registry."""
+    from local_coder import hooks
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    if not config.hooks:
+        return
+    if not hooks.is_trusted(config, ctx_obj["project_root"]):
+        if not ctx_obj.get("_warned_untrusted_hooks"):
+            console.print(
+                f"[yellow]Hooks in {config.source} are not trusted, so they will not run.[/yellow] "
+                "Review them with `local-coder hooks`, then run `local-coder hooks trust`."
+            )
+            ctx_obj["_warned_untrusted_hooks"] = True
+        return
+    hooks.install(coordinator.tool_registry, hooks.HookRunner(config, ctx_obj["project_root"]))
+
+
+def _hooks_table(config) -> Table:
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("Event", style="cyan", no_wrap=True)
+    table.add_column("Tools", style="dim")
+    table.add_column("Command")
+    for hook in config.hooks:
+        table.add_row(hook.event, ", ".join(sorted(hook.tools)) or "all", hook.command)
+    return table
+
+
+def _show_hooks(ctx_obj: dict) -> None:
+    from local_coder import hooks
+
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    for error in config.errors:
+        console.print(f"[yellow]Hook skipped:[/yellow] {error}")
+    if not config.hooks:
+        where = config.source or "the project config"
+        console.print(f"No hooks configured. Add a `hooks:` section to {where}.")
+        return
+    trusted = hooks.is_trusted(config, ctx_obj["project_root"])
+    state = "[green]trusted[/green]" if trusted else "[yellow]not trusted, will not run[/yellow] (local-coder hooks trust)"
+    console.print(f"Hooks from {config.source}: {state}")
+    console.print(_hooks_table(config))
+
+
+@cli.group(name="hooks", invoke_without_command=True)
+@click.pass_context
+def hooks_group(ctx):
+    """Show, trust or untrust this project's lifecycle hooks."""
+    if ctx.invoked_subcommand is None:
+        _show_hooks(ctx.obj)
+
+
+@hooks_group.command(name="trust")
+@click.option("--yes", "-y", is_flag=True, help="Trust without asking")
+@click.pass_context
+def hooks_trust(ctx, yes):
+    """Allow the hooks currently configured here to run."""
+    from local_coder import hooks
+
+    ctx_obj = ctx.obj
+    config = hooks.load_hooks(ctx_obj.get("config_path"), ctx_obj["project_root"])
+    if not config.hooks:
+        console.print("No hooks configured, nothing to trust.")
+        return
+    console.print(_hooks_table(config))
+    if not yes and not click.confirm(f"Trust these hooks from {config.source}?", default=False):
+        return
+    hooks.trust(config, ctx_obj["project_root"])
+    console.print("[green]Hooks trusted.[/green] Changing them will require trusting them again.")
+
+
+@hooks_group.command(name="untrust")
+@click.pass_context
+def hooks_untrust(ctx):
+    """Stop running this project's hooks."""
+    from local_coder import hooks
+
+    if hooks.untrust(ctx.obj["project_root"]):
+        console.print("Hooks for this project are no longer trusted.")
+    else:
+        console.print("This project's hooks were not trusted.")
+
+
+@cli.command(name="commands")
+@click.pass_context
+def commands_cmd(ctx):
+    """List custom slash commands from .local-coder/commands/."""
+    from local_coder import custom_commands
+
+    commands = _load_custom_commands(ctx.obj, warn=True)
+    if not commands:
+        console.print(
+            f"No custom commands. Add Markdown files to {custom_commands.project_commands_dir(ctx.obj['project_root'])}"
+            f" or {custom_commands.user_commands_dir()}."
+        )
+        return
+    table = Table(title="Custom commands", title_justify="left")
+    table.add_column("Command", style="bold cyan", no_wrap=True)
+    table.add_column("Description")
+    table.add_column("Mode", style="dim")
+    table.add_column("File", style="dim")
+    for c in commands.values():
+        table.add_row(f"{c.name} {c.argument_hint}".rstrip(), c.description, c.mode, f"{c.path} ({c.scope})")
     console.print(table)
