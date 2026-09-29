@@ -17,6 +17,8 @@ class AgentRole(str, enum.Enum):
     DEBUGGER = "debugger"
     TESTER = "tester"
     REVIEWER = "reviewer"
+    SECURITY = "security"
+    EXPLOIT_VALIDATOR = "exploit_validator"
 
 
 class TaskStatus(str, enum.Enum):
@@ -50,10 +52,12 @@ class ModelBackend(str, enum.Enum):
 class ToolName(str, enum.Enum):
     READ_FILE = "read_file"
     WRITE_FILE = "write_file"
+    EDIT_FILE = "edit_file"
     APPLY_PATCH = "apply_patch"
     LIST_FILES = "list_files"
     SEARCH_FILES = "search_files"
     GREP = "grep"
+    CODE_SEARCH = "code_search"
     GIT_STATUS = "git_status"
     GIT_DIFF = "git_diff"
     GIT_LOG = "git_log"
@@ -64,6 +68,7 @@ class ToolName(str, enum.Enum):
     BUILD = "build"
     LINT = "lint"
     FORMAT_CODE = "format_code"
+    SECURITY_SCAN = "security_scan"
 
 
 # === Messages ===
@@ -145,6 +150,7 @@ class AgentTask(BaseModel):
 class TaskContext(BaseModel):
     """Context provided to an agent for a task."""
     architecture: str = ""
+    guidelines: str = ""
     relevant_symbols: list[str] = Field(default_factory=list)
     previous_findings: list[str] = Field(default_factory=list)
     file_contents: dict[str, str] = Field(default_factory=dict)

@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import os
 import json
-from typing import Callable
+from typing import Any, Callable, Protocol
 
 from local_coder.approval import ApprovalCallback
 from local_coder.types import (
@@ -19,6 +19,16 @@ from local_coder.scheduler.dag import TaskDAG
 from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
+
+
+class RunCheckpoint(Protocol):
+    """Where Coordinator.run saves each finished phase so an interrupted run
+    can resume (orchestrator.sessions.TurnCheckpoint is the on-disk one).
+    Values are JSON-compatible: strings or model_dump(mode="json") dicts."""
+
+    def get(self, key: str) -> Any | None: ...
+
+    def put(self, key: str, value: Any) -> None: ...
 
 
 class Coordinator:
@@ -82,42 +92,57 @@ class Coordinator:
         for handler in self._event_handlers:
             handler(event)
 
-    async def run(self, request: str) -> str:
-        """Execute a user request end-to-end."""
+    async def run(
+        self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",
+    ) -> str:
+        """Execute a user request end-to-end.
+
+        With a checkpoint, every finished phase is saved to it and any phase
+        it already holds is reused instead of re-run, so calling run() again
+        with the same checkpoint resumes after the last finished phase.
+        history is earlier turns of the same session, given to the agents as
+        context for a follow-up request."""
         self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
-        
+        objective = f"{history}\n\nCurrent request: {request}" if history else request
+
         # Step 1: Explore repository
         self._emit("ORCHESTRATOR", "phase", "Exploring repository...")
-        exploration = await self._explore(request)
-        
+        exploration = await self._resumable(checkpoint, "explore", lambda: self._explore(objective))
+
         # Step 2: Plan
         self._emit("ORCHESTRATOR", "phase", "Creating plan...")
-        plan = await self._plan(request, exploration)
-        
+        plan = await self._resumable(checkpoint, "plan", lambda: self._plan(objective, exploration), TaskPlan)
+
         # Step 3: Determine if simple or complex
         if len(plan.tasks) <= 1:
             self._emit("ORCHESTRATOR", "phase", "Executing simple task...")
-            result = await self._execute_simple(request, exploration)
+            result = await self._resumable(
+                checkpoint, "execute", lambda: self._execute_simple(objective, exploration), AgentResponse,
+            )
         else:
             self._emit("ORCHESTRATOR", "phase", "Executing complex task plan...")
-            result = await self._execute_plan(plan)
-        
+            result = await self._resumable(
+                checkpoint, "execute", lambda: self._execute_plan(plan, checkpoint), AgentResponse,
+            )
+
         # Step 4: Review
         self._emit("ORCHESTRATOR", "phase", "Reviewing changes...")
-        review = await self._review(result)
+        review = await self._resumable(checkpoint, "review", lambda: self._review(result))
         
         # Step 5: Test
         test_result = None
         last_fix_result: AgentResponse | None = None
         if self.config.verification.run_tests_after_changes:
             self._emit("ORCHESTRATOR", "phase", "Running tests...")
-            test_result = await self._run_tests()
+            test_result = await self._resumable(checkpoint, "tests.0", self._run_tests, AgentResponse)
 
             # Step 6: Fix loop
             fix_iterations = 0
             while not test_result.tests_passed and fix_iterations < self.config.verification.max_fix_iterations:
                 self._emit("ORCHESTRATOR", "fix_loop", f"Fixing failures (attempt {fix_iterations + 1})...")
-                last_fix_result = await self._fix_failures(test_result)
+                last_fix_result = await self._resumable(
+                    checkpoint, f"fix.{fix_iterations}", lambda: self._fix_failures(test_result), AgentResponse,
+                )
                 fix_iterations += 1
                 if last_fix_result.status == TaskStatus.FAILED:
                     self._emit(
@@ -125,7 +150,9 @@ class Coordinator:
                         f"Debugger could not attempt a fix: {last_fix_result.summary}",
                     )
                     break
-                test_result = await self._run_tests()
+                test_result = await self._resumable(
+                    checkpoint, f"tests.{fix_iterations}", self._run_tests, AgentResponse,
+                )
 
         # Step 7: Final report
         report = await self._generate_report(result, review, test_result, last_fix_result)
@@ -135,6 +162,19 @@ class Coordinator:
             self._emit("ORCHESTRATOR", "task_failed", "Verification did not pass within the retry limit")
         return report
     
+    async def _resumable(self, checkpoint: RunCheckpoint | None, key: str, produce: Callable, model=None):
+        """Return the checkpointed value for key if there is one, otherwise
+        run produce() and checkpoint its result. model is the pydantic type
+        the value round-trips through (None for plain strings)."""
+        saved = checkpoint.get(key) if checkpoint is not None else None
+        if saved is not None:
+            self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved '{key}' result from the session")
+            return model.model_validate(saved) if model is not None else saved
+        value = await produce()
+        if checkpoint is not None:
+            checkpoint.put(key, value.model_dump(mode="json") if model is not None else value)
+        return value
+
     def _session_cache_filename(self) -> str:
         """Stable per-project filename for the disk-backed slot cache, so
         different projects sharing one llama-server don't collide."""
@@ -259,9 +299,18 @@ class Coordinator:
             follow_up_required=False
         )
 
-    async def _execute_plan(self, plan: TaskPlan) -> AgentResponse:
+    async def _execute_plan(self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None) -> AgentResponse:
         dag = TaskDAG()
         dag.add_tasks(plan.tasks)
+        # Plan tasks that finished before an interruption stay finished; only
+        # the rest run again. Failed tasks are never checkpointed, so they
+        # get another attempt on resume.
+        if checkpoint is not None:
+            for task in plan.tasks:
+                saved = checkpoint.get(f"task.{task.task_id}")
+                if saved is not None:
+                    dag.mark_completed(task.task_id, AgentResponse.model_validate(saved))
+                    self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved result for plan task {task.task_id}")
 
         validation_errors = dag.validate()
         if validation_errors:
@@ -302,7 +351,7 @@ class Coordinator:
             for task in ready_tasks:
                 dag.mark_running(task.task_id)
             semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
-            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore) for task in ready_tasks))
+            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore, checkpoint) for task in ready_tasks))
 
         return AgentResponse(
             task_id="plan_execution",
@@ -333,7 +382,10 @@ class Coordinator:
             seen.update(file_scope)
         return configured
 
-    async def _run_dag_task(self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore) -> None:
+    async def _run_dag_task(
+        self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore,
+        checkpoint: RunCheckpoint | None = None,
+    ) -> None:
         """Run one DAG-scheduled task, bounded by the parallelism semaphore,
         and record its outcome on the DAG. Concurrent siblings in the same
         wave call this independently via asyncio.gather in _execute_plan."""
@@ -367,6 +419,8 @@ class Coordinator:
                     dag.mark_failed(task.task_id, response)
                 else:
                     dag.mark_completed(task.task_id, response)
+                    if checkpoint is not None:
+                        checkpoint.put(f"task.{task.task_id}", response.model_dump(mode="json"))
             except Exception as e:
                 response = AgentResponse(
                     task_id=task.task_id,
@@ -478,6 +532,60 @@ class Coordinator:
             follow_up_required=False
         ))
     
+    async def security_review(self, paths: list[str] | None = None, focus: str | None = None) -> str:
+        """Run a read-only red/blue team security review of the local project."""
+        agent = create_agent(
+            AgentRole.SECURITY, await self.model_manager.get_model(AgentRole.SECURITY), self.tool_registry, self._dispatch
+        )
+        objective = "Perform a security review of this project: find exploitable vulnerabilities and propose fixes."
+        if focus:
+            objective += f" Focus: {focus}"
+        task = AgentTask(
+            role=AgentRole.SECURITY,
+            objective=objective,
+            files=paths or [],
+            constraints=[
+                "Read-only: do not modify files.",
+                "Analyze only the local workspace; do not contact external hosts.",
+            ],
+        )
+        response = await agent.execute(task)
+        return response.summary
+
+    async def validate_finding(self, finding: str, paths: list[str] | None = None) -> str:
+        """Red-team companion to the reviewer: reproduce an already-identified
+        finding in this project's own code as a local PoC test, so a fix can be
+        verified. Requires a concrete finding; refuses anything out of scope."""
+        finding = (finding or "").strip()
+        if not finding:
+            return (
+                "A specific, already-identified finding is required. Run `local-coder security` "
+                "first, then pass one of its findings to validate. This tool only reproduces "
+                "findings in this project's own code; it does not go looking for something to attack."
+            )
+        agent = create_agent(
+            AgentRole.EXPLOIT_VALIDATOR,
+            await self.model_manager.get_model(AgentRole.EXPLOIT_VALIDATOR),
+            self.tool_registry,
+            self._dispatch,
+        )
+        task = AgentTask(
+            role=AgentRole.EXPLOIT_VALIDATOR,
+            objective=(
+                "Reproduce this already-identified vulnerability in THIS project's own code as a "
+                f"proof-of-concept test, so a maintainer can confirm it and verify a fix:\n{finding}"
+            ),
+            files=paths or [],
+            constraints=[
+                "Only this repository's own code; only the finding above.",
+                "Write the PoC as a pytest test under tests/security_poc/; do not modify other project code.",
+                "Offline only: no network, no external hosts, no DoS, no evasion or persistence, no credential harvesting.",
+                "If the task would require anything above, refuse and explain instead.",
+            ],
+        )
+        response = await agent.execute(task)
+        return response.summary
+
     async def run_tests_only(self) -> str:
         """Just run tests and report."""
         res = await self._run_tests()

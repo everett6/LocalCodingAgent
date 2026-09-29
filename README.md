@@ -43,8 +43,41 @@ local-coder --version
 ```
 
 Running `local-coder` with no arguments opens the interactive terminal mode.
+Type a request to run it, or a slash command (`/plan <request>`, `/review`,
+`/test`, `/status`, `/checkpoint`, `/checkpoints`, `/rollback <id>`, `/help`,
+`/quit`); Tab completes slash commands and input history is kept in
+`.local-coder/history`. While a request runs a spinner shows the active agent
+and elapsed time; Ctrl+C cancels the request and returns to the prompt, and
+Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
+
+### Sessions and resume
+
+Every request runs in a session saved under `.local-coder/sessions/<id>/`, so
+work can span several invocations instead of starting cold each time:
+
+```bash
+local-coder "Add OAuth login"          # new session; its id is printed at the end
+local-coder --resume                   # pick the latest session's unfinished request back up
+local-coder --resume "Now add tests"   # follow-up request in the latest session
+local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
+local-coder resume auth                # pick up auth's unfinished request
+local-coder sessions                   # list sessions
+local-coder sessions auth              # show a session's requests and finished phases
+```
+
+The coordinator checkpoints each phase as it finishes (exploration, plan, each
+completed plan task, review, every test run and fix attempt). If a run crashes,
+errors, or is stopped with Ctrl+C, resuming skips the finished phases and
+continues from the next one, running only the plan tasks that had not finished. A follow-up
+request gets the earlier requests in the session and their results (the last
+five, each trimmed) as context. `state.json` in the session folder holds the
+turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
+two terminals from running the same session at once. In the interactive
+prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
+manage it. `POST /run` on the remote server uses the same sessions, so repeating
+a `session_id` there continues it too.
 
 ## Local model server
 
@@ -148,6 +181,59 @@ system message telling the model to stop repeating the call and try
 something else; after 5 it gives up on the task rather than silently
 burning the rest of the iteration budget on a call that has never once
 succeeded.
+
+**Targeted edits:** Coder, Debugger, and Tester agents get an `edit_file`
+tool that replaces an exact snippet of a file (`old_string` -> `new_string`,
+optionally `replace_all`), alongside `write_file` and `apply_patch`. Small
+local models get whole-file rewrites and unified diffs wrong far more often
+than a copy-and-replace, so the prompts steer them to `edit_file` for changes
+to existing files. A failed edit explains how to recover: an ambiguous match
+lists every matching line, and a match that differs only in whitespace
+names the line to re-read. CRLF files keep their line endings. `apply_patch`
+now reports which files it changed, so patch edits show up in task summaries
+and in the drafter's accept/reject signal like other edits do.
+
+**Lint and format:** `lint` runs the project's linter and reports problems
+without touching files; `format_code` formats in place and reports which
+files it rewrote. Both auto-detect the language from its marker file
+(`pyproject.toml`, `package.json`, `go.mod`, `Cargo.toml`) and pick the first
+installed tool -- ruff or flake8, eslint, go vet, clippy for linting; ruff
+format or black, prettier, gofmt, cargo fmt for formatting -- preferring a
+project-local `node_modules/.bin` binary over `PATH`. The model can name one
+of those tools and pass workspace paths, but never an arbitrary command, so
+neither needs the shell approval flow. Review roles get `lint` only.
+
+## Security review (red and blue team)
+
+`local-coder security` runs a read-only security agent over the project
+(`/security` in interactive mode):
+
+```bash
+local-coder security                          # whole project
+local-coder security src/api --focus "auth and injection in request handlers"
+```
+
+The agent works both sides: it maps the attack surface and traces untrusted
+input to dangerous sinks (injection, path traversal, SSRF, unsafe
+deserialization, missing authorization, secrets), verifies scanner hits by
+reading the code, and reports each finding with `file:line`, how it is
+exploitable, its impact, and a concrete fix, plus hardening recommendations
+and the false positives it dismissed. Route it to its own model with
+`agentic.role_models.security`.
+
+Its `security_scan` tool (also available to the coder, debugger, and
+reviewer roles) combines:
+
+- a built-in secret scanner (private keys, AWS/GitHub/Slack/Google/Stripe/
+  Anthropic/OpenAI-style keys, hard-coded passwords and tokens) that needs no
+  dependencies and redacts every matched value in its output;
+- `bandit` for Python, when installed;
+- `semgrep`, when installed **and** the project has its own rules
+  (`.semgrep.yml`, `.semgrep.yaml`, or `.semgrep/`). Remote rule packs are
+  never fetched and metrics are off, so scanning stays offline.
+
+Everything is scoped to the local workspace: the security role cannot edit
+files, run shell commands, or contact other hosts.
 
 Independent tasks in a plan (no `depends_on` between them) run concurrently,
 bounded by `agentic.max_parallel_agents` in the config (default `1`, i.e.
@@ -295,6 +381,45 @@ llama-server itself (or the GGUF's chat template), out of reach from this
 repo's Python code; the retry still helps for genuinely transient failures
 (a real sampling glitch, a momentary server hiccup), just not this specific
 deterministic one.
+
+## Context budget (token efficiency)
+
+A small local model's window fills fast, and every token of history is
+re-sent (and, on a cache miss, re-prefilled) on every turn. The agent loop
+keeps the conversation small in the same layered way opencode does, cheapest
+step first (`context/compression.py`):
+
+1. **Tool-output truncation.** One tool result is capped to
+   `max_tool_output_chars` (default: an eighth of `context_window_chars`,
+   between 2000 and 16000) and 400 lines. The head and tail are kept, since
+   errors and test failures usually sit at the end. The full text is saved to
+   `.local-coder/tool-output/<tool>-<call id>.txt` and the notice tells the
+   model to page through it with `read_file` or `grep`.
+2. **Paged reads.** `read_file` returns up to 1000 lines or 10000 characters,
+   clips lines over 1000 characters, and ends a partial page with the
+   `start_line` to continue from. Before, it cut at 10000 characters with no
+   way to ask for the rest. `grep` clips matching lines over 300 characters.
+3. **Pruning.** Once the conversation is over budget, older tool results are
+   replaced by a one-line placeholder. A read, grep, listing or git call that
+   was later repeated with the same arguments goes first, then anything past
+   the newest `compact_context_chars / 2` of tool output. No model call is
+   needed, and message structure and tool-call ids are kept.
+4. **Summarization.** If pruning isn't enough, the model summarizes the
+   middle of the history (files, facts learned, commands run, what's left).
+   That summary replaces it, and the system prompt, task and newest turns
+   stay verbatim. The cut never leaves a tool result without its tool call.
+   If summarization fails, the old character-budget trimming is the fallback.
+
+Compaction triggers when history passes `context_window_chars`, **or** when
+the prompt size the server reported last turn passes 85% of the model's
+`context_length` minus `max_tokens`. Chars per token varies a lot between
+code and prose, so the real count is the reliable signal. History is only
+rewritten when a trigger fires. Between compactions the prompt is
+append-only, so llama-server's prefix cache is reused on every turn.
+
+Past tool calls are now sent back as real JSON (compact separators) instead
+of a Python `repr`, so the model sees its own calls in the shape it wrote
+them.
 
 ## Architecture
 
