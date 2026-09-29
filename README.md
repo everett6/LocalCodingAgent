@@ -43,6 +43,12 @@ local-coder --version
 ```
 
 Running `local-coder` with no arguments opens the interactive terminal mode.
+Type a request to run it, or a slash command (`/plan <request>`, `/review`,
+`/test`, `/status`, `/checkpoint`, `/checkpoints`, `/rollback <id>`, `/help`,
+`/quit`); Tab completes slash commands and input history is kept in
+`.local-coder/history`. While a request runs a spinner shows the active agent
+and elapsed time; Ctrl+C cancels the request and returns to the prompt, and
+Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
 
