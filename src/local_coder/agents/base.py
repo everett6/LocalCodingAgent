@@ -4,13 +4,19 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from local_coder.types import (
     AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus,
-    Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
+    Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult, ToolName,
 )
 from local_coder.context.compression import compress_messages
+from local_coder.agents.tool_repair import (
+    RepairedCall, extract_text_tool_calls, repair_tool_call, schemas_by_name,
+)
+from local_coder.verification.syntax import check_syntax
+from local_coder.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,14 @@ class BaseAgent:
     # backoff) before giving up on the whole task over one glitch.
     generation_retry_limit: int = 2
     generation_retry_backoff_seconds: float = 0.5
+    # Small-model guardrails (see tool_repair.py and verification/syntax.py):
+    # accept tool calls written as text when no native call was made, refuse
+    # to let write_file clobber an existing file the agent never read, and
+    # parse-check every file an edit touches so a syntax error surfaces in
+    # the same turn instead of in a test run several turns later.
+    parse_text_tool_calls: bool = True
+    require_read_before_overwrite: bool = True
+    check_syntax_after_edits: bool = True
 
     def __init__(
         self,
@@ -147,6 +161,7 @@ class BaseAgent:
             )
 
             base_temperature = self.model.config.temperature if hasattr(self.model, "config") else 0.2
+            tool_schemas = self.tool_registry.get_schemas_for_role(self.role)
             response = None
             generation_error: Exception | None = None
             for attempt in range(self.generation_retry_limit + 1):
@@ -163,7 +178,7 @@ class BaseAgent:
                         messages,
                         temperature=retry_temperature,
                         max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
-                        tools=self.tool_registry.get_schemas_for_role(self.role),
+                        tools=tool_schemas,
                     )
                     generation_error = None
                     break
@@ -197,7 +212,9 @@ class BaseAgent:
             self._metrics.prompt_tokens += response.prompt_tokens
             self._metrics.completion_tokens += response.completion_tokens
             self._metrics.latency_ms += response.latency_ms
-            
+
+            response, repairs = self._repair_tool_calls(response, tool_schemas, task)
+
             # If no tool calls, we're done
             if not response.tool_calls:
                 self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
@@ -246,17 +263,28 @@ class BaseAgent:
                     task_id=task.task_id,
                 )
                 
-                try:
-                    result = await self.tool_registry.execute_tool(
-                        self.role, tc.name, tc.arguments
-                    )
-                except Exception as exc:
-                    result = ToolResult(
-                        tool_call_id=tc.id,
-                        success=False,
-                        output=f"Tool execution failed: {exc}",
-                    )
-                
+                repair = repairs.get(tc.id)
+                blocked = repair.error if repair is not None else None
+                if blocked is None:
+                    blocked = self._check_overwrite(tc, task)
+                if blocked is not None:
+                    result = ToolResult(tool_call_id=tc.id, success=False, output=blocked)
+                else:
+                    try:
+                        result = await self.tool_registry.execute_tool(
+                            self.role, tc.name, tc.arguments
+                        )
+                    except Exception as exc:
+                        result = ToolResult(
+                            tool_call_id=tc.id,
+                            success=False,
+                            output=f"Tool execution failed: {exc}",
+                        )
+                    if result.success and result.files_changed:
+                        self._append_syntax_errors(result, task)
+                if repair is not None and repair.notes:
+                    result.output = f"[Note: {'; '.join(repair.notes)}]\n{result.output}"
+
                 self._metrics.tool_calls += 1
                 self.state.tool_calls_used += 1
                 if tc.name in {"read_file", "search_files", "grep"}:
@@ -367,6 +395,103 @@ class BaseAgent:
             issues=["Exceeded maximum tool-calling iterations"],
         )
     
+    def _repair_tool_calls(
+        self, response: ModelResponse, tool_schemas: list[dict], task: AgentTask
+    ) -> tuple[ModelResponse, dict[str, RepairedCall]]:
+        """Recover text-only tool calls and fix near-miss names/arguments."""
+        schemas = schemas_by_name(tool_schemas)
+        tool_calls = list(response.tool_calls)
+        if not tool_calls and self.parse_text_tool_calls and schemas:
+            tool_calls = extract_text_tool_calls(response.content, set(schemas))
+            if tool_calls:
+                self._emit_event(
+                    "tool_calls_from_text",
+                    f"Recovered {len(tool_calls)} tool call(s) written as text",
+                    task_id=task.task_id,
+                )
+        if not tool_calls:
+            return response, {}
+        repairs = {tc.id: repair_tool_call(tc, schemas) for tc in tool_calls}
+        repaired_calls = [repairs[tc.id].call for tc in tool_calls]
+        if repaired_calls != response.tool_calls:
+            response = response.model_copy(update={"tool_calls": repaired_calls})
+        return response, repairs
+
+    def _workspace(self) -> Workspace | None:
+        """The workspace this agent's file tools are rooted at, if known."""
+        get_tool = getattr(self.tool_registry, "get_tool", None)
+        if get_tool is None:
+            return None
+        for name in (ToolName.WRITE_FILE, ToolName.READ_FILE):
+            try:
+                root = getattr(get_tool(name), "project_root", None)
+            except Exception:
+                root = None
+            if root:
+                return Workspace(root)
+        return None
+
+    def _check_overwrite(self, tc, task: AgentTask) -> str | None:
+        """Refuse a write_file that would replace an existing file the agent
+        hasn't seen in this task: a small model rewriting a file from memory
+        silently drops whatever it didn't remember."""
+        if not self.require_read_before_overwrite or tc.name != ToolName.WRITE_FILE.value:
+            return None
+        path = tc.arguments.get("path")
+        workspace = self._workspace()
+        if not isinstance(path, str) or workspace is None:
+            return None
+        try:
+            target = workspace.resolve(path)
+        except (ValueError, OSError):
+            return None  # write_file reports the bad path itself
+        if not target.is_file():
+            return None
+        seen: set[Path] = set()
+        known = set(self._files_changed) | set(task.context.file_contents)
+        if self.state is not None:
+            known |= self.state.files_read
+        for candidate in known:
+            try:
+                seen.add(workspace.resolve(candidate))
+            except (ValueError, OSError):
+                continue
+        if target in seen:
+            return None
+        return (
+            f"Refusing to overwrite {path}: it already exists and you have not read it in this task. "
+            "Call read_file on it first, then make the change -- prefer a targeted edit over "
+            "rewriting the whole file."
+        )
+
+    def _append_syntax_errors(self, result: ToolResult, task: AgentTask) -> None:
+        """Add a parse error for any edited file that no longer parses."""
+        if not self.check_syntax_after_edits:
+            return
+        workspace = self._workspace()
+        if workspace is None:
+            return
+        problems = []
+        for changed in result.files_changed:
+            try:
+                problem = check_syntax(workspace.resolve(changed), display_path=changed)
+            except (ValueError, OSError):
+                continue
+            if problem:
+                problems.append(problem)
+        if not problems:
+            return
+        result.output = (
+            f"{result.output}\n\nWarning: the edit was saved but the file no longer parses:\n"
+            + "\n\n".join(problems)
+            + "\nFix this before doing anything else."
+        ).strip()
+        self._emit_event(
+            "syntax_error",
+            f"Edit left {len(problems)} file(s) unparseable",
+            task_id=task.task_id,
+        )
+
     def _build_messages(self, task: AgentTask) -> list[Message]:
         """Build the initial message list for a task."""
         messages = [Message(role="system", content=self.system_prompt)]

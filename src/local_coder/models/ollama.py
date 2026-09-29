@@ -7,7 +7,7 @@ from typing import AsyncIterator
 import httpx
 
 from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
-from local_coder.models.base import BaseModelBackend
+from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 
 
 class OllamaBackend(BaseModelBackend):
@@ -66,7 +66,7 @@ class OllamaBackend(BaseModelBackend):
                 func = tc.get("function", {})
                 parsed_tool_calls.append(ToolCall(
                     name=func.get("name", ""),
-                    arguments=func.get("arguments", {})
+                    arguments=decode_tool_arguments(func.get("arguments", {}))
                 ))
 
         return ModelResponse(
