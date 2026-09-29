@@ -57,6 +57,7 @@ class ToolName(str, enum.Enum):
     LIST_FILES = "list_files"
     SEARCH_FILES = "search_files"
     GREP = "grep"
+    CODE_SEARCH = "code_search"
     GIT_STATUS = "git_status"
     GIT_DIFF = "git_diff"
     GIT_LOG = "git_log"
