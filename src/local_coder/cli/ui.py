@@ -47,6 +47,9 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/checkpoint", "Save the current working tree"),
     SlashCommand("/checkpoints", "List saved checkpoints"),
     SlashCommand("/rollback", "Restore a checkpoint", args="<id>"),
+    SlashCommand("/sessions", "List saved sessions"),
+    SlashCommand("/resume", "Pick up a session's unfinished request", args="[id]"),
+    SlashCommand("/new", "Start a new session for the next request"),
     SlashCommand("/help", "Show this help message"),
     SlashCommand("/quit", "Exit interactive mode", aliases=("/exit", "/q")),
 )

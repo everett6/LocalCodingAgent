@@ -52,6 +52,33 @@ Ctrl+C twice at an empty prompt (or Ctrl+D) exits.
 The root command also accepts a direct request, so `lc "Fix the failing tests"`
 is equivalent to `local-coder run "Fix the failing tests"`.
 
+### Sessions and resume
+
+Every request runs in a session saved under `.local-coder/sessions/<id>/`, so
+work can span several invocations instead of starting cold each time:
+
+```bash
+local-coder "Add OAuth login"          # new session; its id is printed at the end
+local-coder --resume                   # pick the latest session's unfinished request back up
+local-coder --resume "Now add tests"   # follow-up request in the latest session
+local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
+local-coder resume auth                # pick up auth's unfinished request
+local-coder sessions                   # list sessions
+local-coder sessions auth              # show a session's requests and finished phases
+```
+
+The coordinator checkpoints each phase as it finishes (exploration, plan, each
+completed plan task, review, every test run and fix attempt). If a run crashes,
+errors, or is stopped with Ctrl+C, resuming skips the finished phases and
+continues from the next one, running only the plan tasks that had not finished. A follow-up
+request gets the earlier requests in the session and their results (the last
+five, each trimmed) as context. `state.json` in the session folder holds the
+turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
+two terminals from running the same session at once. In the interactive
+prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
+manage it. `POST /run` on the remote server uses the same sessions, so repeating
+a `session_id` there continues it too.
+
 ## Local model server
 
 This repo's own `config/config.yaml` is set up for the local llama.cpp stack
