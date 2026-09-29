@@ -19,6 +19,7 @@ from local_coder.scheduler.dag import TaskDAG
 from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
+from local_coder.verification.test_runner import detect_framework
 
 
 class RunCheckpoint(Protocol):
@@ -443,6 +444,22 @@ class Coordinator:
         return "Fallback review: looks good."
 
     async def _run_tests(self) -> AgentResponse:
+        # Running a known framework needs no model: call the tool directly and
+        # save the tester's round trips. Its compact report is what the
+        # debugger sees if anything failed.
+        if detect_framework(self.project_root) is not None:
+            self._emit("ORCHESTRATOR", "tool_call", "Running project tests directly")
+            result = await self.tool_registry.execute_tool(AgentRole.TESTER, "run_tests", {})
+            return AgentResponse(
+                task_id="test_run",
+                status=TaskStatus.COMPLETED if result.success else TaskStatus.FAILED,
+                summary=result.output,
+                files_changed=[],
+                tests_run=["project tests"],
+                tests_passed=result.success,
+                issues=[] if result.success else ["Verification tests failed"],
+                follow_up_required=not result.success,
+            )
         tester = create_agent(AgentRole.TESTER, await self.model_manager.get_model(AgentRole.TESTER), self.tool_registry, self._dispatch)
         if tester:
             task = AgentTask(role=AgentRole.TESTER, objective="Run project tests")
