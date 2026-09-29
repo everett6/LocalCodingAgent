@@ -7,6 +7,20 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 from local_coder.types import Message, ModelResponse, ModelConfig
 
 
+def decode_tool_arguments(raw) -> dict:
+    """Decode a tool call's arguments leniently. Arguments that can't be
+    repaired are kept under RAW_ARGUMENTS_KEY so the agent can tell the
+    model what went wrong, instead of running the tool with no arguments."""
+    from local_coder.agents.tool_repair import RAW_ARGUMENTS_KEY, parse_arguments
+
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    parsed = parse_arguments(raw) if isinstance(raw, str) else None
+    return parsed if parsed is not None else {RAW_ARGUMENTS_KEY: str(raw)}
+
+
 @runtime_checkable
 class LocalModel(Protocol):
     """Protocol for local model backends."""
