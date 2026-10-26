@@ -19,7 +19,7 @@
   compiled development fork and the **native packaged fork's bundled extension**.
   It verified activation, command registration, trusted workspace validation,
   and authenticated shared-engine API calls. The extension host exited with 0.
-- **15 Node tests** pass under Node 26.5.0 and Node 24.18.0. Coverage includes native
+- **17 Node tests** pass under Node 26.5.0 and Node 24.18.0. Coverage includes native
   command/provider/profile/SecretStorage integration, investigation/cancellation,
   untrusted workspace rejection, graceful owned shutdown, shared-engine ownership,
   and fallback cleanup of a descendant in its own process group ignoring SIGTERM.
@@ -29,7 +29,7 @@
 - The parent `dist/local-coder-engine`, `extension/bin`, prepared source extension,
   intermediate packaged extension, and final native application copies all have
   the same SHA-256:
-  `53dc6fc0d2c702e6a918fac7c933ffe0083d437fda307bfe1711e53c1c3dc7ab`.
+  `43ad3c99789c79a0aba8d4cd0e196db88e8eca93fbb8b0f8f5fba2c6bd5e3b1e`.
 
 Ignored local logs are in `.build/compile.log`, `.build/package.log`,
 `.build/vscode-smoke.log`, and `.build/tests-node24.log`.
@@ -38,7 +38,9 @@ Ignored local logs are in `.build/compile.log`, `.build/package.log`,
 
 Windows and macOS native applications were **not built or run** here. Build and
 launch wrappers cover their native upstream targets, but signing, notarization,
-installers, and auto-update infrastructure are not configured.
+and installers are not configured. A daily stable-source update PR workflow,
+Linux x64 native release workflow, and user-configurable native fork updater are now included;
+the workflow has not yet been run remotely or published its first fork release.
 
 The pinned upstream npm installation reported audit findings (root dependency
 report: 36 findings, including one critical). This fork does not silently rewrite
@@ -50,3 +52,44 @@ does not claim to remove every upstream agent UI or SDK module.
 
 Tests and smoke checks made no paid model calls. Provider account availability,
 billing, model IDs, and production model responses were not validated here.
+
+## Launcher and fork updater verification
+
+The installed native application launched successfully both with a fresh profile
+and the normal profile on the actual Wayland graphical session. A graphical
+extension-host smoke then passed twice against the rebuilt native package using
+`LOCAL_CODER_SMOKE_NATIVE=1`, without forcing X11 or disabling the GPU. These runs
+verified real extension activation, commands and authenticated shared-engine
+refresh. The reported earlier inability to open the IDE was not reproduced.
+
+The manager previously discarded all native startup output and reported success
+as soon as a process spawned. It now detects nonzero exits during the first three
+seconds and stores a private startup log. It also discovers a sibling installed
+fork without requiring an environment override. Two launcher regressions and all
+seven desktop tests pass. The IDE's 17 tests include OpenRouter harness/context
+payloads, rejecting external update asset URLs, checksum rejection preserving the
+original app, atomic installation, and retention of the previous app folder.
+
+The full native fork packaging command passed again (1.35 minutes). The final
+activation manifest adds startup activation and was synchronized as an extension
+resource after packaging, followed by the second passing native smoke. The
+upstream checker queried the official stable release API and confirmed the pin
+remains 1.143.1. The update workflow parses as YAML, but its remote Actions build,
+GitHub PR permissions and release publication remain to be verified after push.
+No model downloads or inference calls were made during these checks.
+
+## Harness upgrade verification
+
+306 backend tests, 17 IDE tests and 7 desktop tests pass. The manager interface
+build and lint pass. A real packaged-engine exercise used a synthetic loopback
+model to run a scoped scan, receive model-visible evidence identifiers, record
+an unverified finding, save a durable report and shut down cleanly. No paid
+model call or external target scan was used. The full native fork package was
+rebuilt with the matching engine, then its bundled extension resources were
+synchronized after the automatic-update preference change.
+
+Automatic fork installation defaults to enabled on Linux x64 and can be disabled
+in user settings. Repository scheduled checks and release publication require
+the workflow to be present on the default branch; this feature branch alone
+does not activate the daily schedule. Real-model speedups and Windows/macOS
+native operation remain unmeasured.

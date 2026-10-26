@@ -324,3 +324,11 @@ Run the tests with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+### Red team mode
+
+The manager and Code OSS IDE include a dedicated **Red Team** engagement workflow:
+saved scope/exclusions, phased checklists, bounded opt-in HTTP observations,
+SARIF/Nuclei artifact import, attack-path hypotheses, and persistent evidence.
+Use `lc redteam --target src 'Review trust boundaries'` for local source review.
+See [engagement setup and limits](docs/harness.md#red-team-engagements) and the
+[upstream methodology reference](docs/references/pentest-harness.md).

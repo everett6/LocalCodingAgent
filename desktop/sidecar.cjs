@@ -3,8 +3,8 @@ const { spawn, execFile } = require('node:child_process');
 function isAllowedApiRequest(path, method) {
   if (typeof path !== 'string' || path.length > 4096 || !path.startsWith('/') || path.startsWith('//') || /[\\#\r\n]/.test(path)) return false;
   const pathname = path.split('?')[0];
-  if (method === 'GET') return ['/status', '/settings', '/events', '/workspace', '/diff', '/file', '/files', '/sessions'].includes(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+$/.test(pathname);
-  if (method === 'POST') return ['/settings', '/jobs'].includes(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(pathname);
+  if (method === 'GET') return ['/status', '/settings', '/events', '/workspace', '/diff', '/file', '/files', '/sessions', '/engagements', '/inference', '/security-playbooks'].includes(pathname) || /^\/engagements\/eng-[a-f0-9]{12}(\/report)?$/.test(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+$/.test(pathname);
+  if (method === 'POST') return ['/settings', '/jobs', '/engagements', '/inference/configure', '/inference/start', '/inference/stop', '/inference/install-runtime'].includes(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(pathname);
   return false;
 }
 class Sidecar {

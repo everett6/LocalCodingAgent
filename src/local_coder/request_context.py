@@ -6,7 +6,9 @@ from local_coder.workspace import Workspace
 
 
 def prepare_request(request: str, mode: AgentMode, action: str, project_root: str):
-    commands = {"/hunt": (AgentMode.BUG_HUNTING, "run", "Find reproducible bugs in the selected workspace"),
+    commands = {"/redteam": (AgentMode.RED_TEAM, "run", "Investigate the selected red team engagement"),
+                "/pentest": (AgentMode.RED_TEAM, "run", "Investigate the selected red team engagement"),
+                "/hunt": (AgentMode.BUG_HUNTING, "run", "Find reproducible bugs in the selected workspace"),
                 "/security": (AgentMode.CYBERSECURITY, "run", "Audit the selected workspace"),
                 "/audit": (AgentMode.CYBERSECURITY, "run", "Audit the selected workspace"),
                 "/plan": (mode, "plan", "Plan the requested work"),
@@ -16,6 +18,8 @@ def prepare_request(request: str, mode: AgentMode, action: str, project_root: st
     if first in commands:
         mode, action, default = commands[first]
         request = rest.strip() or default
+    if mode == AgentMode.RED_TEAM:
+        return request, mode, action  # Source attachments must go through scoped engagement tools.
     workspace = Workspace(project_root)
     context, used = [], set()
     for mention in re.findall(r"(?<!\w)@([\w./\\-]+)", request)[:12]:

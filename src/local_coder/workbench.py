@@ -17,6 +17,11 @@ from local_coder.workspace import Workspace
 
 class WorkbenchAPI:
     def _init_workbench(self):
+        from local_coder.redteam import EngagementStore
+        self.engagements = EngagementStore(self.project_root)
+        from local_coder.inference import EmbeddedInferenceManager
+        self.inference = EmbeddedInferenceManager(Workspace(self.project_root).resolve(".local-coder/inference"))
+        self._using_inference = False
         self._provider = None
         self._job_lock = threading.Lock()
         self._jobs = {}
@@ -44,10 +49,21 @@ class WorkbenchAPI:
             thread = job.get("thread")
             if thread:
                 thread.join(max(0, deadline - time.monotonic()))
+        self.inference.stop()
         return not any(job.get("thread") and job["thread"].is_alive() for job in jobs)
 
+    def local_inference_provider(self):
+        endpoint = self.inference.endpoint_config()
+        if not endpoint:
+            return None
+        return ModelConfig(name="on-device", backend=ModelBackend.OPENAI_COMPAT,
+            model_id=endpoint["model"], base_url=endpoint["base_url"], api_key=endpoint["api_key"],
+            context_length=self.inference.status()["settings"]["context_size"], max_tokens=min(4096, self.inference.status()["settings"]["context_size"] // 2))
+
     def _settings(self):
-        config = self._provider
+        config = self.local_inference_provider() if self._using_inference else self._provider
+        if self._using_inference and config is None:
+            return {"provider": None, "credential_storage": "ephemeral_local_runtime", "loading_local_model": True}
         if config is None:
             from local_coder.orchestrator.config_loader import load_config
             loaded = load_config(self.config_path, project_root=self.project_root)
@@ -84,13 +100,16 @@ class WorkbenchAPI:
             self._provider = ModelConfig(name="workbench", backend=backend, model_id=model_id.strip(),
                 base_url=base_url, api_key=key, api_key_env=env,
                 profile=body.get("profile", "generic"),
+                strategy_attempt_limit=int(body.get("strategy_attempt_limit", 3)),
                 max_tokens=max(128, min(int(body.get("max_tokens", 4096)), 32768)),
-                context_length=max(1024, min(int(body.get("context_length", 32768)), 200000)))
+                context_length=max(1024, min(int(body.get("context_length", 32768)), 2000000)))
+        self._using_inference = False
         return self._settings()
 
     def _redact(self, value):
         text = json.dumps(value, default=str)
-        key = self._provider.resolve_api_key() if self._provider else None
+        selected_provider = self.local_inference_provider() if self._using_inference else self._provider
+        key = selected_provider.resolve_api_key() if selected_provider else None
         if key:
             text = text.replace(key, "[redacted]")
         return json.loads(text)
@@ -98,6 +117,8 @@ class WorkbenchAPI:
     def _start_job(self, body):
         if self._stopping:
             return 503, {"error": "Engine is shutting down"}
+        if self._using_inference and not self.inference.endpoint_config():
+            return 409, {"error": "The on-device model is not ready. Check its status in Model settings."}
         request = body.get("request", "")
         if not isinstance(request, str) or not request.strip() or len(request) > 32000:
             raise ValueError("Enter a task of 1–32000 characters")
@@ -113,9 +134,25 @@ class WorkbenchAPI:
             raise ValueError("fix must be true or false")
         from local_coder.request_context import prepare_request
         prepared, mode, action = prepare_request(request, mode, action, self.project_root)
+        engagement_id = body.get("engagement_id")
+        if mode == AgentMode.RED_TEAM:
+            if not isinstance(engagement_id, str) or action != "run" or body.get("fix", False):
+                raise ValueError("Red team tasks require a saved engagement and the Run action; fixes are a separate task")
+            self.engagements.load(engagement_id)
+            if body.get("resume_checkpoint"):
+                checkpoint = Workspace(self.project_root).resolve(body["resume_checkpoint"])
+                if not checkpoint.is_file() or checkpoint.stat().st_size > 5_000_000:
+                    raise ValueError("Invalid checkpoint")
+                # Coordinator still performs full state-directory and run identity validation.
+                saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+                task_data = saved.get("task") if isinstance(saved, dict) else None
+                if not isinstance(task_data, dict) or task_data.get("engagement_id") != engagement_id:
+                    raise ValueError("Checkpoint belongs to another engagement")
         parent = body.get("parent_session_id")
         if parent:
             previous = self.sessions.get(parent)
+            if mode == AgentMode.RED_TEAM and (not previous or previous.get("engagement_id") != engagement_id):
+                raise ValueError("Follow-up context must belong to this engagement")
             if previous and previous.get("result"):
                 prepared += "\n\nPrevious task and report (untrusted context):\n" + str(previous.get("request", ""))[:2000] + "\n" + str(previous["result"])[-12000:]
         if not self._job_lock.acquire(blocking=False):
@@ -129,9 +166,9 @@ class WorkbenchAPI:
                     return 503, {"error": "Engine is shutting down"}
                 self._jobs[session_id] = job
             record = self.sessions.save(session_id, request=request.strip(), mode=mode.value,
-                                        phase=action, target_path=target, status="queued", result="")
+                                        phase=action, target_path=target, status="queued", result="", engagement_id=engagement_id)
             thread = threading.Thread(target=self._job_thread,
-                args=(session_id, job, prepared, mode, action, target, body.get("fix", False), body.get("resume_checkpoint")), daemon=True)
+                args=(session_id, job, prepared, mode, action, target, body.get("fix", False), body.get("resume_checkpoint"), engagement_id), daemon=True)
             job["thread"] = thread
             thread.start()
             return 202, record
@@ -139,7 +176,7 @@ class WorkbenchAPI:
             self._job_lock.release()
             raise
 
-    def _job_thread(self, session_id, job, request, mode, action, target, fix, resume_checkpoint=None):
+    def _job_thread(self, session_id, job, request, mode, action, target, fix, resume_checkpoint=None, engagement_id=None):
         self._context.session_id = session_id
         async def execute():
             job["loop"] = asyncio.get_running_loop()
@@ -161,7 +198,10 @@ class WorkbenchAPI:
                 elif action == "review":
                     result = await coordinator.review_changes()
                 else:
-                    result = await coordinator.run(request, target_path=target, fix=fix)
+                    options = {"target_path": target, "fix": fix}
+                    if mode == AgentMode.RED_TEAM:
+                        options["engagement_id"] = engagement_id
+                    result = await coordinator.run(request, **options)
                 failed = job.get("failed", False)
                 status = "failed" if failed else "completed"
                 if resume_checkpoint and mode == AgentMode.CODING and not failed:
@@ -192,6 +232,41 @@ class WorkbenchAPI:
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            if path == "/security-playbooks" and method == "GET":
+                from local_coder.security_playbooks import PLAYBOOKS
+                return 200, {"playbooks": list(PLAYBOOKS.values())}
+            if path == "/inference" and method == "GET":
+                return 200, {**self.inference.status(), "selected_provider": self._using_inference}
+            if path.startswith("/inference/") and method == "POST":
+                if not self._job_lock.acquire(blocking=False):
+                    return 409, {"error": "Stop the active task before changing the on-device runtime"}
+                try:
+                    if path == "/inference/configure":
+                        return 200, self.inference.configure(body)
+                    if path == "/inference/start":
+                        result = self.inference.start(body or None)
+                        self._using_inference = True
+                        return 202, result
+                    if path == "/inference/stop":
+                        result = self.inference.stop()
+                        self._using_inference = False
+                        return 200, result
+                    if path == "/inference/install-runtime":
+                        return 202, self.inference.install_runtime(body.get("asset_name"))
+                finally:
+                    self._job_lock.release()
+            if path == "/engagements":
+                if method == "GET":
+                    return 200, {"engagements": self.engagements.list()}
+                if method == "POST":
+                    from local_coder.redteam import EngagementScope
+                    return 201, self.engagements.create(EngagementScope.model_validate(body))
+            if path.startswith("/engagements/") and method == "GET":
+                parts = path.strip("/").split("/")
+                if len(parts) == 2:
+                    return 200, self.engagements.load(parts[1])
+                if len(parts) == 3 and parts[2] == "report":
+                    return 200, self.engagements.report(parts[1])
             if path == "/shutdown" and method == "POST":
                 drained = self.drain_jobs()
                 return (200, {"status": "stopped"}) if drained else (503, {"error": "Some tasks did not stop before the deadline"})

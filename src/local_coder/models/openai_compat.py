@@ -26,6 +26,14 @@ class OpenAICompatibleBackend(BaseModelBackend):
         # Assuming tools are already in OpenAI JSON schema format
         return tools
 
+    def _profile_payload(self, payload):
+        if self.config.profile.startswith("openrouter_"):
+            payload["reasoning"] = {"effort": "high", "exclude": False}
+            payload["provider"] = {"require_parameters": True}
+            if self.config.profile == "openrouter_kimi":
+                payload.pop("temperature", None)
+        return payload
+
     async def generate(
         self,
         messages: list[Message],
@@ -60,6 +68,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
         elif self.config.profile == "qwen38":
             payload.update(enable_thinking=True, stream=True, stream_options={"include_usage": True})
 
+        self._profile_payload(payload)
         try:
             # Relative to base_url, which is expected to already include the
             # server's own "/v1" prefix (the OpenAI SDK convention, e.g.
@@ -77,7 +86,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
 
         latency_ms = (time.time() - start_time) * 1000.0
         
-        choice = data.get("choices", [{}])[0]
+        if data.get("error") or not data.get("choices"):
+            raise RuntimeError("Provider returned an error or no completion; check model access and quota")
+        choice = data["choices"][0]
         msg_data = choice.get("message", {})
         content = msg_data.get("content") or ""
         
@@ -110,12 +121,13 @@ class OpenAICompatibleBackend(BaseModelBackend):
             total_tokens=usage.get("total_tokens", 0),
             latency_ms=latency_ms,
             model=data.get("model", self.config.model_id),
-            reasoning_content=msg_data.get("reasoning_content"),
+            reasoning_content=msg_data.get("reasoning_content") or msg_data.get("reasoning"),
+            reasoning_details=msg_data.get("reasoning_details"),
         )
 
     async def _collect_stream(self, payload):
         """Assemble indexed tool deltas before any tool may execute."""
-        content, reasoning, calls, usage = [], [], {}, {}
+        content, reasoning, calls, usage, details = [], [], {}, {}, []
         finish, model = "stop", self.config.model_id
         async with self.client.stream("POST", "/chat/completions", json=payload) as response:
             response.raise_for_status()
@@ -134,14 +146,15 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     finish = choice.get("finish_reason") or finish
                     delta = choice.get("delta", {})
                     content.append(delta.get("content") or "")
-                    reasoning.append(delta.get("reasoning_content") or "")
+                    reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+                    details.extend(delta.get("reasoning_details") or [])
                     for call in delta.get("tool_calls") or []:
                         assembled = calls.setdefault(call["index"], {"id": "", "function": {"name": "", "arguments": ""}})
                         assembled["id"] += call.get("id") or ""
                         for key in ("name", "arguments"):
                             assembled["function"][key] += call.get("function", {}).get(key) or ""
         return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning) or None,
-                                          "tool_calls": [calls[i] for i in sorted(calls)]}, "finish_reason": finish}],
+                                          "tool_calls": [calls[i] for i in sorted(calls)], "reasoning_details": details or None}, "finish_reason": finish}],
                 "usage": usage, "model": model}
 
     async def stream(
@@ -162,6 +175,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
             "stream": True,
         }
 
+        self._profile_payload(payload)
         try:
             async with self.client.stream("POST", "/chat/completions", json=payload) as response:
                 response.raise_for_status()

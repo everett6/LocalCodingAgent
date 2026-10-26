@@ -12,17 +12,18 @@ function validateLoopbackURL(value) {
 }
 function validateJob(job) {
   if (!job || typeof job.request !== 'string' || !job.request.trim() || job.request.length > 100000 ||
-      !['coding','cybersecurity','bug_hunting'].includes(job.mode) || !['run','plan','review'].includes(job.action) ||
+      !['coding','cybersecurity','bug_hunting','red_team'].includes(job.mode) || !['run','plan','review'].includes(job.action) ||
       (job.fix !== undefined && typeof job.fix !== 'boolean') ||
       (job.target_path !== undefined && (typeof job.target_path !== 'string' || job.target_path.length > 4096))) {
     throw new Error('Invalid task request, mode, action, or scope');
   }
+  if(job.mode==='red_team'&&(!/^eng-[a-f0-9]{12}$/.test(job.engagement_id||'')||job.action!=='run'||job.fix))throw new Error('Red team requires a saved scope and run action');
   return {...job,request:job.request.trim()};
 }
 function validateProvider(provider) {
   if (!provider || !['openai_compatible','anthropic','ollama'].includes(provider.backend) ||
       typeof provider.model_id !== 'string' || !provider.model_id.trim() || provider.model_id.length > 256 ||
-      !['generic','glm53','qwen38'].includes(provider.profile) ||
+      !['generic','glm53','qwen38','openrouter_deepseek','openrouter_glm','openrouter_kimi'].includes(provider.profile) ||
       (provider.max_tokens !== undefined && (!Number.isInteger(provider.max_tokens) || provider.max_tokens < 128 || provider.max_tokens > 32768))) {
     throw new Error('Invalid provider protocol, model, profile, or output token budget');
   }
@@ -98,7 +99,7 @@ class EngineConnection {
   async request(route,method='GET',body,timeout=30000) {
     if(this.closed&&route!=='/shutdown')throw new Error('Engine connection is closed');
     if(!this.url)await this.start();
-    if(!/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown)(\/[^?#]*)?(\?[^#]*)?$/.test(route))throw new Error('Unsupported engine API route');
+    if(!/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route))throw new Error('Unsupported engine API route');
     if(!['GET','POST'].includes(method))throw new Error('Unsupported engine API method');
     const payload=body===undefined?null:JSON.stringify(body);
     return new Promise((resolve,reject)=>{

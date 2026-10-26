@@ -6,6 +6,9 @@ const crypto=require('node:crypto');
 const {EngineConnection,validateJob,validateProvider}=require('./engine.cjs');
 let active;
 const presets=[
+  {label:'DeepSeek V4.1 Flash · OpenRouter',backend:'openai_compatible',model_id:'deepseek/deepseek-v4.1-flash-1017',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_deepseek',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
+  {label:'GLM 5.3 · OpenRouter',backend:'openai_compatible',model_id:'z-ai/glm-5.3',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_glm',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
+  {label:'Kimi K3.1 Pro · OpenRouter',backend:'openai_compatible',model_id:'moonshotai/kimi-k3.1-pro',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_kimi',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
   {label:'GLM 5.3 · Z.ai Coding Plan',backend:'openai_compatible',model_id:'glm-5.3',base_url:'https://api.z.ai/api/coding/paas/v4',profile:'glm53',max_tokens:16384},
   {label:'Qwen 3.8 · Model Studio',backend:'openai_compatible',model_id:'qwen3.8-max',base_url:'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',profile:'qwen38',max_tokens:16384},
   {label:'Anthropic Messages',backend:'anthropic',model_id:'',base_url:'https://api.anthropic.com/v1',profile:'generic',max_tokens:8192},
@@ -113,6 +116,28 @@ function activate(context){
     if(!configured.provider){await configureProvider(folder);if(!(await entry.engine.request('/settings')).provider)return;}
     const request=await vscode.window.showInputBox({title:`Local Coder · ${mode.replace('_',' ')}`,prompt:action==='review'?'What should the review focus on?':'Describe the task',value:action==='review'?'Review the current workspace changes for correctness, bugs, and security issues.':'',ignoreFocusOut:true});
     if(!request?.trim())return;
+    if(mode==='red_team'){
+      const listing=await entry.engine.request('/engagements');
+      const choices=[{label:'Create a new engagement'},...(listing.engagements||[]).map(item=>({label:item.name,description:item.id,id:item.id}))];
+      const choice=await vscode.window.showQuickPick(choices,{placeHolder:'Choose the saved scope for this red team task'});if(!choice)return;
+      let engagement_id=choice.id;
+      if(!engagement_id){
+        const paths=await vscode.window.showInputBox({title:'In-scope local paths',prompt:'Comma-separated paths inside this workspace',value:'.'});if(paths===undefined)return;
+        const excluded=await vscode.window.showInputBox({title:'Excluded local paths',prompt:'Comma-separated paths; optional',value:''});if(excluded===undefined)return;
+        const check=await vscode.window.showQuickPick([{label:'Local source review only',active:false},{label:'Enable authorized HTTP observations',active:true}],{placeHolder:'Choose engagement capabilities'});if(!check)return;
+        let origins='',authorization='',excluded_urls='';
+        if(check.active){
+          origins=await vscode.window.showInputBox({title:'Authorized HTTP origins',prompt:'Exact HTTP(S) origins, comma separated; no wildcards'});if(origins===undefined)return;
+          authorization=await vscode.window.showInputBox({title:'Authorization reference',prompt:'Rules of engagement or lab approval reference; no credentials'});if(authorization===undefined)return;
+          excluded_urls=await vscode.window.showInputBox({title:'Excluded URLs',prompt:'Comma-separated full URL path prefixes; optional',value:''});if(excluded_urls===undefined)return;
+        }
+        const split=value=>value.split(',').map(item=>item.trim()).filter(Boolean);
+        const created=await entry.engine.request('/engagements','POST',{name:request.slice(0,100),objective:request,paths:split(paths),excluded_paths:split(excluded),origins:split(origins),excluded_urls:split(excluded_urls),authorization,active_http:check.active,max_requests:20});
+        engagement_id=created.id;
+      }
+      await entry.engine.request('/jobs','POST',validateJob({request,mode,action:'run',engagement_id,fix:false}));
+      output.show(true);await vscode.commands.executeCommand('localCoder.tasks.focus');await refresh();return;
+    }
     let target_path='.',fix=false;
     if(mode!=='coding'){
       target_path=await vscode.window.showInputBox({title:'Investigation scope',prompt:'Path inside this workspace',value:'.'});if(target_path===undefined)return;
@@ -126,12 +151,12 @@ function activate(context){
     const preset=await vscode.window.showQuickPick(presets,{placeHolder:'Choose your provider (model access and billing are supplied by your account)'});if(!preset)return;
     const model_id=await vscode.window.showInputBox({title:'Provider model ID',value:preset.model_id,prompt:'Exact model ID enabled on your account'});if(model_id===undefined)return;
     const base_url=await vscode.window.showInputBox({title:'Provider endpoint',value:preset.base_url,prompt:'HTTPS endpoint, or HTTP on localhost for a local model'});if(base_url===undefined)return;
-    const profiles=[{label:'Standard harness',value:'generic'},{label:'GLM 5.3 reasoning harness',value:'glm53'},{label:'Qwen 3.8 thinking and tools harness',value:'qwen38'}];
+    const profiles=[{label:'Standard harness',value:'generic'},{label:'GLM 5.3 reasoning harness',value:'glm53'},{label:'Qwen 3.8 thinking and tools harness',value:'qwen38'},{label:'OpenRouter DeepSeek harness',value:'openrouter_deepseek'},{label:'OpenRouter GLM harness',value:'openrouter_glm'},{label:'OpenRouter Kimi harness',value:'openrouter_kimi'}];
     profiles.sort((a,b)=>Number(b.value===preset.profile)-Number(a.value===preset.profile));
     const profile=await vscode.window.showQuickPick(profiles,{placeHolder:'Choose the model harness',ignoreFocusOut:true});if(!profile)return;
     const budget=await vscode.window.showInputBox({title:'Maximum output tokens',value:String(preset.max_tokens),validateInput:value=>Number.isInteger(Number(value))&&Number(value)>=128&&Number(value)<=32768?undefined:'Enter an integer from 128 to 32768'});if(budget===undefined)return;
-    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget)});
-    const api_key_env=await vscode.window.showInputBox({title:'Optional API key environment variable',prompt:'Leave blank to use a saved or pasted key; the engine process must inherit this variable',value:''});if(api_key_env===undefined)return;
+    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget),...(preset.context_length?{context_length:preset.context_length}:{})});
+    const api_key_env=await vscode.window.showInputBox({title:'Optional API key environment variable',prompt:'Leave blank to use a saved or pasted key; the engine process must inherit this variable',value:preset.api_key_env||''});if(api_key_env===undefined)return;
     if(api_key_env&&!/^[A-Za-z_][A-Za-z0-9_]*$/.test(api_key_env))throw new Error('Enter a valid environment variable name');
     if(api_key_env)provider.api_key_env=api_key_env;
     let api_key;
@@ -148,6 +173,8 @@ function activate(context){
   register('localCoder.review',()=>startJob('coding','review'));
   register('localCoder.security',()=>startJob('cybersecurity','run'));
   register('localCoder.bugs',()=>startJob('bug_hunting','run'));
+  register('localCoder.redteam',()=>startJob('red_team','run'));
+  register('localCoder.engagementReport',async()=>{const folder=await chooseFolder();if(!folder)return;const entry=await service(folder);const listing=await entry.engine.request('/engagements');const chosen=await vscode.window.showQuickPick((listing.engagements||[]).map(item=>({label:item.name,description:item.id,id:item.id})),{placeHolder:'Choose an engagement report'});if(!chosen)return;const report=await entry.engine.request(`/engagements/${chosen.id}/report`);await showDocument('red-team-report.md',report.markdown,'markdown');});
   register('localCoder.configureProvider',()=>configureProvider());
   register('localCoder.forgetProviderKey',async()=>{const folder=await chooseFolder();if(!folder)return;const provider=context.globalState.get(configKey(folder));if(provider)await context.secrets.delete(keyID(provider));vscode.window.showInformationMessage('Saved provider key removed. The running engine retains its in-memory key until it closes.');});
   register('localCoder.refresh',()=>refresh(true));
@@ -160,6 +187,28 @@ function activate(context){
     const selected=await vscode.window.showQuickPick((sessions||[]).filter(session=>['queued','running'].includes(session.status)).map(session=>({label:session.request,description:session.session_id,session})),{placeHolder:'Choose a task to cancel'});if(!selected)return;
     await entry.engine.request(`/jobs/${encodeURIComponent(selected.session.session_id)}/cancel`,'POST',{});await refresh();
   });
+  let updateBusy=false;
+  async function updateIDE(manual=false){
+    if(updateBusy)return;
+    if([...services.values()].some(entry=>(entry.sessions||[]).some(session=>['queued','running','cancelling'].includes(session.status)))){if(manual)vscode.window.showInformationMessage('Stop active agent tasks before updating the IDE.');return;}
+    const updateSetting=vscode.workspace.getConfiguration('localCoder').inspect('autoUpdate');
+    if(!manual&&(updateSetting?.globalValue??updateSetting?.defaultValue)!==true)return;
+    updateBusy=true;
+    try{
+      const updater=require('./update.cjs');
+      const release=await updater.latest();
+      if(!release){if(manual)vscode.window.showInformationMessage('No validated Local Coder IDE release is published yet.');return;}
+      if(manual&&await vscode.window.showInformationMessage('Install the latest validated Local Coder IDE fork? Restart the IDE after installation.', 'Install')!=='Install')return;
+      const installed=await updater.install(release);
+      if(installed)vscode.window.showInformationMessage('Local Coder IDE updated. Restart the IDE to use the new version. Your previous installation is retained beside the current app.');
+      else if(manual)vscode.window.showInformationMessage('Local Coder IDE is already up to date.');
+    }catch(error){if(manual)vscode.window.showErrorMessage(error.message);else output.appendLine(`IDE update: ${error.message}`);}
+    finally{updateBusy=false;}
+  }
+  register('localCoder.updateIDE',()=>updateIDE(true));
+  const updateTimer=setTimeout(()=>void updateIDE(),30000);
+  const updateInterval=setInterval(()=>void updateIDE(),6*60*60*1000);
+  context.subscriptions.push({dispose:()=>{clearTimeout(updateTimer);clearInterval(updateInterval);}});
   const interval=setInterval(()=>void refresh(),1500);
   context.subscriptions.push({dispose:()=>clearInterval(interval)},vscode.workspace.onDidChangeWorkspaceFolders(async()=>{
     const roots=new Set((vscode.workspace.workspaceFolders||[]).map(folder=>folder.uri.fsPath));

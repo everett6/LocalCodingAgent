@@ -60,6 +60,7 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
             api_key=model_data.get("api_key"),
             api_key_env=model_data.get("api_key_env"),
             profile=model_data.get("profile", "generic"),
+            strategy_attempt_limit=model_data.get("strategy_attempt_limit", 3),
         )
         
     resources_data = data.get("resources", {})

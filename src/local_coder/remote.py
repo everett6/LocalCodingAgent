@@ -142,11 +142,17 @@ class RemoteControlServer(WorkbenchAPI):
 
     def _coordinator(self) -> Coordinator:
         config = load_config(self.config_path, project_root=self.project_root)
-        if self._provider is not None:
-            config.models = {"workbench": self._provider.model_copy(deep=True)}
+        provider = self.local_inference_provider() if self._using_inference else self._provider
+        if self._using_inference and provider is None:
+            raise ValueError("The on-device model is not ready")
+        if provider is not None:
+            config.models = {"workbench": provider.model_copy(deep=True)}
             config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
         elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
+        if provider is not None and (provider.profile.startswith("openrouter_") or self._using_inference):
+            config.agentic.context_window_chars = min(provider.context_length * 3, 240000)
+            config.agentic.compact_context_chars = config.agentic.context_window_chars // 2
         if self.yolo:
             config.approval.require_approval_for_commands = False
             config.approval.require_approval_for_commits = False

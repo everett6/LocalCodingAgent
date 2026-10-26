@@ -28,8 +28,8 @@ const extensionPath=spec.development?path.join(root,'extension'):path.resolve(sp
 env.LOCAL_CODER_SMOKE_EXTENSION_PATH=extensionPath;
 const log=await fs.open(path.join(root,'.build','vscode-smoke.log'),'w');
 try{
-  const args=[...spec.args,'--new-window','--user-data-dir',profile,'--extensions-dir',path.join(workspace,'extensions'),'--extensionDevelopmentPath',extensionPath,'--extensionTestsPath',path.join(root,'test','vscode-smoke.cjs'),'--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-gpu','--disable-extension=GitHub.copilot','--disable-extension=GitHub.copilot-chat',workspace];
-  if(process.platform==='linux')args.unshift('--ozone-platform=x11');
+  const args=[...spec.args,'--new-window','--user-data-dir',profile,'--extensions-dir',path.join(workspace,'extensions'),'--extensionDevelopmentPath',extensionPath,'--extensionTestsPath',path.join(root,'test','vscode-smoke.cjs'),'--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-extension=GitHub.copilot','--disable-extension=GitHub.copilot-chat',workspace];
+  if(process.platform==='linux'&&process.env.LOCAL_CODER_SMOKE_NATIVE!=='1')args.unshift('--ozone-platform=x11','--disable-gpu');
   if(process.env.LOCAL_CODER_SMOKE_DEBUG_PORT)args.push(`--remote-debugging-port=${process.env.LOCAL_CODER_SMOKE_DEBUG_PORT}`);
   if(process.env.LOCAL_CODER_SMOKE_NO_SANDBOX==='1')args.unshift('--no-sandbox');
   const code=await new Promise((resolve,reject)=>{

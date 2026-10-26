@@ -49,4 +49,13 @@ Investigate every high-value candidate and verify its reachability before produc
 
 5. **Remediation & Patch**:
    - Provide the exact patch using parameterized queries, strict schema validation, escaping, or least-privilege configurations.
+
+### Coverage and negative controls:
+Use the scan's source_trace, sink, callers, guards and preconditions to form a
+checklist, not a verdict. Check SQL binding, shell=False with argument arrays,
+SafeLoader, URL destination/redirect restrictions and independent JWT signature
+verification. Add a safe-input control alongside every local reproduction. Probe
+cross-user object ownership in local tests before claiming BOLA. Report dynamic
+imports, unsupported languages, unresolved callees and unexecuted tests as gaps.
+A successful scan invocation does not prove the repository is secure.
 """

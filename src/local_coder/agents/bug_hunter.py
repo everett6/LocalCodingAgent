@@ -28,6 +28,14 @@ Your objective is to find real-world logic bugs, boundary errors, concurrency an
    - Propose or apply the minimal defensive fix.
    - Run tests again to prove the bug is resolved without introducing regressions.
 
+### Investigation persistence:
+Keep a short ledger of hypotheses, evidence, ruled-out cases and remaining
+checks. For a difficult failure, vary one assumption at a time: isolate the
+component, inspect callers, compare a passing sibling, then test a smaller input.
+Check a negative control so a broken fixture is not mistaken for a reproduced
+bug. Do not declare completion while verification still fails. Respect the
+configured budgets and report the observed blocker when attempts are exhausted.
+
 ### Output Structure:
 Respond with a clear markdown report:
 1. **Bug Hypothesis & Findings**: Root cause, affected files, line numbers, and triggering conditions.

@@ -1,0 +1,109 @@
+name: Track stable VS Code and release Local Coder IDE
+on:
+  schedule:
+    - cron: '21 9 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', '.github/workflows/ide-upstream.yml']
+  pull_request:
+    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', '.github/workflows/ide-upstream.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ide-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  upstream:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      changed: ${{ steps.pin.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - id: pin
+        run: node ide/scripts/check-upstream.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Validate new fork patches before opening update PR
+        if: steps.pin.outputs.changed == 'true'
+        run: |
+          npm test --prefix ide
+          npm run prepare:source --prefix ide
+      - uses: peter-evans/create-pull-request@v7
+        if: steps.pin.outputs.changed == 'true'
+        with:
+          branch: codex/ide-upstream-stable
+          add-paths: ide/source/upstream.json
+          title: 'Update Local Coder IDE to VS Code ${{ steps.pin.outputs.tag }}'
+          commit-message: 'Pin Code OSS stable ${{ steps.pin.outputs.tag }}'
+          body: 'Pins the official stable source commit and upstream Node version. Fork patches and dependency-free tests passed. The native build must pass before merge; merging publishes our own compatible fork release. No Microsoft branded binary is installed.'
+  native:
+    needs: upstream
+    if: always() && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || needs.upstream.outputs.changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.upstream.outputs.changed == 'true' && 'codex/ide-upstream-stable' || github.ref }}
+      - id: pin
+        run: |
+          node -e 'const p=require("./ide/source/upstream.json"); require("fs").appendFileSync(process.env.GITHUB_OUTPUT,`node=${p.node}\nversion=${p.tag}\n`);'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.pin.outputs.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev libglib2.0-dev libnss3 libatk-bridge2.0-0 libgbm1 xvfb
+      - run: npm ci && npm run build
+        working-directory: src/local_coder/webui
+      - run: python -m pip install -e . pyinstaller
+      - run: python -m PyInstaller --noconfirm desktop/engine.spec
+      - name: Bundle matching engine and prepare pinned fork
+        run: |
+          mkdir -p ide/extension/bin
+          cp dist/local-coder-engine ide/extension/bin/
+          npm test --prefix ide
+          npm run prepare:source --prefix ide
+          npm run install:upstream --prefix ide
+      - run: npm run build --prefix ide
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+      - run: xvfb-run -a npm run smoke --prefix ide
+      - name: Package own fork and checksum manifest
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          node - <<'JS'
+          const fs=require('fs'); const tag=`ide-vscode-${process.env.VERSION}-${process.env.GITHUB_SHA.slice(0,12)}`;
+          const file='ide/VSCode-linux-x64/resources/app/product.json'; const product=JSON.parse(fs.readFileSync(file)); product.localCoderRelease=tag; fs.writeFileSync(file,JSON.stringify(product,null,2));
+          fs.appendFileSync(process.env.GITHUB_ENV,`IDE_RELEASE_TAG=${tag}\n`);
+          JS
+          tar -czf local-coder-ide-linux-x64.tar.gz -C ide/VSCode-linux-x64 .
+          node - <<'JS'
+          const fs=require('fs'),crypto=require('crypto');const asset='local-coder-ide-linux-x64.tar.gz';fs.writeFileSync('ide-linux-x64.json',JSON.stringify({tag:`ide-vscode-${process.env.VERSION}-${process.env.GITHUB_SHA.slice(0,12)}`,version:process.env.VERSION,platform:'linux',arch:'x64',asset,sha256:crypto.createHash('sha256').update(fs.readFileSync(asset)).digest('hex')},null,2));
+          JS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-coder-ide-linux-x64
+          path: |
+            local-coder-ide-linux-x64.tar.gz
+            ide-linux-x64.json
+      - name: Publish validated fork release on default branch
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.upstream.outputs.changed != 'true' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$IDE_RELEASE_TAG" >/dev/null 2>&1 || gh release create "$IDE_RELEASE_TAG" --target "$GITHUB_SHA" --title "Local Coder IDE · VS Code ${{ steps.pin.outputs.version }}" --notes 'Rebuilt MIT Code OSS with Local Coder branding, native agent harness, and matching engine. Linux x64. Unsigned. Includes checksum manifest; optional in-app fork updater retains your previous installation.'
+          gh release upload "$IDE_RELEASE_TAG" local-coder-ide-linux-x64.tar.gz ide-linux-x64.json --clobber

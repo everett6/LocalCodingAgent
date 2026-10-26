@@ -66,6 +66,7 @@ class ToolRegistry:
                 ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
             },
             AgentRole.REVIEWER: {
+                ToolName.SECURITY_PLAYBOOK,
                 ToolName.READ_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
@@ -73,6 +74,7 @@ class ToolRegistry:
                 ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
             },
             AgentRole.SECURITY: {
+                ToolName.SECURITY_PLAYBOOK,
                 ToolName.READ_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
@@ -80,6 +82,7 @@ class ToolRegistry:
                 ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
             },
             AgentRole.BUG_HUNTER: {
+                ToolName.SECURITY_PLAYBOOK,
                 ToolName.RUN_BUG_SCAN,
                 ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.APPLY_PATCH,
                 ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
@@ -141,6 +144,8 @@ class ToolRegistry:
             )
             
         try:
+            if name_enum == ToolName.RECOVER_CONTEXT:
+                arguments = {**arguments, "_caller_role": role}
             result = await tool.execute(**arguments)
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)

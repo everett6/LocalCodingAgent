@@ -159,6 +159,45 @@ def audit(ctx, target, fix):
 
 
 @cli.command()
+@click.argument("request", nargs=-1, required=True)
+@click.option("--engagement", help="Reuse a saved engagement ID")
+@click.option("--name", default="Red team exercise", help="Engagement name")
+@click.option("--target", multiple=True, default=(".",), help="In-scope local path; repeat to add more")
+@click.option("--exclude", multiple=True, help="Excluded local path")
+@click.option("--origin", multiple=True, help="Exact authorized HTTP(S) origin")
+@click.option("--exclude-url", multiple=True, help="Excluded URL path prefix")
+@click.option("--authorization", default="", help="Rules-of-engagement/authorization reference; never paste a credential")
+@click.option("--active-http", is_flag=True, help="Enable bounded GET/HEAD/OPTIONS observations")
+@click.option("--max-requests", default=20, type=click.IntRange(1, 50))
+@click.pass_context
+def redteam(ctx, request, engagement, name, target, exclude, origin, exclude_url, authorization, active_http, max_requests):
+    """Run a scope-bound red team investigation with durable evidence."""
+    from local_coder.redteam import EngagementStore, EngagementScope
+    from local_coder.orchestrator.config_loader import load_config
+    from local_coder.orchestrator.sessions import SessionStore
+    prompt = " ".join(request)
+    store = EngagementStore(ctx.obj["project_root"])
+    try:
+        record = store.load(engagement) if engagement else store.create(EngagementScope(
+            name=name, objective=prompt, paths=list(target), excluded_paths=list(exclude),
+            origins=list(origin), excluded_urls=list(exclude_url), authorization=authorization,
+            active_http=active_http, max_requests=max_requests))
+        config = load_config(ctx.obj["config_path"], project_root=ctx.obj["project_root"])
+        async def execute():
+            coordinator = _build_coordinator(config, {**ctx.obj, "mode": "red_team"})
+            try:
+                result = await coordinator.run(prompt, engagement_id=record["id"])
+                SessionStore(ctx.obj["project_root"]).save(f"local-{uuid.uuid4().hex[:8]}",
+                    request=prompt, mode="red_team", phase="run", engagement_id=record["id"], result=result)
+                console.print(Panel(Markdown(result), title=f"Red Team · {record['id']}", border_style="red"))
+            finally:
+                await coordinator.model_manager.close_all()
+        asyncio.run(execute())
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command()
 @click.pass_context
 def undo(ctx):
     """Aider-style instant rollback to the state before the last agent command."""

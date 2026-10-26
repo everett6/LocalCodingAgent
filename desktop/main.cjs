@@ -2,6 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron');
 const { randomBytes, createHash } = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs');
+const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { spawn } = require('node:child_process');
 const { Sidecar, isAllowedApiRequest } = require('./sidecar.cjs');
@@ -32,6 +33,28 @@ async function chooseProject() {
   try { await sidecar?.stop(); await startEngine(result.filePaths[0]); fs.writeFileSync(path.join(app.getPath('userData'), 'workspace.json'), JSON.stringify({ project })); await window.loadURL(origin); }
   finally { switching = false; }
 }
+function installedIDE({ managerExecutable = process.execPath, platform = process.platform, exists = fs.existsSync } = {}) {
+  const names = platform === 'darwin' ? ['Local Coder IDE.app/Contents/MacOS/Local Coder IDE'] : [platform === 'win32' ? 'Local Coder IDE.exe' : 'local-coder-ide'];
+  const candidates = names.flatMap(name => [path.resolve(path.dirname(managerExecutable), '..', 'ide', name), path.join(os.homedir(), '.local', 'opt', 'local-coder', 'current', 'ide', name)]);
+  return candidates.find(exists);
+}
+async function spawnIDE(executable, args, { cwd, env, logPath, spawnProcess = spawn, startupMs = 3000 }) {
+  fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+  // Never put credentials or child output in the UI. The private log records native startup diagnostics.
+  const fd = fs.openSync(logPath, 'w', 0o600);
+  fs.fchmodSync(fd, 0o600);
+  let child;
+  try { child = spawnProcess(executable, args, { cwd, detached: true, stdio: ['ignore', fd, fd], windowsHide: false, env }); }
+  finally { fs.closeSync(fd); }
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); resolve(); }, startupMs);
+    const cleanup = () => { clearTimeout(timer); child.removeListener('error', failed); child.removeListener('exit', exited); };
+    const failed = error => { cleanup(); reject(new Error(`Cannot start Local Coder IDE: ${error.message}. Startup diagnostics: ${logPath}`)); };
+    const exited = (code, signal) => { cleanup(); code === 0 ? resolve() : reject(new Error(`Local Coder IDE stopped during startup (${signal || `exit ${code}`}). Startup diagnostics: ${logPath}`)); };
+    child.once('error', failed); child.once('exit', exited);
+  });
+  child.unref();
+}
 async function openIDE() {
   const environment = { ...process.env, LOCAL_CODER_ENGINE_URL: origin, LOCAL_CODER_REMOTE_TOKEN: token,
     LOCAL_CODER_DESKTOP_PROJECT: project, LOCAL_CODER_IDE_DATA_HOME: path.join(app.getPath('userData'), 'ide-profiles') };
@@ -47,6 +70,7 @@ async function openIDE() {
     const settingsPath = path.join(app.getPath('userData'), 'ide.json');
     executable = process.env.LOCAL_CODER_IDE_EXECUTABLE;
     if (!executable) try { executable = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).executable; } catch {}
+    if (!executable || !fs.existsSync(executable)) executable = installedIDE();
     if (!executable || !fs.existsSync(executable)) {
       const result = await dialog.showOpenDialog(window, { title: 'Select your built Local Coder IDE application', properties: ['openFile'],
         ...(process.platform === 'win32' ? { filters: [{ name: 'Application', extensions: ['exe'] }] } : {}) });
@@ -63,9 +87,7 @@ async function openIDE() {
     const profile = path.join(app.getPath('userData'), 'ide-profiles', createHash('sha256').update(token).digest('hex').slice(0, 16));
     args = ['--new-window', '--user-data-dir', profile, project];
   }
-  const child = spawn(executable, args, { cwd, detached: true, stdio: 'ignore', windowsHide: false, env: environment });
-  await new Promise((resolve, reject) => { child.once('error', reject); child.once('spawn', resolve); });
-  child.unref();
+  await spawnIDE(executable, args, { cwd, env: environment, logPath: path.join(app.getPath('userData'), 'logs', 'ide-startup.log') });
 }
 app.whenReady().then(async () => {
   try {
@@ -80,6 +102,16 @@ app.whenReady().then(async () => {
     window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
     window.webContents.session.on('will-download', event => event.preventDefault());
     ipcMain.handle('engine:request', (event, pathname, method, body) => { if (!trusted(event)) throw new Error('Untrusted sender'); return request(pathname, method, body); });
+    ipcMain.handle('inference:choose-file', async (event, purpose) => {
+      if (!trusted(event)) throw new Error('Untrusted sender');
+      if (!['runtime', 'model', 'draft'].includes(purpose)) throw new Error('Unsupported inference file purpose');
+      const result = await dialog.showOpenDialog(window, {
+        title: purpose === 'runtime' ? 'Choose local inference runtime' : purpose === 'draft' ? 'Choose draft GGUF model' : 'Choose GGUF model',
+        properties: ['openFile'],
+        ...(purpose !== 'runtime' ? { filters: [{ name: 'GGUF model', extensions: ['gguf'] }] } : process.platform === 'win32' ? { filters: [{ name: 'Application', extensions: ['exe'] }] } : {})
+      });
+      return result.canceled ? null : result.filePaths[0];
+    });
     ipcMain.handle('ide:open', event => { if (!trusted(event)) throw new Error('Untrusted sender'); return openIDE(); });
     ipcMain.handle('workspace:choose', event => { if (!trusted(event)) throw new Error('Untrusted sender'); return chooseProject(); });
     Menu.setApplicationMenu(Menu.buildFromTemplate([
@@ -94,3 +126,5 @@ app.whenReady().then(async () => {
 });
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', event => { if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });
+
+module.exports = { installedIDE, spawnIDE };

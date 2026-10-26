@@ -18,6 +18,10 @@ test('startup timeout kills a stuck sidecar', async () => {
 });
 test('bridge only permits known relative API operations', () => {
   assert.ok(isAllowedApiRequest('/settings', 'POST'));
+  assert.ok(isAllowedApiRequest('/engagements', 'POST'));
+  assert.ok(isAllowedApiRequest('/engagements/eng-0123456789ab/report', 'GET'));
+  assert.equal(isAllowedApiRequest('/engagements/../outside', 'GET'),false);
+  assert.equal(isAllowedApiRequest('/engagements/eng-0123456789ab', 'POST'),false);
   assert.ok(isAllowedApiRequest('/events?session_id=x&since=3', 'GET'));
   assert.ok(isAllowedApiRequest('/jobs/session-abc/cancel', 'POST'));
   for (const path of ['https://evil.test/status', '//evil.test/status', '/assets/key', '/file/../../secret', '/status#fragment', '/status\\evil']) assert.equal(isAllowedApiRequest(path, 'GET'), false);

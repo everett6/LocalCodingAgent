@@ -20,7 +20,7 @@ findings or apply fixes and run tests. These actions use the existing Python
 coordinator, tools, safety boundaries, checkpoints, and model harness.
 
 **Local Coder: Configure Provider and Harness** supports OpenAI-compatible APIs,
-Anthropic Messages, Ollama, and editable GLM 5.3/Qwen 3.8 presets. Preset model IDs
+Anthropic Messages, Ollama, editable direct GLM 5.3/Qwen 3.8 presets, and OpenRouter DeepSeek V4.1 Flash, GLM 5.3 and Kimi K3.1 Pro presets. OpenRouter presets use dedicated harness profiles, a 1,048,576-token context setting and `OPENROUTER_API_KEY` by default. Preset model IDs
 must be enabled on the user's provider account. Endpoint, exact model ID, token
 budget, and `generic`, `glm53`, or `qwen38` profile are sent to `POST /settings`.
 Keys entered in the native password prompt are saved in VS Code `SecretStorage`
@@ -119,8 +119,8 @@ to an absolute trusted engine path.
 
 Native output is under `ide/VSCode-linux-x64/`, `ide/VSCode-darwin-arm64/`, or the
 matching platform/architecture directory. This task builds an application folder;
-installers, code signing, notarization, and auto-update hosting require additional
-release configuration.
+installers, code signing and notarization require additional release configuration.
+The repository workflow builds and publishes unsigned Linux x64 fork archives.
 
 ## Conversation manager launch contract
 
@@ -185,3 +185,45 @@ entry point. These tests do not make paid model calls.
 Full native build status and any environment-specific blockers from this work
 are recorded in `BUILD_STATUS.md`. Passing extension tests alone does not establish
 that Windows, macOS, or Linux installers have been built or signed.
+
+## Red team engagements
+
+**Local Coder: Red Team Engagement** creates or reuses a scope through the shared
+engine. Choose local paths/exclusions and either source review or bounded
+explicitly authorized HTTP observations. The latter requires exact origins and an
+authorization reference. **Local Coder: Open Engagement Evidence Report** opens
+the persistent Markdown report in an editor document. Scope, evidence, checklists
+and request budgets are shared with the manager. This role has no generic shell
+or file-write capability; remediation is a separate task. See `../docs/harness.md`.
+
+## Automatic fork updates
+
+`.github/workflows/ide-upstream.yml` checks the official stable VS Code release
+once per day. It resolves the tag to an immutable commit and reads `.nvmrc` from
+that commit, prepares the fork patches, runs the extension tests, and opens a
+`codex/ide-upstream-stable` pull request. A separate job builds the candidate
+native fork and matching Python engine and runs its real extension-host smoke.
+It never resets an existing developer checkout. Repository Actions must permit
+creating pull requests. A failed upstream patch or build requires maintenance
+before merging; changes are not automatically merged.
+
+Default-branch IDE changes publish a validated `ide-vscode-*` GitHub release with
+our own Linux x64 application and SHA-256 manifest. **Local Coder: Check for IDE
+Updates** installs that release after confirmation. To install future validated
+releases automatically, the user setting `localCoder.autoUpdate` defaults to enabled; checks
+run on startup and every six hours. Disable this user setting to turn automatic installation off. It currently
+supports Linux x64 only. The updater downloads only this repository's fork
+release assets, verifies their checksum and application identity, stages beside
+the installation, and atomically replaces the application folder. The previous
+folder is retained as `ide.previous-<timestamp>` for rollback. Restart to activate
+an update. The install directory must be writable by the current user.
+
+The built-in Microsoft update service remains disabled. No Microsoft branded
+binary is installed. No update becomes available until the repository workflow
+has successfully built and published its first fork release.
+
+The manager automatically discovers the sibling installed IDE and stores native
+startup diagnostics under its private `logs/ide-startup.log`. A nonzero exit in
+the first three seconds is reported instead of being treated as a successful
+launch. `LOCAL_CODER_SMOKE_NATIVE=1 npm run smoke` exercises the actual graphical
+session without forced X11 or GPU-disabling switches.

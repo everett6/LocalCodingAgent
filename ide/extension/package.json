@@ -13,7 +13,8 @@
     "ui"
   ],
   "activationEvents": [
-    "onView:localCoder.tasks"
+    "onView:localCoder.tasks",
+    "onStartupFinished"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -73,6 +74,18 @@
       {
         "command": "localCoder.activity",
         "title": "Local Coder: Show Agent Activity"
+      },
+      {
+        "command": "localCoder.redteam",
+        "title": "Local Coder: Red Team Engagement"
+      },
+      {
+        "command": "localCoder.engagementReport",
+        "title": "Local Coder: Open Engagement Evidence Report"
+      },
+      {
+        "command": "localCoder.updateIDE",
+        "title": "Local Coder: Check for IDE Updates"
       }
     ],
     "viewsContainers": {
@@ -95,7 +108,7 @@
     "viewsWelcome": [
       {
         "view": "localCoder.tasks",
-        "contents": "Open a trusted local folder, then [connect your provider](command:localCoder.configureProvider).\n[Run a task](command:localCoder.run) \u00b7 [Plan](command:localCoder.plan)\n[Security](command:localCoder.security) \u00b7 [Bug hunt](command:localCoder.bugs)"
+        "contents": "Open a trusted local folder, then [connect your provider](command:localCoder.configureProvider).\n[Run a task](command:localCoder.run) \u00b7 [Plan](command:localCoder.plan)\n[Security](command:localCoder.security) \u00b7 [Bug hunt](command:localCoder.bugs)\n[Red team](command:localCoder.redteam) \u00b7 [Engagement evidence](command:localCoder.engagementReport)"
       }
     ],
     "menus": {
@@ -132,6 +145,14 @@
         {
           "command": "localCoder.activity",
           "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.redteam",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.engagementReport",
+          "when": "view == localCoder.tasks"
         }
       ]
     },
@@ -143,6 +164,12 @@
           "default": "",
           "scope": "application",
           "description": "Absolute path to the trusted local-coder-engine executable. Set in user settings only."
+        },
+        "localCoder.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Automatically install validated Local Coder IDE fork releases from everett6/LocalCodingAgent. Linux x64 only. Restart to activate. Retains the previous installation."
         }
       }
     },

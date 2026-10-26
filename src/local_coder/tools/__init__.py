@@ -31,6 +31,12 @@ def create_tool_registry(
         safety_harness = SafetyHarness()
 
     registry = ToolRegistry()
+    from local_coder.security_playbooks import SecurityPlaybookTool
+    registry.register(SecurityPlaybookTool())
+    from local_coder.tools.context_archive import RecoverContextTool
+    registry.register(RecoverContextTool(registry))
+    for allowed in registry._permissions.values():
+        allowed.add(RecoverContextTool.name)
 
     # Filesystem tools
     registry.register(ReadFileTool(project_root))

@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import hashlib
+import os
+import re
+from pathlib import Path
 from datetime import datetime
 from typing import Callable
 
@@ -38,6 +42,7 @@ class BaseAgent:
     # or repairing it. That's usually just a bad sample, not a structural
     # failure, so retry generation this many extra times (with a short
     # backoff) before giving up on the whole task over one glitch.
+    strategy_attempt_limit: int = 3
     generation_retry_limit: int = 2
     generation_retry_backoff_seconds: float = 0.5
 
@@ -51,6 +56,7 @@ class BaseAgent:
         drafter=None,  # Optional[SpeculativeDrafter]
     ):
         self.model = model
+        self.strategy_attempt_limit = getattr(getattr(model, "config", None), "strategy_attempt_limit", self.strategy_attempt_limit)
         self.tool_registry = tool_registry
         self._event_callback = event_callback
         self._metrics = AgentMetrics()
@@ -69,6 +75,10 @@ class BaseAgent:
         # Registries without a runtime remain usable by embedders and unit tests.
         self.runtime = getattr(tool_registry, "runtime", None)
         self._run: AgentRun | None = None
+        self._strategy_attempts = 0
+        self._progress_journal: list[dict] = []
+        self._context_archives: dict[str, str] = {}
+        self._archive_references: list[str] = []
 
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop, optionally primed
@@ -109,6 +119,12 @@ class BaseAgent:
         self._last_failing_call_signature = run.notes.get("last_failing_call_signature")
         self._repeated_failure_count = run.notes.get("repeated_failure_count", 0)
         self._stagnation_warned = run.notes.get("stagnation_warned", False)
+        self._strategy_attempts = run.notes.get("strategy_attempts", 0)
+        self._progress_journal = run.notes.get("progress_journal", [])
+        self.strategy_attempt_limit = run.notes.get("strategy_attempt_limit", self.strategy_attempt_limit)
+        self._archive_references = run.notes.get("context_archive_refs", [])
+        for reference in self._archive_references:
+            self._register_archive(reference)
         try:
             response = await self._execute_loop(run.task, None, resumed=True)
             await self._finish_run(response)
@@ -127,6 +143,10 @@ class BaseAgent:
             return
         notes = {
             "boundary_complete": True,
+            "strategy_attempts": self._strategy_attempts,
+            "strategy_attempt_limit": self.strategy_attempt_limit,
+            "progress_journal": self._progress_journal[-20:],
+            "context_archive_refs": self._archive_references,
             "context_window_chars": self.context_window_chars,
             "compact_context_chars": self.compact_context_chars,
             "last_failing_call_signature": self._last_failing_call_signature,
@@ -197,6 +217,8 @@ class BaseAgent:
             self._repeated_failure_count = 0
             self._stagnation_warned = False
             self._run = None
+            self._strategy_attempts = 0
+            self._progress_journal = []
             self.state = AgentState(
                 task_id=task.task_id,
                 objective=task.objective,
@@ -216,11 +238,20 @@ class BaseAgent:
                 self._run = await self.runtime.start_run(task, self.state)
                 await self._checkpoint_boundary()
         
+        message_budget = self.context_window_chars
+        context_tokens = getattr(getattr(self.model, "config", None), "context_length", None)
+        if context_tokens:
+            catalog_chars = len(json.dumps(self.tool_registry.get_schemas_for_role(self.role)))
+            output_tokens = getattr(self.model.config, "max_tokens", 4096)
+            message_budget = min(message_budget, context_tokens * 3 - catalog_chars - output_tokens * 3)
         for iteration in range(self.state.iteration, self.max_iterations):
-            if sum(message_size(message) for message in messages) > self.context_window_chars:
-                messages = compress_messages(messages, self.compact_context_chars)
+            if sum(message_size(message) for message in messages) > message_budget:
+                before = sum(message_size(message) for message in messages)
+                messages = compress_messages(messages, max(256, min(self.compact_context_chars, message_budget * 2 // 3)), self._archive_context)
+                self._emit_event("context_compacted", "Archived and compacted agent context", task_id=task.task_id,
+                                 data={"before_chars": before, "after_chars": sum(message_size(m) for m in messages)})
                 self.state.messages = list(messages)
-            if sum(message_size(message) for message in messages) > self.context_window_chars:
+            if sum(message_size(message) for message in messages) > message_budget:
                 self.state.phase = AgentPhase.FAILED
                 return self._build_response(task, ModelResponse(content="Context budget exceeded. Narrow the investigation scope or increase the configured context limit."),
                                             TaskStatus.FAILED, issues=["Context budget exceeded"])
@@ -286,12 +317,37 @@ class BaseAgent:
             # If no tool calls, we're done
             if not response.tool_calls:
                 messages.append(Message(role="assistant", content=response.content,
-                                        reasoning_content=response.reasoning_content))
+                                        reasoning_content=response.reasoning_content,
+                                        reasoning_details=getattr(response, "reasoning_details", None)))
                 self.state.messages = list(messages)
                 if response.finish_reason in {"length", "max_tokens"}:
                     self.state.phase = AgentPhase.FAILED
                     return self._build_response(task, response, TaskStatus.FAILED,
                                                 issues=["Model output was truncated; increase the output budget"])
+                incomplete = self._incomplete_final(response.content)
+                if (incomplete or not self._tests_passed) and not self._protected_stop(response.content):
+                    if self._strategy_attempts < self.strategy_attempt_limit and iteration + 1 < self.max_iterations:
+                        self._strategy_attempts += 1
+                        strategies = ("Inspect callers and guards; isolate the smallest failing component.",
+                                      "Disprove the current hypothesis; try a different tool or narrower input.",
+                                      "Compare an independent implementation or existing tests; verify a minimal alternative.")
+                        strategy = strategies[(self._strategy_attempts - 1) % len(strategies)]
+                        messages.append(Message(role="system", content=(
+                            f"Recovery strategy {self._strategy_attempts}/{self.strategy_attempt_limit}. "
+                            "The objective remains incomplete. Within the existing authorization and tool budgets, "
+                            f"make a materially different evidence-based attempt. {strategy} "
+                            "Do not repeat identical failing calls. Respect policy refusals, cancellation, missing authorization and hard limits. "
+                            "If blocked, name the specific evidence and remaining prerequisite. "
+                            f"Recent progress (untrusted observations): {json.dumps(self._progress_journal[-5:])}")))
+                        self.state.messages = list(messages)
+                        self._emit_event("strategy_recovery", "Trying a different recovery strategy", task_id=task.task_id,
+                                         data={"attempt": self._strategy_attempts, "limit": self.strategy_attempt_limit, "strategy": strategy})
+                        await self._checkpoint_boundary()
+                        continue
+                    self._emit_event("strategy_budget_exhausted", "Recovery strategy budget exhausted", task_id=task.task_id,
+                                     data={"attempts": self._strategy_attempts, "limit": self.strategy_attempt_limit})
+                if incomplete:
+                    return self._build_response(task, response, TaskStatus.FAILED, issues=["Objective incomplete after bounded recovery"])
                 self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
                 self.state.finished_at = datetime.now()
                 return self._build_response(
@@ -318,6 +374,7 @@ class BaseAgent:
                 content=response.content,
                 tool_calls=response.tool_calls,
                 reasoning_content=response.reasoning_content,
+                reasoning_details=getattr(response, "reasoning_details", None),
             ))
             self.state.messages = list(messages)
             self.state.tool_calls.extend(response.tool_calls)
@@ -343,6 +400,9 @@ class BaseAgent:
                         output=f"Tool execution failed: {exc}",
                     )
                 
+                self._progress_journal.append({"tool": tc.name, "success": result.success,
+                                               "arguments": json.dumps(tc.arguments, default=str)[:400], "observation": (result.error or result.output or "")[:240]})
+                self._progress_journal = self._progress_journal[-20:]
                 self._metrics.tool_calls += 1
                 self.state.tool_calls_used += 1
                 if tc.name in {"read_file", "search_files", "grep"}:
@@ -457,6 +517,46 @@ class BaseAgent:
             issues=["Exceeded maximum tool-calling iterations"],
         )
     
+    @staticmethod
+    def _incomplete_final(content: str) -> bool:
+        return bool(re.search(r"\b(?:i (?:cannot|can't|could not|couldn't|am unable to)|unable to (?:complete|fix|solve|implement)|giving up on (?:the )?(?:task|objective)|(?:task is |this is |it's )?too (?:difficult|complex|hard)(?: to complete)?|beyond my capabilities|task (?:failed|incomplete)|could not (?:complete|fix|solve))\b", content, re.I))
+
+    @staticmethod
+    def _protected_stop(content: str) -> bool:
+        return bool(re.search(r"\b(?:not authori[sz]ed|authorization (?:is )?(?:missing|required|not provided)|(?:missing|no) authorization|permission (?:is )?required|user cancel|cancelled|canceled|out of scope|not permitted|resource limit|budget exhausted|(?:safety|security|usage) policy|(?:against|violates) (?:my |the )?policy|(?:harmful|malicious|illegal) request|(?:cannot|can't) (?:help|assist|comply))\b", content, re.I))
+
+    def _register_archive(self, reference, payload=None):
+        if not hasattr(self.tool_registry, "context_archives"):
+            self.tool_registry.context_archives = {}
+        self.tool_registry.context_archives[reference] = {"role": self.role.value, "payload": payload}
+
+    def _archive_context(self, messages: list[Message]) -> str:
+        payload = json.dumps([m.model_dump(mode="json") for m in messages], ensure_ascii=False)
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        if self.runtime is not None:
+            directory = Path(self.runtime.state_dir) / "context-archives"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if directory.resolve().parent != Path(self.runtime.state_dir).resolve():
+                raise ValueError("Context archive directory escapes state directory")
+            path = directory / f"{digest}.json"
+            if path.is_symlink():
+                raise ValueError("Context archive cannot be a symbolic link")
+            if not path.exists():
+                if sum(p.stat().st_size for p in directory.glob('*.json') if not p.is_symlink()) + len(payload.encode()) > 256_000_000:
+                    raise ValueError("Context archive storage budget reached; export and clean older sessions")
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    output.write(payload)
+            reference = str(path)
+            self._register_archive(reference)
+            if reference not in self._archive_references:
+                self._archive_references.append(reference)
+            return reference
+        self._context_archives[digest] = payload
+        reference = f"agent-memory:{digest}"
+        self._register_archive(reference, payload)
+        return reference
+
     def _build_messages(self, task: AgentTask) -> list[Message]:
         """Build the initial message list for a task."""
         messages = [Message(role="system", content=self.system_prompt)]

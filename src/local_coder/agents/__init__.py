@@ -12,6 +12,7 @@ from local_coder.agents.tester import TesterAgent
 from local_coder.agents.reviewer import ReviewerAgent
 from local_coder.agents.security import SecurityAuditorAgent
 from local_coder.agents.bug_hunter import BugHunterAgent
+from local_coder.agents.red_team import RedTeamAgent
 
 
 def create_agent(
@@ -32,6 +33,7 @@ def create_agent(
         AgentRole.REVIEWER: ReviewerAgent,
         AgentRole.SECURITY: SecurityAuditorAgent,
         AgentRole.BUG_HUNTER: BugHunterAgent,
+        AgentRole.RED_TEAM: RedTeamAgent,
     }
     
     agent_cls = agent_map.get(role)
@@ -50,5 +52,6 @@ __all__ = [
     "ReviewerAgent",
     "SecurityAuditorAgent",
     "BugHunterAgent",
+    "RedTeamAgent",
     "create_agent",
 ]

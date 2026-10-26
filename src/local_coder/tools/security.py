@@ -88,7 +88,7 @@ class RunSASTTool(Tool):
                 "engine": "builtin-sast",
                 "scanned_path": str(scan_target.relative_to(self.project_root)),
                 "total_findings": len(findings),
-                "findings": [dict(f, confidence="heuristic", verification="unverified") for f in findings],
+                "findings": [dict({"confidence": "heuristic", "verification": "unverified"}, **f) for f in findings],
                 "coverage": coverage,
             }
 
@@ -214,118 +214,14 @@ class RunSASTTool(Tool):
         try:
             rel_path = str(file_path.relative_to(self.project_root))
             content = file_path.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(content, filename=str(file_path))
+            ast.parse(content, filename=str(file_path))
         except (OSError, UnicodeError, SyntaxError, ValueError) as exc:
             coverage["skipped"].append(f"{file_path.name}: {type(exc).__name__}")
             coverage["status"] = "partial"
             return findings
 
-        lines = content.splitlines()
-
-        class SecurityVisitor(ast.NodeVisitor):
-            def visit_Call(this, node: ast.Call):
-                func_name = ""
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    func_name = node.func.attr
-
-                # Rule 1: eval() / exec()
-                if func_name in ("eval", "exec"):
-                    findings.append({
-                        "file": rel_path,
-                        "line": node.lineno,
-                        "severity": "CRITICAL",
-                        "rule_id": "SEC-PY-CODE-EXEC",
-                        "message": f"Dangerous dynamic code execution with '{func_name}()'",
-                        "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                    })
-
-                # Rule 2: os.system
-                elif func_name == "system" and isinstance(node.func, ast.Attribute):
-                    findings.append({
-                        "file": rel_path,
-                        "line": node.lineno,
-                        "severity": "HIGH",
-                        "rule_id": "SEC-PY-OS-SYSTEM",
-                        "message": "Direct OS command execution using os.system(); potential command injection sink",
-                        "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                    })
-
-                # Rule 3: subprocess shell=True
-                elif func_name in ("Popen", "run", "call", "check_output", "check_call"):
-                    for kw in node.keywords:
-                        if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                            findings.append({
-                                "file": rel_path,
-                                "line": node.lineno,
-                                "severity": "HIGH",
-                                "rule_id": "SEC-PY-SUBPROCESS-SHELL",
-                                "message": f"subprocess.{func_name}() with shell=True invites shell command injection",
-                                "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                            })
-
-                # Rule 4: SQL string formatting in execute()
-                elif func_name in ("execute", "executemany"):
-                    if node.args:
-                        first_arg = node.args[0]
-                        # check for formatted string f"SELECT ... {param}" or % formatting or binary '+'
-                        if isinstance(first_arg, ast.JoinedStr) or isinstance(first_arg, ast.BinOp):
-                            findings.append({
-                                "file": rel_path,
-                                "line": node.lineno,
-                                "severity": "CRITICAL",
-                                "rule_id": "SEC-PY-SQL-INJECTION",
-                                "message": "SQL query constructed via string formatting/concatenation; use parameterized queries",
-                                "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                            })
-
-                # Rule 5: Insecure deserialization
-                elif func_name in ("loads", "load"):
-                    mod_name = ""
-                    if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                        mod_name = node.func.value.id
-                    if mod_name == "pickle":
-                        findings.append({
-                            "file": rel_path,
-                            "line": node.lineno,
-                            "severity": "HIGH",
-                            "rule_id": "SEC-PY-PICKLE-INSECURE",
-                            "message": "pickle deserialization of untrusted input can lead to arbitrary code execution",
-                            "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                        })
-                    elif mod_name == "yaml":
-                        # check if Loader parameter is SafeLoader
-                        has_safeloader = any(
-                            (getattr(kw.value, "id", "") or getattr(kw.value, "attr", "")) in ("SafeLoader", "CSafeLoader")
-                            for kw in node.keywords if kw.arg == "Loader"
-                        )
-                        if not has_safeloader:
-                            findings.append({
-                                "file": rel_path,
-                                "line": node.lineno,
-                                "severity": "MEDIUM",
-                                "rule_id": "SEC-PY-YAML-UNSAFE",
-                                "message": "yaml.load() without SafeLoader is vulnerable to arbitrary code execution",
-                                "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                            })
-
-                # Rule 6: Insecure md5/sha1 for password hashing
-                elif func_name in ("md5", "sha1"):
-                    if isinstance(node.func, ast.Attribute) and getattr(node.func.value, "id", "") == "hashlib":
-                        findings.append({
-                            "file": rel_path,
-                            "line": node.lineno,
-                            "severity": "LOW",
-                            "rule_id": "SEC-PY-WEAK-HASH",
-                            "message": f"Weak cryptographic hash hashlib.{func_name}(); use sha256 or bcrypt/argon2 for passwords",
-                            "code": lines[node.lineno - 1].strip() if node.lineno <= len(lines) else "",
-                        })
-
-                this.generic_visit(node)
-
-        SecurityVisitor().visit(tree)
-        return findings
+        from local_coder.tools.detection import python_candidates
+        return python_candidates(content, rel_path)
 
     def _scan_js_file(self, file_path: Path) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
@@ -335,7 +231,19 @@ class RunSASTTool(Tool):
         except Exception:
             return findings
 
+        in_block_comment = False
         for i, line in enumerate(content.splitlines(), start=1):
+            # A lexical fallback, not a JavaScript parser. Ignore standalone
+            # comments and report the remaining syntax limitations explicitly.
+            stripped = line.strip()
+            if in_block_comment:
+                in_block_comment = "*/" not in stripped
+                continue
+            if stripped.startswith("/*"):
+                in_block_comment = "*/" not in stripped
+                continue
+            if stripped.startswith("//"):
+                continue
             if re.search(r"\beval\s*\(", line):
                 findings.append({
                     "file": rel_path,
@@ -345,7 +253,7 @@ class RunSASTTool(Tool):
                     "message": "Use of eval() introduces arbitrary script execution risks",
                     "code": line.strip(),
                 })
-            elif re.search(r"\.innerHTML\s*=", line):
+            elif re.search(r"\.innerHTML\s*=", line) and not re.search(r"=\s*(?:DOMPurify\.sanitize\(|[\"\'])", line):
                 findings.append({
                     "file": rel_path,
                     "line": i,
@@ -364,6 +272,12 @@ class RunSASTTool(Tool):
                     "code": line.strip(),
                 })
 
+        for finding in findings:
+            finding.update({"verification": "unverified", "confidence": "heuristic",
+                            "sink": {"line": finding["line"], "code": finding["code"]},
+                            "source_trace": [], "guards": [],
+                            "preconditions": ["Attacker-controlled input reaches the sink", "Relevant guards do not enforce safety"],
+                            "coverage_limits": ["lexical JavaScript scan; no parser/dataflow", "caller and guards require manual inspection", "no code executed"]})
         return findings
 
     def _format_findings_markdown(self, summary: dict[str, Any]) -> str:
@@ -390,6 +304,10 @@ class RunSASTTool(Tool):
         for idx, f in enumerate(findings[:15], start=1):
             md.append(f"\n**{idx}. [{f.get('severity')}] {f.get('rule_id')}** in `{f.get('file')}:{f.get('line')}`")
             md.append(f"> {f.get('message')}")
+            if f.get("sink"):
+                evidence = {key: f[key] for key in ("source_trace", "sink", "function", "callers", "guards", "decorators", "preconditions", "coverage_limits") if key in f}
+                md.append("Static evidence (untrusted; reachability and guard efficacy require review):")
+                md.append("```json\n" + json.dumps(evidence, ensure_ascii=False) + "\n```")
             if f.get("code"):
                 md.append(f"```\n{f.get('code')}\n```")
 

@@ -19,6 +19,7 @@ class AgentRole(str, enum.Enum):
     REVIEWER = "reviewer"
     SECURITY = "security"
     BUG_HUNTER = "bug_hunter"
+    RED_TEAM = "red_team"
 
 
 class SafetyTier(str, enum.Enum):
@@ -31,9 +32,10 @@ class SafetyTier(str, enum.Enum):
 
 
 class AgentMode(str, enum.Enum):
-    """3 operating modes for the agent harness."""
+    """Operating modes for the agent harness."""
     CODING = "coding"                    # Feature development, refactoring, implementation
     CYBERSECURITY = "cybersecurity"      # AppSec auditing, taint tracking, secret & config scanning
+    RED_TEAM = "red_team"                # Scoped adversary simulation and evidence-led engagements
     BUG_HUNTING = "bug_hunting"          # Edge cases, race conditions, logic flaws, regression testing
 
 
@@ -87,6 +89,13 @@ class ToolName(str, enum.Enum):
     AUDIT_DEPENDENCIES = "audit_dependencies"
     AUDIT_CONFIG = "audit_config"
     RUN_BUG_SCAN = "run_bug_scan"
+    REDTEAM_WORKSPACE = "redteam_workspace"
+    REDTEAM_HTTP = "redteam_http_check"
+    REDTEAM_FINDING = "redteam_record_finding"
+    REDTEAM_WORKFLOW = "redteam_workflow"
+    REDTEAM_IMPORT = "redteam_import_findings"
+    SECURITY_PLAYBOOK = "security_playbook"
+    RECOVER_CONTEXT = "recover_context"
 
 
 # === Messages ===
@@ -99,6 +108,7 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     name: str | None = None
     reasoning_content: str | None = Field(default=None, repr=False)
+    reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
 
 
 class ToolCall(BaseModel):
@@ -133,6 +143,7 @@ class ModelResponse(BaseModel):
     latency_ms: float = 0.0
     model: str = ""
     reasoning_content: str | None = Field(default=None, repr=False)
+    reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
 
 
 class ModelConfig(BaseModel):
@@ -143,13 +154,14 @@ class ModelConfig(BaseModel):
     base_url: str = "http://localhost:11434"  # Default Ollama URL
     context_length: int = 8192
     temperature: float = 0.2
+    strategy_attempt_limit: int = Field(default=3, ge=1, le=10)
     max_tokens: int = 4096
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     api_key_env: str | None = None
-    profile: Literal["generic", "glm53", "qwen38"] = "generic"
+    profile: Literal["generic", "glm53", "qwen38", "openrouter_deepseek", "openrouter_glm", "openrouter_kimi"] = "generic"
 
     def resolve_api_key(self) -> str | None:
         import os
@@ -177,6 +189,7 @@ class AgentTask(BaseModel):
     max_retries: int = 3
     timeout_seconds: int = 300
     model_name: str | None = None
+    engagement_id: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
 
 

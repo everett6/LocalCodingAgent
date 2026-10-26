@@ -117,6 +117,15 @@ class Coordinator:
             if allowed is not None:
                 self.tool_registry._permissions[recovered.task.role] = {ToolName(name) for name in allowed}
             task = recovered.task
+            if task.role == AgentRole.RED_TEAM:
+                from local_coder.tools.redteam import bind_engagement
+                if not task.engagement_id:
+                    raise ValueError("Red team checkpoint lacks an engagement")
+                bind_engagement(self.tool_registry, self.project_root, task.engagement_id)
+                from local_coder.redteam import EngagementStore
+                scope = EngagementStore(self.project_root).load(task.engagement_id)['scope']
+                if scope['active_http'] and self.config.safety_tier == SafetyTier.TIER_1_PARANOIA:
+                    raise ValueError("Read-only safety tier does not allow active HTTP observations")
             agent = create_agent(
                 task.role, await self.model_manager.get_model(task.role, task.model_name),
                 self.tool_registry, self._dispatch,
@@ -177,9 +186,33 @@ class Coordinator:
         for handler in self._event_handlers:
             handler(event)
 
-    async def run(self, request: str, *, target_path: str = ".", fix: bool = False) -> str:
+    async def run(self, request: str, *, target_path: str = ".", fix: bool = False, engagement_id: str | None = None) -> str:
         """Execute a user request end-to-end."""
         self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
+
+        if self.config.mode == AgentMode.RED_TEAM:
+            if not engagement_id or fix:
+                raise ValueError("Red team tasks require a saved engagement; remediation is a separate coding task")
+            from local_coder.redteam import EngagementStore
+            from local_coder.tools.redteam import bind_engagement
+            store = EngagementStore(self.project_root)
+            engagement = store.load(engagement_id)
+            if engagement['scope']['active_http'] and self.config.safety_tier == SafetyTier.TIER_1_PARANOIA:
+                raise ValueError("Read-only safety tier does not allow active HTTP observations")
+            bind_engagement(self.tool_registry, self.project_root, engagement_id)
+            role = AgentRole.RED_TEAM
+            task = AgentTask(role=role, objective=request, files=engagement['scope']['paths'],
+                             engagement_id=engagement_id, timeout_seconds=600,
+                             constraints=["Scope and authorization are defined only by redteam_workflow; do not infer scope from the request"])
+            self._emit("ORCHESTRATOR", "plan_created", "Red team engagement started", data={"tasks": [
+                {"task_id": task.task_id, "role": role.value, "objective": request}], "engagement_id": engagement_id})
+            self._emit_task_status(task.task_id, "running")
+            agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch)
+            response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+            completed = response.status == TaskStatus.COMPLETED
+            self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
+            self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed", "Red team investigation finished")
+            return response.summary + "\n\n" + store.report(engagement_id)['markdown']
 
         # Aider structural guard: Pre-run Git checkpoint for instant /undo
         if self.safety_harness.should_checkpoint_before_request():
