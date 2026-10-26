@@ -110,6 +110,7 @@ class _LSPClient:
         self.capabilities: dict[str, Any] = {}
         self.documents: dict[str, tuple[int, str]] = {}
         self.counter = 0
+        self.diagnostics: dict[str, tuple[int, list]] = {}
 
     async def send(self, payload: dict) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -145,6 +146,14 @@ class _LSPClient:
         for _ in range(256):
             message = await self._read()
             if "method" in message:
+                if message["method"] == "textDocument/publishDiagnostics" and "id" not in message:
+                    notification = message.get("params")
+                    if isinstance(notification, dict):
+                        uri, version = notification.get("uri"), notification.get("version")
+                        document = self.documents.get(uri) if isinstance(uri, str) else None
+                        items = notification.get("diagnostics")
+                        if document and type(version) is int and version == document[0] and isinstance(items, list):
+                            self.diagnostics[uri] = (version, items[:50])
                 if "id" in message:
                     # Servers cannot ask this client to run commands or mutate files.
                     if message["method"] == "workspace/configuration":
@@ -189,7 +198,9 @@ class _LSPClient:
             "clientInfo": {"name": "local-coder-readonly"},
             "capabilities": {"general": {"positionEncodings": ["utf-16"]},
                 "workspace": {"applyEdit": False, "configuration": False},
-                "textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": True}}},
+                "textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                    "diagnostic": {"dynamicRegistration": False, "relatedDocumentSupport": False},
+                    "publishDiagnostics": {"versionSupport": True}}},
         })
         if not isinstance(result, dict) or not isinstance(result.get("capabilities"), dict):
             await self.close()
@@ -206,6 +217,7 @@ class _LSPClient:
         if previous and previous[1] == text:
             return previous[0]
         version = previous[0] + 1 if previous else 1
+        self.diagnostics.pop(uri, None)
         if previous:
             sync = self.capabilities.get("textDocumentSync", 0)
             change = sync.get("change", 0) if isinstance(sync, dict) else sync
@@ -223,6 +235,7 @@ class _LSPClient:
     async def close(self) -> None:
         process, self.process = self.process, None
         self.documents.clear()
+        self.diagnostics.clear()
         if process:
             await terminate_tree(process)
 
@@ -449,6 +462,32 @@ class LanguageService:
             return str(value.get("value", "")) if isinstance(value, dict) else ""
         return "\n".join(render(value) for value in contents)[:2000] if isinstance(contents, list) else render(contents)[:2000]
 
+    @staticmethod
+    def _diagnostics(items, text: str) -> list[dict]:
+        """Bound and validate server evidence; never follow related document links."""
+        if not isinstance(items, list):
+            return []
+        result = []
+        lines = _lines(text)
+        for item in items[:50]:
+            if not isinstance(item, dict) or not isinstance(item.get("message"), str):
+                continue
+            span = item.get("range")
+            start = span.get("start") if isinstance(span, dict) else None
+            if not isinstance(start, dict):
+                continue
+            line, character = start.get("line"), start.get("character")
+            severity = item.get("severity", 1)
+            if (type(line) is not int or not 0 <= line < len(lines)
+                    or type(character) is not int or character < 0
+                    or type(severity) is not int or severity not in {1, 2, 3, 4}):
+                continue
+            result.append({"line": line + 1, "character": _unicode_character(text, line + 1, character),
+                           "severity": severity, "message": re.sub(r"[\x00-\x1f\x7f]", " ", item["message"])[:1000],
+                           "source": item.get("source", "")[:100] if isinstance(item.get("source", ""), str) else "",
+                           "provider": "lsp"})
+        return result
+
     async def context(self, path: str | Path, line: int = 1, character: int = 0,
                       query: str | None = None, char_budget: int = 4000) -> dict:
         full = self._path(path)
@@ -459,8 +498,8 @@ class LanguageService:
         budget = max(128, min(int(char_budget), 16000))
         symbols = self.syntax_symbols(full)
         result = {"path": full.relative_to(self.project_root).as_posix(), "language": adapter.language if adapter else "unknown",
-                  "symbols": symbols, "definitions": [], "references": [], "hover": "", "providers": sorted({s["provider"] for s in symbols}),
-                  "availability": {"semantic": False, "parser": "python-ast" if adapter and adapter.language == "python" else None}}
+                  "symbols": symbols, "definitions": [], "references": [], "diagnostics": [], "hover": "", "providers": sorted({s["provider"] for s in symbols}),
+                  "availability": {"semantic": False, "diagnostics": "unavailable", "parser": "python-ast" if adapter and adapter.language == "python" else None}}
         if adapter:
             lock = self._locks.setdefault(adapter.language, asyncio.Lock())
             async with lock:
@@ -490,6 +529,21 @@ class LanguageService:
                                 arguments["context"] = {"includeDeclaration": True}
                             raw = await client.request(f"textDocument/{method}", arguments)
                             result[key] = self._symbols(raw, full) if key == "symbols" else self._hover(raw) if key == "hover" else self._locations(raw)
+                        diagnostic_provider = client.capabilities.get("diagnosticProvider")
+                        if diagnostic_provider is not None and diagnostic_provider is not False:
+                            raw = await client.request("textDocument/diagnostic", {"textDocument": params["textDocument"]})
+                            if not isinstance(raw, dict) or raw.get("kind") != "full" or not isinstance(raw.get("items"), list):
+                                raise ValueError("Expected a full LSP diagnostic report")
+                            result["diagnostics"] = self._diagnostics(raw["items"], text)
+                            result["availability"]["diagnostics"] = "pull"
+                        else:
+                            published = client.diagnostics.get(full.as_uri())
+                            if published and published[0] == result["version"]:
+                                result["diagnostics"] = self._diagnostics(published[1], text)
+                                result["availability"]["diagnostics"] = "versioned-push"
+                        if self._read(full) != text:
+                            result["diagnostics"] = []
+                            result["availability"]["diagnostics"] = "stale-source"
                         result["providers"] = sorted(set(result["providers"]) | {"lsp"})
                         result["availability"]["semantic"] = any(client.capabilities.get(k) is not None and client.capabilities.get(k) is not False for k in ("definitionProvider", "referencesProvider", "hoverProvider"))
                         self._errors.pop(adapter.language, None)
@@ -500,6 +554,8 @@ class LanguageService:
                 except (OSError, ValueError, TypeError, UnicodeError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
                     if client:
                         await client.close()
+                    result["diagnostics"] = []
+                    result["availability"]["diagnostics"] = "unavailable"
                     self._errors[adapter.language] = f"LSP unavailable: {type(exc).__name__}"
                 if adapter.language in self._errors:
                     result["availability"]["error"] = self._errors[adapter.language]
@@ -513,7 +569,9 @@ class LanguageService:
         title = f"Language context: {result['path']} ({result['language']})\n"
         if not result["availability"]["semantic"]:
             title += "Semantic context unavailable; showing bounded fallback context.\n"
-        rows = [f"{s['line']}: {s['name']} [{s['provider']}]" for s in result["symbols"][:40]]
+        rows = [f"Diagnostics: {result['availability']['diagnostics']} ({len(result['diagnostics'])} reported; capped at 50)"]
+        rows.extend(f"diagnostic: {d['line']}:{d['character']} severity={d['severity']} {d['message']}" for d in result["diagnostics"])
+        rows.extend(f"{s['line']}: {s['name']} [{s['provider']}]" for s in result["symbols"][:40])
         for key in ("definitions", "references"):
             rows.extend(f"{key}: {s['path']}:{s['line']}:{s['character']}" for s in result[key][:20])
         result["text"] = (title + "\n".join(rows) + "\n" + result["hover"] + "\n" + excerpt)[:budget]

@@ -886,9 +886,23 @@ class Coordinator:
         return report
         
     async def plan_only(self, request: str) -> str:
-        """Plan without executing."""
-        exploration = await self._explore(request)
-        plan = await self._plan(request, exploration)
+        """Plan with project-read tools only; restore permissions on every exit."""
+        read_tools = {
+            ToolName.READ_FILE, ToolName.LIST_FILES, ToolName.SEARCH_FILES,
+            ToolName.GREP, ToolName.CODE_SEARCH, ToolName.REPO_MAP,
+            ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
+            ToolName.LANGUAGE_CONTEXT, ToolName.MEMORY_SEARCH,
+        }
+        permissions = self.tool_registry._permissions
+        saved = {role: set(allowed) for role, allowed in permissions.items()}
+        try:
+            for role in permissions:
+                permissions[role] = permissions[role] & read_tools
+            exploration = await self._explore(request)
+            plan = await self._plan(request, exploration)
+        finally:
+            permissions.clear()
+            permissions.update(saved)
         self._emit(
             "ORCHESTRATOR", "plan_created", f"Plan: {len(plan.tasks)} task(s)",
             data={"tasks": [
@@ -896,7 +910,16 @@ class Coordinator:
                 for t in plan.tasks
             ]},
         )
-        return f"Plan created: {plan.plan_id} with {len(plan.tasks)} tasks."
+        lines = [f"Plan created: {plan.plan_id} with {len(plan.tasks)} tasks.",
+                 "Project mutations and command execution were disabled during planning."]
+        for index, task in enumerate(plan.tasks, 1):
+            lines.append(f"\n{index}. [{task.role.value}] {task.objective} (task {task.task_id})")
+            for label, values in (("Files", task.files), ("Dependencies", task.depends_on),
+                                  ("Constraints", task.constraints), ("Verification", task.success_criteria)):
+                if values:
+                    lines.append(f"   {label}: " + "; ".join(values))
+        lines.append("\nReview this proposal before starting execution. This planning call does not execute it.")
+        return "\n".join(lines)
     
     async def review_changes(self) -> str:
         """Review current uncommitted changes."""
