@@ -8,6 +8,8 @@ from typing import Any
 
 from local_coder.types import ToolResult, ToolName, AgentRole, ToolSettings
 from local_coder.workspace import Workspace
+from local_coder.orchestrator.blocked import AgentBlocked
+from local_coder.providers.quota import ProviderQuotaExhausted
 
 # Tools that write files, keyed by the argument holding the target path.
 FILE_WRITING_TOOLS = {ToolName.WRITE_FILE: "path", ToolName.EDIT_FILE: "path"}
@@ -374,6 +376,8 @@ class ToolRegistry:
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)
             return result
+        except (AgentBlocked, ProviderQuotaExhausted):
+            raise
         except Exception as e:
             return ToolResult(
                 success=False, 

@@ -93,6 +93,8 @@ class ToolName(str, enum.Enum):
     RUN_SAST = "run_sast"
     AUDIT_DEPENDENCIES = "audit_dependencies"
     AUDIT_CONFIG = "audit_config"
+    ADVANCED_AUDIT = "advanced_audit"
+    DEPENDENCY_INTELLIGENCE = "dependency_intelligence"
     RUN_BUG_SCAN = "run_bug_scan"
     REDTEAM_WORKSPACE = "redteam_workspace"
     REDTEAM_HTTP = "redteam_http_check"

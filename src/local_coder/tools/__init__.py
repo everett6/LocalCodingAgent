@@ -122,6 +122,12 @@ def create_tool_registry(
     registry.register(BuildTool(project_root))
 
     # Security & Audit tools
+    from local_coder.tools.advanced_audit import AdvancedAuditTool
+    from local_coder.tools.dependency_intelligence import DependencyIntelligenceTool
+    registry.register(AdvancedAuditTool(project_root))
+    registry.register(DependencyIntelligenceTool(project_root))
+    for role in (AgentRole.SECURITY, AgentRole.BUG_HUNTER, AgentRole.REVIEWER, AgentRole.EXPLORER):
+        registry._permissions[role].update({ToolName.ADVANCED_AUDIT, ToolName.DEPENDENCY_INTELLIGENCE})
     registry.register(RunSASTTool(project_root))
     registry.register(AuditDependenciesTool(project_root))
     registry.register(AuditConfigTool(project_root))

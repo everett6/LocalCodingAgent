@@ -13,10 +13,12 @@ from local_coder.types import AgentEvent, AgentMode, ModelBackend, ModelConfig
 from local_coder.workspace import Workspace
 from local_coder.harness_api import HarnessAPI
 from local_coder.provider_api import ProviderAPI
+from local_coder.research_api import ResearchAPI, ResearchRequestError
 from local_coder.providers.quota import ProviderQuotaExhausted
+from local_coder.orchestrator.blocked import AgentBlocked
 
 
-class WorkbenchAPI(HarnessAPI, ProviderAPI):
+class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
     def _init_workbench(self):
         from local_coder.redteam import EngagementStore
         self.engagements = EngagementStore(self.project_root)
@@ -255,6 +257,10 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                 self.sessions.save(session_id, status="cancelled", result="Task stopped. Review the workspace for partial changes.",
                                    checkpoint=job.get("checkpoint"), events=job.get("events", []))
                 self._event(AgentEvent(source="SERVER", event_type="job_cancelled", message="Task stopped"))
+            except AgentBlocked as exc:
+                self.sessions.save(session_id, status="blocked", result=self._redact(exc.response.summary),
+                                   error=str(exc), checkpoint=job.get("checkpoint"), events=job.get("events", []))
+                self._event(AgentEvent(source="SERVER", event_type="job_blocked", message=str(exc)))
             except ProviderQuotaExhausted as exc:
                 self.sessions.save(session_id, status="quota_exhausted", error=str(exc), quota_notice=exc.notice,
                                    checkpoint=job.get("checkpoint"), events=job.get("events", []))
@@ -277,6 +283,9 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            handled, payload = self._research_get(path, query) if method == "GET" else self._research_post(path, body) if method == "POST" else (False, None)
+            if handled:
+                return 200, payload
             handled, payload = self._provider_get(path, query) if method == "GET" else self._provider_post(path, body) if method == "POST" else (False, None)
             if handled:
                 return 200, payload
@@ -402,6 +411,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             if method == "GET" and path == "/diff":
                 from local_coder.remote import _git
                 return 200, {"diff": _git(self.project_root, "diff", "HEAD", "--", ".", ":(exclude).local-coder/**")[:500000]}
+        except ResearchRequestError as exc:
+            return 400, {"error": str(exc)}
         except (ValueError, TypeError, OSError, UnicodeError):
             return 400, {"error": "Invalid request or path. Check the provider URL, model and selected workspace."}
         return None

@@ -59,6 +59,18 @@ def message_chars(messages: list[Message]) -> int:
     return sum(len(message.content) for message in messages)
 
 
+def sliding_tool_output_budget(max_chars: int, max_lines: int, depth: float) -> tuple[int, int]:
+    """Shrink new output as context fills; configured ceilings never increase.
+
+    Depth is a conservative observation from provider usage or serialized
+    history size, not a claim to possess the model's exact tokenizer.
+    """
+    depth = max(0.0, min(1.0, depth))
+    factor = 1.0 - .8 * depth
+    return (min(max_chars, max(64, int(max_chars * factor))),
+            min(max_lines, max(2, int(max_lines * factor))))
+
+
 def truncate_tool_output(
     text: str,
     max_chars: int,
@@ -232,41 +244,66 @@ def _tool_call_signatures(messages: list[Message]) -> dict[str, str]:
     return signatures
 
 
-def prune_tool_outputs(messages: list[Message], protect_chars: int) -> tuple[list[Message], int]:
+def prune_tool_outputs(messages: list[Message], protect_chars: int,
+                       outcomes: dict[str, bool] | None = None,
+                       target_chars: int | None = None,
+                       prune_recent_successes: bool = False) -> tuple[list[Message], int]:
     """Clear old tool results in place. Returns (messages, chars freed).
 
-    First, results of an idempotent call that was repeated identically
-    later are cleared anywhere in the history. Then, walking back from the
-    newest message, tool results beyond the first protect_chars of tool
-    output are cleared too. Message count, roles and tool_call ids are
-    untouched so the history stays well-formed.
+    Duplicate successful/unknown idempotent calls are replaced with a pointer
+    to the newer result; a failed repeat never supersedes prior evidence.
+    Older confirmed successes are then cleared before unknown or failed
+    outputs. If a target is supplied, stop once it fits. The engine may also
+    release recent confirmed successes before requesting a lossy summary.
+    Message count, assistant reasoning, arguments, roles and tool_call IDs
+    remain untouched so every tool batch stays well-formed.
     """
     signatures = _tool_call_signatures(messages)
+    outcomes = outcomes or {}
     seen_later: set[str] = set()
     protected = 0
     freed = 0
     result = list(messages)
+    candidates = []
     for index in range(len(result) - 1, -1, -1):
         message = result[index]
         if message.role != "tool" or message.content in {PRUNED_TOOL_OUTPUT, SUPERSEDED_TOOL_OUTPUT}:
             continue
         signature = signatures.get(message.tool_call_id or "")
+        outcome = outcomes.get(message.tool_call_id or "")
         replacement = None
-        if signature is not None and signature in seen_later:
+        if signature is not None and signature in seen_later and outcome is not False:
             replacement = SUPERSEDED_TOOL_OUTPUT
         elif protected + len(message.content) <= protect_chars:
             protected += len(message.content)
+            if prune_recent_successes and outcome is True:
+                candidates.append(index)
         else:
             # Once one result falls outside the window, everything older
             # does too, so later small ones can't sneak back in and leave
             # a patchwork the model has to reason around.
             protected = protect_chars + 1
-            replacement = PRUNED_TOOL_OUTPUT
-        if signature is not None:
+            candidates.append(index)
+        if signature is not None and outcome is not False:
             seen_later.add(signature)
         if replacement is not None and len(replacement) < len(message.content):
             freed += len(message.content) - len(replacement)
             result[index] = message.model_copy(update={"content": replacement})
+    # With a target, stop as soon as enough cheap evidence has been removed.
+    # Confirmed successes precede unknown results, failures last. Assistant
+    # reasoning, call arguments and every tool envelope stay byte-exact.
+    size = sum(message_size(message) for message in result)
+    priority = lambda index: (0 if outcomes.get(result[index].tool_call_id or "") is True
+                              else 2 if outcomes.get(result[index].tool_call_id or "") is False else 1, index)
+    for index in sorted(candidates, key=priority):
+        if target_chars is not None and size <= target_chars:
+            break
+        message = result[index]
+        if len(PRUNED_TOOL_OUTPUT) < len(message.content):
+            replacement = message.model_copy(update={"content": PRUNED_TOOL_OUTPUT})
+            freed += len(message.content) - len(replacement.content)
+            size -= message_size(message) - message_size(replacement)
+            result[index] = replacement
     return result, freed
 
 

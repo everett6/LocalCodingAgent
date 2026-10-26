@@ -32,6 +32,7 @@ from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
 from local_coder.verification.test_runner import detect_framework
 from local_coder.providers.quota import ProviderQuotaExhausted
+from local_coder.orchestrator.blocked import AgentBlocked
 
 
 class RunCheckpoint(Protocol):
@@ -136,6 +137,7 @@ class Coordinator:
                          constraints=["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate."])
         self._emit("ORCHESTRATOR", "subagent_started", f"Started scoped {child.value} leaf task", data={"task_id": task.task_id, "parent_task_id": current["task_id"]})
         response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+        self._raise_if_blocked(response)
         self._emit("ORCHESTRATOR", "subagent_finished", f"Leaf task {response.status.value}", data={"task_id": task.task_id})
         return {"success": response.status == TaskStatus.COMPLETED, "output": response.summary}
 
@@ -183,6 +185,7 @@ class Coordinator:
                 result = AgentResponse.model_validate(final["result"])
                 if result.task_id != recovered.task.task_id:
                     raise ValueError("Final result task identity mismatch")
+                self._raise_if_blocked(result)
                 return result
             recovered.validate_resume()
             await recovered.validate_pending_batch()
@@ -213,6 +216,7 @@ class Coordinator:
             self._emit_task_status(task.task_id, "running", "Resuming saved checkpoint")
             continuation = agent.resume(recovered, allow_model_change=True) if allow_model_change else agent.resume(recovered)
             response = await asyncio.wait_for(continuation, timeout=task.timeout_seconds)
+            self._raise_if_blocked(response)
             completed = response.status == TaskStatus.COMPLETED
             self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
             self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed",
@@ -237,6 +241,8 @@ class Coordinator:
             return None
         try:
             drafter_model = await self.model_manager.get_model("drafter")
+        except (ProviderQuotaExhausted, AgentBlocked):
+            raise
         except Exception:
             return None
         return SpeculativeDrafter(drafter_model, prompt_cache=self._prompt_cache)
@@ -253,6 +259,14 @@ class Coordinator:
             "ORCHESTRATOR", "task_status", f"{task_id}: {status}",
             data={"task_id": task_id, "status": status, "note": note},
         )
+
+    def _raise_if_blocked(self, response: AgentResponse) -> None:
+        """Keep a refusal terminal; never turn it into a plan or retry hint."""
+        if response.status == TaskStatus.BLOCKED:
+            self._emit_task_status(response.task_id, "blocked", response.summary[:200])
+            self._emit("ORCHESTRATOR", "task_blocked", "Agent stopped at an explicit refusal or authorization boundary",
+                       task_id=response.task_id, data={"task_id": response.task_id, "status": "blocked"})
+            raise AgentBlocked(response)
 
     def _dispatch(self, event: AgentEvent) -> None:
         """Forward an already-built AgentEvent to registered handlers.
@@ -300,6 +314,7 @@ class Coordinator:
             self._emit_task_status(task.task_id, "running")
             agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch)
             response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+            self._raise_if_blocked(response)
             completed = response.status == TaskStatus.COMPLETED
             self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
             self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed", "Red team investigation finished")
@@ -344,6 +359,7 @@ class Coordinator:
                     planning = await asyncio.wait_for(planner.execute(AgentTask(role=AgentRole.PLANNER,
                         objective="Plan milestones and acceptance checks. Delegate bounded source inspection to explorer agents when useful. Local bug investigation: " + objective,
                         files=[target_path])), timeout=300)
+                    self._raise_if_blocked(planning)
                 task = AgentTask(role=role, objective=objective, files=[target_path],
                                  constraints=["Apply minimal fixes and run local regression tests" if fix else
                                               "Read-only review: propose reproduction tests and patches; do not execute project code"])
@@ -353,6 +369,7 @@ class Coordinator:
                     {"task_id": task.task_id, "role": role.value, "objective": request}]})
                 self._emit_task_status(task.task_id, "running")
                 response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+                self._raise_if_blocked(response)
                 completed = response.status == TaskStatus.COMPLETED
                 self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
                 self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed",
@@ -391,6 +408,7 @@ class Coordinator:
                 checkpoint, "execute", lambda: self._execute_plan(plan, checkpoint), AgentResponse,
             )
 
+        self._raise_if_blocked(result)
         # Step 4: Review
         self._emit("ORCHESTRATOR", "phase", "Reviewing changes...")
         review = await self._resumable(checkpoint, "review", lambda: self._review(result))
@@ -401,6 +419,7 @@ class Coordinator:
         if self.config.verification.run_tests_after_changes:
             self._emit("ORCHESTRATOR", "phase", "Running tests...")
             test_result = await self._resumable(checkpoint, "tests.0", self._run_tests, AgentResponse)
+            self._raise_if_blocked(test_result)
 
             # Step 6: Fix loop
             fix_iterations = 0
@@ -413,6 +432,7 @@ class Coordinator:
                     lambda: self._fix_failures(test_result, escalate=fix_iterations > 0), AgentResponse,
                 )
                 fix_iterations += 1
+                self._raise_if_blocked(last_fix_result)
                 if last_fix_result.status == TaskStatus.FAILED:
                     self._emit(
                         "ORCHESTRATOR", "fix_loop_error",
@@ -422,6 +442,7 @@ class Coordinator:
                 test_result = await self._resumable(
                     checkpoint, f"tests.{fix_iterations}", self._run_tests, AgentResponse,
                 )
+                self._raise_if_blocked(test_result)
 
         # Step 7: Final report
         report = await self._generate_report(result, review, test_result, last_fix_result)
@@ -438,8 +459,13 @@ class Coordinator:
         saved = checkpoint.get(key) if checkpoint is not None else None
         if saved is not None:
             self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved '{key}' result from the session")
-            return model.model_validate(saved) if model is not None else saved
+            value = model.model_validate(saved) if model is not None else saved
+            if isinstance(value, AgentResponse):
+                self._raise_if_blocked(value)
+            return value
         value = await produce()
+        if isinstance(value, AgentResponse):
+            self._raise_if_blocked(value)
         if checkpoint is not None:
             checkpoint.put(key, value.model_dump(mode="json") if model is not None else value)
         return value
@@ -498,6 +524,7 @@ class Coordinator:
                 context=TaskContext(architecture=await self._repo_map(request)),
             )
             response = await explorer.execute(task)
+            self._raise_if_blocked(response)
             if self.config.agentic.session_cache:
                 save = getattr(model, "save_slot", None)
                 if save is not None:
@@ -514,6 +541,7 @@ class Coordinator:
                 context=TaskContext(architecture=await self._repo_map(request)),
             )
             response = await planner.execute(task)
+            self._raise_if_blocked(response)
             plan_data = response.summary
             
             try:
@@ -550,7 +578,7 @@ class Coordinator:
                 if not tasks:
                     raise ValueError("No tasks found in plan")
                 return TaskPlan(objective=request, tasks=tasks, notes=[plan_data])
-            except ProviderQuotaExhausted:
+            except (ProviderQuotaExhausted, AgentBlocked):
                 raise
             except Exception as e:
                 self._emit("ORCHESTRATOR", "plan_error", f"Failed to parse plan JSON: {e}")
@@ -592,6 +620,7 @@ class Coordinator:
             )
             self._emit_task_status(task.task_id, "running")
             response = await coder.execute(task)
+            self._raise_if_blocked(response)
             self._emit_task_status(task.task_id, "failed" if response.status == TaskStatus.FAILED else "completed", response.summary[:200])
             return response
         return AgentResponse(
@@ -615,7 +644,9 @@ class Coordinator:
             for task in plan.tasks:
                 saved = checkpoint.get(f"task.{task.task_id}")
                 if saved is not None:
-                    dag.mark_completed(task.task_id, AgentResponse.model_validate(saved))
+                    response = AgentResponse.model_validate(saved)
+                    self._raise_if_blocked(response)
+                    dag.mark_completed(task.task_id, response)
                     self._emit("ORCHESTRATOR", "phase_resumed", f"Reusing saved result for plan task {task.task_id}")
 
         validation_errors = dag.validate()
@@ -662,7 +693,7 @@ class Coordinator:
             running = [asyncio.create_task(self._run_dag_task(dag, task, semaphore, checkpoint)) for task in ready_tasks]
             try:
                 await asyncio.gather(*running)
-            except ProviderQuotaExhausted:
+            except BaseException:
                 for sibling in running:
                     if not sibling.done():
                         sibling.cancel()
@@ -710,14 +741,23 @@ class Coordinator:
         just failed, the task is rerun once on that model before it is
         recorded as failed."""
         async with semaphore:
-            response = await self._attempt_dag_task(task, escalate=False)
-            if self._failed(response) and self._can_escalate(task.role, task.model_name):
+            async def attempt(escalate):
+                try:
+                    return await self._attempt_dag_task(task, escalate=escalate)
+                except AgentBlocked as exc:
+                    dag.mark_failed(task.task_id, exc.response)
+                    self._raise_if_blocked(exc.response)
+            response = await attempt(False)
+            if response.status != TaskStatus.BLOCKED and self._failed(response) and self._can_escalate(task.role, task.model_name):
                 self._emit(
                     "ORCHESTRATOR", "escalate",
                     f"Retrying {task.task_id} on {self.config.routing.escalate_to} after: {response.summary[:200]}",
                     task_id=task.task_id,
                 )
-                response = await self._attempt_dag_task(task, escalate=True)
+                response = await attempt(True)
+            if response.status == TaskStatus.BLOCKED:
+                dag.mark_failed(task.task_id, response)
+                self._raise_if_blocked(response)
             if self._failed(response):
                 dag.mark_failed(task.task_id, response)
                 self._emit_task_status(task.task_id, "failed", response.summary[:200])
@@ -736,7 +776,7 @@ class Coordinator:
 
     @staticmethod
     def _failed(response: AgentResponse) -> bool:
-        return response.status == TaskStatus.FAILED or not response.tests_passed
+        return response.status in (TaskStatus.FAILED, TaskStatus.BLOCKED) or not response.tests_passed
 
     def _can_escalate(self, role: AgentRole, model_name: str | None = None) -> bool:
         """True when a retry would actually run on a different model."""
@@ -774,7 +814,7 @@ class Coordinator:
                 issues=[],
                 follow_up_required=False
             )
-        except ProviderQuotaExhausted:
+        except (ProviderQuotaExhausted, AgentBlocked):
             raise
         except Exception as e:
             return AgentResponse(
@@ -789,10 +829,12 @@ class Coordinator:
             )
 
     async def _review(self, result: AgentResponse) -> str:
+        self._raise_if_blocked(result)
         reviewer = create_agent(AgentRole.REVIEWER, await self.model_manager.get_model(AgentRole.REVIEWER), self.tool_registry, self._dispatch)
         if reviewer:
             task = AgentTask(role=AgentRole.REVIEWER, objective=f"Review result: {result.summary}")
             response = await reviewer.execute(task)
+            self._raise_if_blocked(response)
             return response.summary
         return "Fallback review: looks good."
 
@@ -817,6 +859,7 @@ class Coordinator:
         if tester:
             task = AgentTask(role=AgentRole.TESTER, objective="Run project tests")
             response = await tester.execute(task)
+            self._raise_if_blocked(response)
             return response
         return AgentResponse(
             task_id="test_run",
@@ -830,6 +873,7 @@ class Coordinator:
         )
         
     async def _fix_failures(self, test_result: AgentResponse, escalate: bool = False) -> AgentResponse:
+        self._raise_if_blocked(test_result)
         if escalate and self._can_escalate(AgentRole.DEBUGGER):
             self._emit("ORCHESTRATOR", "escalate", f"Escalating the fix to {self.config.routing.escalate_to}")
         debugger = create_agent(
@@ -852,6 +896,7 @@ class Coordinator:
                 context=TaskContext(error_context=test_result.summary),
             )
             response = await debugger.execute(task)
+            self._raise_if_blocked(response)
             return response
         return AgentResponse(
             task_id="fix_run",
@@ -871,6 +916,9 @@ class Coordinator:
         test_result: AgentResponse | None = None,
         last_fix_result: AgentResponse | None = None,
     ) -> str:
+        for response in (result, test_result, last_fix_result):
+            if response is not None:
+                self._raise_if_blocked(response)
         report = f"Final Report\n\nExecution Result:\n{result.summary}\n\nReview:\n{review}"
         if test_result is not None:
             status = "passed" if test_result.tests_passed else "failed"
@@ -977,6 +1025,7 @@ class Coordinator:
                 constraints=constraints,
                 context=context,
             ))
+            self._raise_if_blocked(response)
             report = response.summary
         else:
             notes = []
@@ -999,6 +1048,7 @@ class Coordinator:
                     constraints=constraints,
                     context=batch_context,
                 ))
+                self._raise_if_blocked(response)
                 notes.append(response.summary)
             ledger.load()
             report = render_ledger_report(ledger, len(batches), len(files), notes)
@@ -1054,6 +1104,7 @@ class Coordinator:
             response = await agent.execute(task)
         finally:
             self.tool_registry._permissions[AgentRole.REVIEWER] = allowed
+        self._raise_if_blocked(response)
         if response.status != TaskStatus.COMPLETED:
             raise ValueError("Independent review did not complete")
         raw = response.summary.strip()
@@ -1093,6 +1144,7 @@ class Coordinator:
             response = await agent.execute(AgentTask(role=AgentRole.EXPLOIT_VALIDATOR,
                 objective="Prepare regression for this untrusted finding data:\n" + json.dumps(row["finding"]),
                 files=[row["finding"]["path"]]))
+            self._raise_if_blocked(response)
             return response.summary
         finally:
             self.tool_registry._permissions[AgentRole.EXPLOIT_VALIDATOR] = allowed
@@ -1129,6 +1181,7 @@ class Coordinator:
             ],
         )
         response = await agent.execute(task)
+        self._raise_if_blocked(response)
         report = response.summary
         # A reproduced finding is worth remembering; queue it for review.
         confirmed = [
@@ -1147,6 +1200,7 @@ class Coordinator:
     async def run_tests_only(self) -> str:
         """Just run tests and report."""
         res = await self._run_tests()
+        self._raise_if_blocked(res)
         return res.summary
     
     async def get_status(self) -> str:

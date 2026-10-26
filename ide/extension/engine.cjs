@@ -44,6 +44,9 @@ function isAllowedEngineRequest(route, method) {
   const pathname = route.split('?')[0];
   if (!route.startsWith('/') || route.startsWith('//') || /%(2e|2f|5c|00)/i.test(pathname)) return false;
   try { if (new URL(route, 'http://127.0.0.1').pathname !== pathname) return false; } catch { return false; }
+
+  if(method==='GET'&&['/research/capabilities','/research/evidence','/research/report','/research/dependencies','/research/advisories','/memory/structure'].includes(pathname))return true;
+  if(method==='POST'&&['/research/audit','/research/sarif/import','/research/advisories/import'].includes(pathname))return true;
   if(method==='GET'&&['/providers/models','/providers/usage','/providers/quota','/providers/profiles','/inference/discovery'].includes(pathname))return true;
   if(method==='POST'&&(['/providers/discover','/providers/profiles/save','/inference/discover','/inference/discovery/cancel','/inference/discovery/select'].includes(pathname)||/^\/providers\/profiles\/[a-f0-9]{32}\/(select|delete)$/.test(pathname)))return true;
   if (/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route)) return true;

@@ -5,7 +5,6 @@ embeddings. Retrieved text is untrusted evidence and never executable policy.
 """
 from __future__ import annotations
 
-import ast
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,6 +22,7 @@ import uuid
 
 from local_coder.context.code_index import SKIP_DIRS, SKIP_EXTENSIONS, tokenize, iter_tokens
 from local_coder.statedir import state_path
+from local_coder.memory.code_structure import module_names, structure_chunks
 
 _KINDS = {"conversation", "code", "tool", "finding", "decision", "evidence", "hypothesis", "failure"}
 _STATE_FIELDS = {"objective", "constraints", "hypotheses", "failed_attempts", "evidence", "unfinished_work"}
@@ -44,7 +44,7 @@ _LOCKS_GUARD = threading.Lock()
 def _clean(value: Any) -> Any:
     if isinstance(value, str):
         for pattern in _SECRET_PATTERNS:
-            value = pattern.sub("[REDACTED]", value)
+            value = pattern.sub(lambda match: "[REDACTED]" + "\n" * match.group().count("\n"), value)
         return value
     if isinstance(value, dict):
         return {_clean(str(key)): "[REDACTED]" if _SENSITIVE_KEY.search(str(key)) else _clean(item) for key, item in value.items()}
@@ -121,6 +121,19 @@ class ContextMemory:
                     );
                     CREATE TABLE IF NOT EXISTS task_states (
                         task_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS code_symbols (
+                        memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                        source_path TEXT NOT NULL, qualified_name TEXT NOT NULL,
+                        anchor TEXT NOT NULL, symbol_anchor TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS code_anchor_lookup ON code_symbols(anchor);
+                    CREATE INDEX IF NOT EXISTS code_symbol_lookup ON code_symbols(source_path, qualified_name);
+                    CREATE TABLE IF NOT EXISTS code_calls (
+                        source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                        target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                        expression TEXT NOT NULL, line INTEGER NOT NULL, resolution TEXT NOT NULL,
+                        PRIMARY KEY(source_id, target_id, expression, line)
                     );
                 """)
                 owner = connection.execute("SELECT value FROM settings WHERE key='project_root'").fetchone()
@@ -229,36 +242,20 @@ class ContextMemory:
             raise ValueError("Memory links must be a list of memory IDs")
         head, timestamp = self._head(), _now()
         rows = []
-        spans = self._chunks(cleaned)
-        if kind == "code" and relative and relative.endswith(".py"):
-            try:
-                tree = ast.parse(cleaned)
-                lines = cleaned.splitlines(keepends=True)
-                # A top-level definition remains coherent where it fits; large ones
-                # retain line references through the ordinary bounded window splitter.
-                definitions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-                if definitions:
-                    spans = []
-                    cursor = 1
-                    for node in definitions:
-                        begin = min([node.lineno] + [decorator.lineno for decorator in node.decorator_list])
-                        end = node.end_lineno or node.lineno
-                        for offset, last in ((cursor, begin - 1), (begin, end)):
-                            block = "".join(lines[offset - 1:last])
-                            spans.extend((offset + first - 1, offset + final - 1, text) for first, final, text in self._chunks(block))
-                        cursor = end + 1
-                    spans.extend((cursor + first - 1, cursor + last - 1, text) for first, last, text in self._chunks("".join(lines[cursor - 1:])))
-                    spans = spans[:128]
-            except (SyntaxError, ValueError, RecursionError):
-                pass
-        for first, last, text in spans:
+        chunks = [{"content": text, "metadata": {"start_line": first, "end_line": last}}
+                  for first, last, text in self._chunks(cleaned)]
+        if kind == "code" and relative:
+            chunks = structure_chunks(relative, cleaned)
+        for chunk in chunks:
+            text = chunk["content"]
             if not text.strip():
                 continue
-            details = {**clean_metadata, "start_line": first, "end_line": last}
+            details = {**clean_metadata, **_clean(chunk["metadata"])}
+            search_label = " ".join(str(details.get(key, "")) for key in ("anchor", "qualified_name"))
             rows.append({"id": uuid.uuid4().hex, "kind": kind, "content": text, "source_path": relative,
                          "source_hash": source_hash, "content_hash": _digest(text.encode()), "head": head,
                          "task_id": task_id, "metadata": details, "created_at": timestamp, "updated_at": timestamp,
-                         "_links": links, "_vector": self._vector(text), "_terms": Counter(tokenize(text + " " + (relative or "")))})
+                         "_links": links, "_vector": self._vector(text), "_terms": Counter(tokenize(text + " " + (relative or "") + " " + search_label))})
         return rows
 
     def _insert(self, connection: sqlite3.Connection, rows: list[dict]) -> None:
@@ -266,12 +263,54 @@ class ContextMemory:
             columns = ("id", "kind", "content", "source_path", "source_hash", "content_hash", "head", "task_id", "metadata", "created_at", "updated_at")
             connection.execute("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?)", tuple(json.dumps(row[key]) if key == "metadata" else row[key] for key in columns))
             self._indices(connection, row)
+            metadata = row["metadata"]
+            if row["kind"] == "code" and row["source_path"] and metadata.get("anchor"):
+                connection.execute("INSERT INTO code_symbols VALUES (?,?,?,?,?)", (row["id"], row["source_path"], metadata["qualified_name"], metadata["anchor"], metadata["symbol_anchor"]))
             for target in row["_links"]:
                 if connection.execute("SELECT 1 FROM memories WHERE id=?", (target,)).fetchone():
                     connection.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (row["id"], target, "references"))
             previous = connection.execute("SELECT id FROM memories WHERE id<>? AND ((task_id IS NOT NULL AND task_id=?) OR (source_path IS NOT NULL AND source_path=?)) ORDER BY created_at DESC LIMIT 1", (row["id"], row["task_id"], row["source_path"])).fetchone()
             if previous:
                 connection.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (row["id"], previous[0], "related"))
+
+    def _refresh_code_graph(self, connection: sqlite3.Connection) -> None:
+        """Resolve bounded static candidates against explicit indexed definitions.
+
+        These edges describe source references, not proof of runtime dispatch.
+        No source imports, execution, or external package inspection takes place.
+        """
+        connection.execute("DELETE FROM code_calls")
+        records = connection.execute("SELECT m.id,m.source_path,m.metadata FROM memories m JOIN code_symbols s ON s.memory_id=m.id ORDER BY m.updated_at DESC LIMIT 10000").fetchall()
+        by_symbol, modules, parsed = {}, {}, []
+        for record in records:
+            metadata = json.loads(record["metadata"])
+            parsed.append((record, metadata))
+            if metadata.get("syntax_provider") != "python_ast" or metadata.get("ambiguous_symbol"):
+                continue
+            key = (record["source_path"], metadata["qualified_name"])
+            by_symbol.setdefault(key, []).append(record["id"])
+            for module in module_names(record["source_path"]):
+                modules.setdefault(module, set()).add(record["source_path"])
+        edges = 0
+        for record, metadata in parsed:
+            for call in metadata.get("calls", [])[:32]:
+                if call.get("resolution") != "static_candidate":
+                    continue
+                matches = set()
+                for target in call.get("targets", [])[:2]:
+                    paths = {target["source_path"]} if target.get("source_path") else modules.get(target.get("module"), set())
+                    for path in paths:
+                        key = (path, target.get("qualified_name"))
+                        if key in by_symbol:
+                            matches.add(key)
+                if len(matches) != 1:
+                    continue
+                for target_id in by_symbol[next(iter(matches))][:8]:
+                    if record["id"] != target_id:
+                        connection.execute("INSERT OR IGNORE INTO code_calls VALUES (?,?,?,?,?)", (record["id"], target_id, call["expression"], call["line"], call["reason"]))
+                        edges += 1
+                        if edges >= 20000:
+                            return
 
     def _indices(self, connection: sqlite3.Connection, row: dict) -> None:
         connection.executemany("INSERT INTO terms VALUES (?,?,?)", [(row["id"], term, count) for term, count in row["_terms"].items()])
@@ -281,6 +320,8 @@ class ContextMemory:
         rows = self._prepare(kind, content, source_path, task_id, metadata)
         with self._connection() as connection:
             self._insert(connection, rows)
+            if kind == "code":
+                self._refresh_code_graph(connection)
         return [self.get(row["id"]) for row in rows]
 
     def _freshness(self, row: dict, head: str | None) -> str:
@@ -330,6 +371,14 @@ class ContextMemory:
             connection.execute("DELETE FROM terms WHERE memory_id=?", (memory_id,))
             connection.execute("DELETE FROM vectors WHERE memory_id=?", (memory_id,))
             connection.execute("DELETE FROM links WHERE source_id=? OR target_id=?", (memory_id, memory_id))
+            connection.execute("DELETE FROM code_symbols WHERE memory_id=?", (memory_id,))
+            connection.execute("DELETE FROM code_calls WHERE source_id=? OR target_id=?", (memory_id, memory_id))
+            if original["kind"] == "code":
+                metadata = json.loads(original["metadata"])
+                for key in ("anchor", "symbol_anchor", "qualified_name", "symbol", "symbol_kind", "calls", "syntax_provider"):
+                    metadata.pop(key, None)
+                metadata["structure_status"] = "corrected_unverified"
+                connection.execute("UPDATE memories SET metadata=? WHERE id=?", (json.dumps(metadata), memory_id))
             self._indices(connection, derived)
         return self.get(memory_id)
 
@@ -354,8 +403,12 @@ class ContextMemory:
         with self._connection() as connection:
             # Exact term postings bound the lexical candidate set. Vectors rerank
             # lexical candidates; a supplied neural backend may add vector-only hits.
-            records = connection.execute(f"SELECT m.*, v.value AS vector, v.backend AS vector_backend, count(t.term) AS lexical FROM memories m JOIN terms t ON t.memory_id=m.id JOIN vectors v ON v.memory_id=m.id WHERE t.term IN ({placeholders}) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) GROUP BY m.id ORDER BY lexical DESC, m.updated_at DESC LIMIT 1000", (*terms, task_id, task_id)).fetchall()
-            if self.embedding_backend is not None:
+            anchor_query = query.startswith('code:')
+            if anchor_query:
+                records = connection.execute("SELECT m.*,v.value AS vector,v.backend AS vector_backend,1 AS lexical FROM memories m JOIN vectors v ON v.memory_id=m.id JOIN code_symbols s ON s.memory_id=m.id WHERE (s.anchor=? OR s.symbol_anchor=?) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY m.updated_at DESC LIMIT 128", (query, query, task_id, task_id)).fetchall()
+            else:
+                records = connection.execute(f"SELECT m.*, v.value AS vector, v.backend AS vector_backend, count(t.term) AS lexical FROM memories m JOIN terms t ON t.memory_id=m.id JOIN vectors v ON v.memory_id=m.id WHERE t.term IN ({placeholders}) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) GROUP BY m.id ORDER BY lexical DESC, m.updated_at DESC LIMIT 1000", (*terms, task_id, task_id)).fetchall()
+            if self.embedding_backend is not None and not anchor_query:
                 additional = connection.execute("SELECT m.*, v.value AS vector, v.backend AS vector_backend, 0 AS lexical FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE v.backend=? AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY m.updated_at DESC LIMIT 1000", (self.embedding_name, task_id, task_id)).fetchall()
                 seen = {record["id"] for record in records}
                 records = list(records) + [record for record in additional if record["id"] not in seen]
@@ -371,20 +424,57 @@ class ContextMemory:
                 if not lexical and similarity < 0.65:
                     continue
                 exact = query.casefold() in row["content"].casefold()
-                row["score"] = round(lexical / len(terms) * 3 + max(0, similarity) + (2 if exact else 0), 6)
+                symbol = row['metadata'].get('qualified_name', '')
+                symbol_match = bool(symbol) and (query.casefold() == symbol.casefold() or query.casefold() == row['metadata'].get('symbol', '').casefold())
+                row["score"] = round(lexical / len(terms) * 3 + max(0, similarity) + (2 if exact else 0) + (4 if symbol_match or anchor_query else 0), 6)
                 row["reasons"] = ([f"{lexical} matching lexical terms"] if lexical else []) + [f"{backend} vector similarity {similarity:.3f}"]
                 if exact:
                     row["reasons"].append("exact phrase")
+                if anchor_query:
+                    row['reasons'].append('exact structural anchor')
+                elif symbol_match:
+                    row['reasons'].append('exact AST symbol')
                 if row["freshness"] != "fresh":
                     row["reasons"].append("historical evidence: " + row["freshness"])
                 ranked.append(row)
             ranked.sort(key=lambda row: (row["score"], row["updated_at"], row["id"]), reverse=True)
+            planned, seen_ids, seen_anchors = [], set(), set()
+            for root in ranked:
+                queue = [(root, 0)]
+                while queue and len(planned) < limit:
+                    row, depth = queue.pop(0)
+                    anchor = row['metadata'].get('anchor')
+                    if row['id'] in seen_ids or (anchor and anchor in seen_anchors):
+                        continue
+                    seen_ids.add(row['id'])
+                    if anchor:
+                        seen_anchors.add(anchor)
+                    planned.append(row)
+                    if row['kind'] != 'code' or depth >= 2 or anchor_query:
+                        continue
+                    dependencies = connection.execute("SELECT m.*,c.expression AS call_expression,c.line AS call_line,c.resolution AS call_resolution FROM code_calls c JOIN memories m ON m.id=c.target_id WHERE c.source_id=? AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY c.line,c.target_id LIMIT 4", (row['id'], task_id, task_id)).fetchall()
+                    for record in dependencies:
+                        helper = self._view(connection, record, head)
+                        expression, line = helper.pop('call_expression'), helper.pop('call_line')
+                        resolution = helper.pop('call_resolution')
+                        if helper['freshness'] != 'fresh':
+                            continue
+                        helper['score'] = row['score'] * .8
+                        helper['dependency_of'] = row['id']
+                        helper['dependency_depth'] = depth + 1
+                        helper['call_site'] = {'source_ref': f"{row['source_path']}:{line}", 'expression': expression, 'resolution': resolution}
+                        helper['reasons'] = [f"static call {expression} from {row['source_ref']}", 'indexed static target; runtime dispatch unproven']
+                        queue.append((helper, depth + 1))
+                if len(planned) >= limit:
+                    break
             hits = []
-            for row in ranked[:limit]:
+            for index, row in enumerate(planned):
                 if budget <= 0:
                     break
-                row["truncated"] = len(row["content"]) > budget
-                row["content"] = row["content"][:budget]
+                # Reserve room for every planned helper under the SAME budget.
+                allowance = max(1, budget // (len(planned) - index))
+                row["truncated"] = len(row["content"]) > allowance
+                row["content"] = row["content"][:allowance]
                 budget -= len(row["content"])
                 hits.append(row)
             return hits
@@ -420,7 +510,8 @@ class ContextMemory:
         text = "Untrusted memory evidence; verify sources before acting.\n"[:budget] if items else ""
         included = []
         for item in items:
-            header = f"\n[{item['id']}] {item['source_ref']} ({item['freshness']})\n"
+            via = f"; static helper via {item['call_site']['expression']}" if item.get('dependency_of') else ''
+            header = f"\n[{item['id']}] {item['source_ref']} ({item['freshness']}{via})\n"
             remaining = budget - len(text) - len(header)
             if remaining <= 0:
                 break
@@ -428,6 +519,55 @@ class ContextMemory:
             text += header + content
             included.append({**item, "content": content, "truncated": item["truncated"] or len(content) < len(item["content"])})
         return {"text": text, "items": included, "untrusted": True, "embedding_backend": self.embedding_name, "char_budget": budget}
+
+    def structure(self, paths: list[str] | None = None, *, query: str = '', char_budget: int = 4000, limit: int = 100) -> dict:
+        """Browse an indexed directory/symbol tree using stable metadata anchors.
+
+        This is bounded source navigation; anchors are not hidden source edits.
+        Missing or stale code never appears as a fresh structural definition.
+        """
+        if paths is not None and (not isinstance(paths, list) or len(paths) > self.max_index_files):
+            raise ValueError('Structure paths must be a bounded list')
+        roots = [self._path(path) for path in paths] if paths is not None else [self.project_root]
+        budget, limit = max(0, min(int(char_budget), 50000)), max(0, min(int(limit), 500))
+        query = _clean(str(query))[:4000].casefold()
+        head, items, lines, seen, truncated = self._head(), [], [], set(), False
+        with self._connection() as connection:
+            records = connection.execute('SELECT m.* FROM memories m JOIN code_symbols s ON s.memory_id=m.id ORDER BY m.source_path,s.qualified_name,m.updated_at DESC LIMIT 10000').fetchall()
+            for record in records:
+                row = self._view(connection, record, head)
+                metadata = row['metadata']
+                anchor = metadata.get('anchor')
+                if not anchor or anchor in seen or row['freshness'] != 'fresh':
+                    continue
+                path = self._path(row['source_path'])
+                if not any(path == root or path.is_relative_to(root) for root in roots):
+                    continue
+                if query and query not in (' '.join([row['source_path'], metadata.get('qualified_name', ''), anchor])).casefold():
+                    continue
+                seen.add(anchor)
+                parts = Path(row['source_path']).parts
+                labels = []
+                for depth, part in enumerate(parts):
+                    key = '/'.join(parts[:depth + 1])
+                    if key not in seen:
+                        labels.append('  ' * depth + part + ('/' if depth < len(parts) - 1 else '') + '\n')
+                        seen.add(key)
+                labels.append('  ' * len(parts) + f"{metadata['symbol_kind']} {metadata['qualified_name']} [{anchor}] {row['source_ref']}\n")
+                text = ''.join(labels)
+                remaining = budget - sum(len(line) for line in lines)
+                if len(items) >= limit or len(text) > remaining:
+                    if remaining > 0:
+                        lines.append(text[:remaining])
+                    truncated = True
+                    break
+                lines.append(text)
+                items.append({'id': row['id'], 'source_path': row['source_path'], 'source_ref': row['source_ref'],
+                              'anchor': anchor, 'qualified_name': metadata['qualified_name'], 'symbol_kind': metadata['symbol_kind'],
+                              'start_line': metadata['start_line'], 'end_line': metadata['end_line'],
+                              'syntax_provider': metadata['syntax_provider'], 'freshness': row['freshness'], 'untrusted': True})
+        return {'text': ''.join(lines), 'items': items, 'truncated': truncated, 'untrusted': True,
+                'char_budget': budget, 'graph_limits': {'max_depth': 2, 'fanout': 4, 'max_nodes': 10000, 'max_edges': 20000}}
 
     @staticmethod
     def _indexable(path: Path, root: Path) -> bool:
@@ -487,6 +627,7 @@ class ContextMemory:
                 if source and not source.exists() and any(source == root or source.is_relative_to(root) for root in roots):
                     connection.execute("DELETE FROM memories WHERE id=?", (row["id"],))
             self._insert(connection, prepared)
+            self._refresh_code_graph(connection)
         return {"files": len(indexed_paths), "chunks": len(prepared), "skipped": skipped, "max_files": self.max_index_files, "embedding_backend": self.embedding_name}
 
     def status(self) -> dict:
@@ -494,6 +635,7 @@ class ContextMemory:
             return {"memories": connection.execute("SELECT count(*) FROM memories").fetchone()[0],
                     "tasks": connection.execute("SELECT count(*) FROM task_states").fetchone()[0],
                     "links": connection.execute("SELECT count(*) FROM links").fetchone()[0],
+                    "code_call_edges": connection.execute("SELECT count(*) FROM code_calls").fetchone()[0],
                     "embedding_backend": self.embedding_name,
                     "embedding_kind": "supplied_local_backend" if self.embedding_backend is not None else "lexical_subword_hash",
                     "neural_embeddings": bool(getattr(self.embedding_backend, "is_neural", False)),
