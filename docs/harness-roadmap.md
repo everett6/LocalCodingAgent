@@ -32,9 +32,9 @@ locks only coordinate cooperating writers. Atomic replacement is not a guarantee
 against every filesystem or machine power-loss scenario.
 
 `save()` explicitly replaces a caller's snapshot and `reset()` explicitly clears
-it; concurrent discovery must use `record()`. The current batched-review workflow
-still resets the ledger at the beginning of a review. Cross-review history,
-independent confirmation, and before/after-fix test orchestration remain pending.
+it; concurrent discovery must use `record()`. Reviews now retain the ledger across runs. The separate local security evidence
+workflow adds persistent lifecycle events, independent review contexts, and
+isolated before/after regression checks; see [local-security-evidence.md](local-security-evidence.md).
 
 ## Design constraints
 

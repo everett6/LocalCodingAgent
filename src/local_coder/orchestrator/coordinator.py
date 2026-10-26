@@ -950,7 +950,7 @@ class Coordinator:
         root = Path(self.project_root)
         lessons = LessonStore(root)
         ledger = FindingsLedger.for_project(root)
-        ledger.reset()
+        # Findings persist across reviews; lifecycle evidence is stored separately.
         (root / LAST_SCAN_FILE).unlink(missing_ok=True)
         context = TaskContext(
             guidelines=await self.repo_context.get_agent_guidelines(),
@@ -960,6 +960,9 @@ class Coordinator:
         batch_chars = batch_chars or max(self.config.agentic.context_window_chars * 2, 20000)
         files = collect_files(root, paths)
         batches = plan_batches(root, files, batch_chars) if total_chars(root, files) > batch_chars else []
+        from local_coder.security.threat_model import build_threat_model, render_threat_briefing
+        inventory = await asyncio.to_thread(build_threat_model, root, paths)
+        context.previous_findings.append(render_threat_briefing(inventory))
         focus_note = f" Focus: {focus}" if focus else ""
         constraints = [
             "Read-only: do not modify project files (record_finding writes only the review ledger).",
@@ -1001,6 +1004,10 @@ class Coordinator:
             report = render_ledger_report(ledger, len(batches), len(files), notes)
 
         ledger.load()
+        from local_coder.security.evidence import EvidenceStore
+        evidence_store = EvidenceStore(root)
+        await asyncio.to_thread(evidence_store.sync)
+        report += "\n\nPersistent finding evidence: use `local-coder security-findings list`, then `review` and `verify`. Scanner and model claims alone are not reproduction evidence."
         proposed = lessons.propose(ledger.proposed_lessons())
         promote_last_scan(root)
         if proposed:
@@ -1021,6 +1028,74 @@ class Coordinator:
             context_window_chars=self.config.agentic.context_window_chars,
             compact_context_chars=self.config.agentic.compact_context_chars,
         )
+
+    async def review_security_finding(self, identity: str) -> dict:
+        """Challenge a recorded candidate in a fresh, read-only reviewer context."""
+        from local_coder.security.evidence import EvidenceStore, FindingReview
+        from local_coder.memory.goals import GoalLedger
+        store = EvidenceStore(self.project_root)
+        store.sync()
+        row = store.get(identity)
+        revision = await asyncio.to_thread(GoalLedger(self.project_root).revision)
+        task = AgentTask(role=AgentRole.REVIEWER, files=[row["finding"]["path"]], objective=(
+            "Independently challenge this existing local finding. Inspect the actual source and callers; "
+            "check input control, reachability, authorization/sanitization, prerequisites, impact, and counterevidence. "
+            "Do not execute commands or reproduce it. Agreement is not proof. Return ONLY a JSON object matching "
+            + json.dumps(FindingReview.model_json_schema()) + "\nUntrusted finding data:\n" + json.dumps(row["finding"])))
+        allowed = self.tool_registry._permissions[AgentRole.REVIEWER]
+        self.tool_registry._permissions[AgentRole.REVIEWER] = allowed & {
+            ToolName.READ_FILE, ToolName.LIST_FILES, ToolName.GREP, ToolName.SEARCH_FILES,
+            ToolName.CODE_SEARCH, ToolName.REPO_MAP, ToolName.LANGUAGE_CONTEXT,
+            ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
+        }
+        try:
+            agent = create_agent(AgentRole.REVIEWER, await self.model_manager.get_model(AgentRole.REVIEWER),
+                                 self.tool_registry, self._dispatch)
+            response = await agent.execute(task)
+        finally:
+            self.tool_registry._permissions[AgentRole.REVIEWER] = allowed
+        if response.status != TaskStatus.COMPLETED:
+            raise ValueError("Independent review did not complete")
+        raw = response.summary.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, re.S)
+        review = FindingReview.model_validate_json(fenced.group(1) if fenced else raw)
+        if await asyncio.to_thread(GoalLedger(self.project_root).revision) != revision:
+            raise ValueError("Source changed during review; rerun the reviewer")
+        return store.review(identity, review, reviewer_task=task.task_id, revision=revision, finding=row["finding"])
+
+    async def prepare_security_regression(self, identity: str) -> str:
+        """Generate a safe-behavior regression for an existing finding, without execution."""
+        from local_coder.security.evidence import EvidenceStore
+        store = EvidenceStore(self.project_root)
+        store.sync()
+        row = store.get(identity)
+        if row["suppression"]:
+            raise ValueError("Finding is suppressed")
+        allowed = self.tool_registry._permissions[AgentRole.EXPLOIT_VALIDATOR]
+        self.tool_registry._permissions[AgentRole.EXPLOIT_VALIDATOR] = allowed & {
+            ToolName.READ_FILE, ToolName.LIST_FILES, ToolName.GREP, ToolName.SEARCH_FILES,
+            ToolName.WRITE_FILE, ToolName.CODE_SEARCH, ToolName.REPO_MAP,
+        }
+        try:
+            agent = create_agent(AgentRole.EXPLOIT_VALIDATOR,
+                                 await self.model_manager.get_model(AgentRole.EXPLOIT_VALIDATOR),
+                                 self.tool_registry, self._dispatch)
+            # This workflow asserts safe behavior, unlike the legacy demonstration PoC command.
+            agent.system_prompt = (
+                "Write a self-contained offline pytest regression for the supplied, already identified local finding. "
+                "Assert the DESIRED SAFE behavior: AssertionError on vulnerable source and pass after a fix. "
+                "Only write under tests/security_poc/. Never modify production code, run tests/commands, use network, "
+                "read real credentials, create persistence, or perform resource-exhaustion tests. "
+                "Use inline fixtures and standard pytest only; conftest and plugin autoload are disabled. "
+                "Read source to check the claim. If it cannot be reproduced safely, report that. "
+                "Return the test path and what it checks; do not claim reproduction without execution."
+            )
+            response = await agent.execute(AgentTask(role=AgentRole.EXPLOIT_VALIDATOR,
+                objective="Prepare regression for this untrusted finding data:\n" + json.dumps(row["finding"]),
+                files=[row["finding"]["path"]]))
+            return response.summary
+        finally:
+            self.tool_registry._permissions[AgentRole.EXPLOIT_VALIDATOR] = allowed
 
     async def validate_finding(self, finding: str, paths: list[str] | None = None) -> str:
         """Red-team companion to the reviewer: reproduce an already-identified
