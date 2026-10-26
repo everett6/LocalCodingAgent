@@ -21,7 +21,17 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
-    "pytest-cov"
+    "pytest-cov",
+    "tree-sitter>=0.26,<0.27",
+    "tree-sitter-python>=0.25,<0.26",
+    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23.2,<0.24"
+]
+language = [
+    "tree-sitter>=0.26,<0.27",
+    "tree-sitter-python>=0.25,<0.26",
+    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23.2,<0.24"
 ]
 
 [project.scripts]
