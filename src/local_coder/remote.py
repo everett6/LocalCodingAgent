@@ -113,6 +113,8 @@ class RemoteControlServer(WorkbenchAPI):
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
         self._event_seq = 0
         self.lock = Lock()
+        from local_coder.statedir import state_path
+        state_path(project_root, '.local-coder/bootstrap')
         self.sessions = SessionStore(project_root)
         self._init_workbench()
         self._lease_file = None

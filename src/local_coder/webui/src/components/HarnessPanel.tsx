@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
+import { ContextAccountingPanel } from './ContextAccountingPanel'
 
 type Settings = {
   memory_enabled: boolean
@@ -195,6 +196,7 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
   const codeStyle = { maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 } as const
 
   return <section className="playbook-view" aria-labelledby="harness-title">
+    <ContextAccountingPanel disabled={disabled} />
     <h1 id="harness-title">Harness controls</h1>
     <p>Set task limits, inspect saved scaffolding and review file snapshots. Permissions, project scope, approvals and shared budgets remain enforced by the engine.</p>
     <nav className="settings-tabs" aria-label="Harness views">

@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any
 
-from local_coder.security_intelligence import DependencyInventory, LocalAdvisoryStore
+from local_coder.security_intelligence import DependencyInventory, LocalAdvisoryStore, advisory_match
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
 
@@ -16,7 +16,7 @@ _MAX_AUDIT_COMPARISONS = 100000
 
 class DependencyIntelligenceTool(Tool):
     name = ToolName.DEPENDENCY_INTELLIGENCE
-    description = 'Read-only offline npm/Python dependency inventory, operator-imported advisory lookup, and exact-version advisory audit. Does not install, fetch, resolve versions, execute code, or establish that dependencies are safe. Ranges and markers remain unresolved.'
+    description = 'Read-only offline npm/Python dependency inventory, operator-imported advisory lookup, and ecosystem-range advisory audit. Does not install, fetch, resolve versions, execute code, or establish that dependencies are safe. Unsupported ranges and markers remain unresolved.'
     parameters = {'type': 'object', 'properties': {
         'action': {'type': 'string', 'enum': ['inventory', 'query', 'audit'], 'default': 'inventory'},
         'target_path': {'type': 'string', 'default': '.'},
@@ -74,16 +74,17 @@ class DependencyIntelligenceTool(Tool):
                 if comparisons > _MAX_AUDIT_COMPARISONS:
                     truncated = True
                     break
-                if record['affected_ranges']:
+                matched, match_type, reasons = advisory_match(record, component['version'])
+                if reasons:
                     if len(matches) + len(unresolved) >= _MAX_AUDIT_RECORDS:
                         truncated = True
                         break
-                    unresolved.append({'id': record['id'], 'component_id': component['id'], 'reason': 'Imported affected ranges are not evaluated'})
-                if component['version'] in record['versions']:
+                    unresolved.append({'id': record['id'], 'component_id': component['id'], 'reason': reasons[0]})
+                if matched:
                     if len(matches) + len(unresolved) >= _MAX_AUDIT_RECORDS:
                         truncated = True
                         break
-                    matches.append({**record, 'component_id': component['id'], 'conditional': component['conditional'], 'match_type': 'exact_imported_version', 'verification': 'unverified'})
+                    matches.append({**record, 'component_id': component['id'], 'conditional': component['conditional'], 'match_type': match_type, 'verification': 'unverified'})
         data['coverage']['limits'].update(max_audit_records=_MAX_AUDIT_RECORDS, max_advisory_comparisons=_MAX_AUDIT_COMPARISONS)
         if truncated:
             data['coverage']['status'] = 'partial'

@@ -4,7 +4,13 @@ root = Path(SPECPATH).parent
 analysis = Analysis([str(root / 'desktop' / 'engine.py')], pathex=[str(root / 'src')],
     binaries=[], datas=[(str(root / 'src' / 'local_coder' / 'webui' / 'dist'), 'local_coder/webui/dist'),
                         (str(root / 'src' / 'local_coder' / 'webui' / 'public'), 'local_coder/webui/public')],
-    hiddenimports=[], hookspath=[], runtime_hooks=[], excludes=['pytest'])
+    hiddenimports=[], hookspath=[], runtime_hooks=[],
+    # GGUF inference uses the selected native runtime. The optional tokenizer
+    # needs text assets only; do not bundle unrelated ML execution frameworks.
+    excludes=['pytest', 'torch', 'tensorflow', 'jax', 'jaxlib', 'flax',
+              'torchvision', 'torchaudio', 'pandas', 'sklearn', 'scipy',
+              'librosa', 'soundfile', 'soxr', 'av', 'cv2', 'PIL',
+              'matplotlib', 'sympy', 'IPython', 'timm'])
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, analysis.binaries, analysis.datas, [], name='local-coder-engine',
           debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=True)

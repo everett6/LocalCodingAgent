@@ -80,15 +80,21 @@ class Coordinator:
         self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config, quota_guard=quota_guard)
         from local_coder.core.budgets import BudgetLedger
+        from local_coder.context.token_count import load_counter_for_project
         from local_coder.statedir import state_path
         limits = config.harness
         self.budget = BudgetLedger(max_requests=limits.max_requests, max_tokens=limits.max_tokens,
                                    max_request_tokens=limits.max_request_tokens, max_cost_usd=limits.max_cost_usd,
-                                   state_path=state_path(project_root, f".local-coder/budgets/{uuid.uuid4().hex}.json"))
+                                   state_path=state_path(project_root, f".local-coder/budgets/{uuid.uuid4().hex}.json"),
+                                   token_counter=load_counter_for_project(project_root))
         self.model_manager.budget = self.budget
         self.model_manager.on_close = self.tool_registry.close
         self.tool_registry.budget = self.budget
         self.tool_registry.quota_guard = quota_guard
+        evolution_tool = self.tool_registry.get_tool(ToolName.HARNESS_EVOLVE)
+        if evolution_tool is not None:
+            # Binding is inert: only an explicitly approved improve action runs it.
+            evolution_tool.improvement_evaluator = self._evaluate_harness_profile
         self.tool_registry.memory_context_chars = limits.memory_context_chars if limits.memory_enabled else 0
         self.tool_registry.memory_enabled = limits.memory_enabled
         self.tool_registry.context_snapshots = limits.context_snapshots
@@ -110,6 +116,45 @@ class Coordinator:
         # draft prompt (e.g. the same file across a fix-loop retry) can hit
         # the cache instead of paying for another small-model round trip.
         self._prompt_cache = PromptCache()
+
+    async def _evaluate_harness_profile(self, overlay):
+        """Measure the selected security model's instruction profile, not a coding workflow.
+
+        Use a dedicated single-backend manager so evaluation cannot load unrelated
+        models, probe fallbacks or close the coordinator's live tools/models.
+        """
+        from local_coder.core.budgets import BudgetedModel
+        from local_coder.harness.evaluation import make_model_evaluator, spending_admission
+        from local_coder.models.profiles import resolve_profile, validate_overlay
+
+        controls = {**self.tool_registry.profile_overrides, **validate_overlay(overlay)}
+        selected = resolve_model_name(self.model_manager.config, AgentRole.SECURITY)
+        configured = self.model_manager.config.models[selected]
+        resolve_profile(configured, AgentRole.SECURITY, controls)
+        # Admission is required before constructing even a dedicated manager.
+        spending_admission(configured, self.budget)
+        dedicated_config = self.model_manager.config.model_copy(deep=True)
+        dedicated_config.models = {selected: dedicated_config.models[selected]}
+        dedicated_config.routing.fallbacks = {}
+        dedicated_config.routing.escalate_to = None
+        manager = ModelManager(dedicated_config, quota_guard=self.model_manager.quota_guard)
+        manager.budget = self.budget
+        try:
+            model = await manager.get_model(AgentRole.SECURITY, selected)
+            # The adapter wraps exactly once, with the same request ledger and
+            # quota guard. Keep manager ownership of its wrapper for cleanup.
+            while isinstance(model, BudgetedModel):
+                model = model.model
+            evaluator = make_model_evaluator(lambda _overlay: model, ledger=self.budget,
+                quota_guard=manager.quota_guard, render_profile=True)
+            return await evaluator(controls)
+        finally:
+            cleanup = asyncio.create_task(asyncio.wait_for(manager.close_all(), timeout=15))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise
 
     async def _delegate_task(self, request):
         """Leaf agents share the exact registry, scope, approval callback and ledger."""

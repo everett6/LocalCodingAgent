@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from local_coder.harness_api import _integer, _object, _query, _text
@@ -93,6 +94,8 @@ class ResearchAPI:
             _object(query, filters)
             from local_coder.security_intelligence import LocalAdvisoryStore
             options = {key: _text(_query(query, key, ""), maximum=200) for key in filters if key in query}
+            if 'advisory_id' in options and not re.fullmatch(r'(?:CVE-\d{4}-\d{4,}|GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}|PYSEC-\d{4}-\d+)', options['advisory_id']):
+                raise ValueError('Choose a supported CVE, GHSA or PYSEC identifier')
             return True, LocalAdvisoryStore(self.project_root).query(**options)
         if path == "/research/capabilities":
             _object(query, set())

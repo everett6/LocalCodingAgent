@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { InferenceTuningPanel } from './InferenceTuningPanel'
 import type { Provider } from '../api'
 
 type Settings = { runtime_path: string; model_path: string; draft_model_path: string; context_size: number; gpu_layers: number; threads: number; flash_attention: string; prompt_cache: boolean; cache_ram_mb: number; prefetch: boolean; prefetch_mb: number; startup_timeout: number }
@@ -54,7 +55,7 @@ export function LocalInferenceSettings({ saved }: { saved: (provider: Provider) 
   const candidates = [...(discovery?.runtimes || []).map(item => ({ ...item, type: 'runtime' as const })), ...(discovery?.models || []).map(item => ({ ...item, type: 'model' as const }))].filter(item => (kind === 'all' || kind === item.type) && `${item.path} ${item.display_name || item.name} ${item.architecture || ''} ${item.validity}`.toLowerCase().includes(search.toLowerCase()))
   const pages = Math.max(1, Math.ceil(candidates.length / 10)), currentPage = Math.min(page, pages - 1), selectedModel = discovery?.models.find(item => item.path === form.model_path)
   return <section className="local-inference">
-    <div className="runtime-summary"><p className="runtime-state">Runtime: <strong>{status.state}</strong></p><p className="hint">Run an existing local GGUF model with llama.cpp. Discovery reads headers and locations without starting found programs or downloading weights.</p></div>
+    <InferenceTuningPanel /><div className="runtime-summary"><p className="runtime-state">Runtime: <strong>{status.state}</strong></p><p className="hint">Run an existing local GGUF model with llama.cpp. Discovery reads headers and locations without starting found programs or downloading weights.</p></div>
     <section className="section-card model-catalog discovery-catalog" aria-label="Detected local models and runtimes">
       <h3>Models and runtimes on this computer</h3><p className="hint">Common locations are searched automatically, including Hugging Face caches. Detected binaries are checked for runtime health only when you choose Start.</p>
       <div className="runtime-actions"><button type="button" disabled={scanning} onClick={() => { void discover() }}>Search common locations</button><button type="button" disabled={scanning} onClick={() => { void discover(true) }}>Search all folders</button>{scanning && <button type="button" onClick={() => { void api<Discovery>('/inference/discovery/cancel', 'POST', {}).then(setDiscovery).catch(problem => setError(String(problem))) }}>Cancel search</button>}</div>

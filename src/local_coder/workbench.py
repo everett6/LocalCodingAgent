@@ -14,26 +14,41 @@ from local_coder.workspace import Workspace
 from local_coder.harness_api import HarnessAPI
 from local_coder.provider_api import ProviderAPI
 from local_coder.research_api import ResearchAPI, ResearchRequestError
+from local_coder.evaluation_api import EvaluationAPI
+from local_coder.memory_api import MemoryAuditAPI
+from local_coder.findings_api import FindingsAPI
+from local_coder.context_accounting_api import ContextAccountingAPI
+from local_coder.dependency_updates_api import DependencyUpdatesAPI
+from local_coder.inference_tuning_api import InferenceTuningAPI
+from local_coder.doctor_api import DoctorAPI
 from local_coder.providers.quota import ProviderQuotaExhausted
 from local_coder.orchestrator.blocked import AgentBlocked
 
 
-class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
+class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAuditAPI,
+                   FindingsAPI, ContextAccountingAPI, DependencyUpdatesAPI, InferenceTuningAPI, DoctorAPI):
     def _init_workbench(self):
         from local_coder.redteam import EngagementStore
         self.engagements = EngagementStore(self.project_root)
         from local_coder.inference import EmbeddedInferenceManager
-        self.inference = EmbeddedInferenceManager(Workspace(self.project_root).resolve(".local-coder/inference"))
+        from local_coder.statedir import state_path
+        inference_state = state_path(self.project_root, '.local-coder/inference/runtime-state').parent
+        self.inference = EmbeddedInferenceManager(inference_state)
         self._using_inference = False
         self._provider = None
         from local_coder.memory.goals import GoalLedger
         self.goal_ledger = GoalLedger(self.project_root)
         self._job_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._jobs = {}
         self._context = threading.local()
         self.instance_id = uuid4().hex
         self._stopping = False
         self._init_harness_api()
+        self._init_context_accounting_api()
+        self._init_findings_api()
+        self._init_evaluation_api()
+        self._init_tuning_api()
         self._init_provider_api()
 
     def reconcile_sessions(self):
@@ -44,7 +59,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
                                    error="Server restarted before completion; resume a saved step or start a new task")
 
     def drain_jobs(self, timeout=12):
-        self._stopping = True
+        with self._lifecycle_lock:
+            self._stopping = True
         self.approvals.cancel_all()
         with self.lock:
             jobs = list(self._jobs.values())
@@ -57,7 +73,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
             thread = job.get("thread")
             if thread:
                 thread.join(max(0, deadline - time.monotonic()))
-        self.inference.stop()
+        with self._lifecycle_lock:
+            self.inference.stop()
         self.runtime_discovery.cancel()
         return not any(job.get("thread") and job["thread"].is_alive() for job in jobs)
 
@@ -210,10 +227,15 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
                                         phase=action, target_path=target, status="queued", result="", engagement_id=engagement_id)
             thread = threading.Thread(target=self._job_thread,
                 args=(session_id, job, prepared, mode, action, target, body.get("fix", False), body.get("resume_checkpoint"), engagement_id, allow_model_change), daemon=True)
-            job["thread"] = thread
-            thread.start()
+            with self.lock:
+                if self._stopping:
+                    raise ValueError('Engine is shutting down')
+                job["thread"] = thread
+                thread.start()
             return 202, record
         except BaseException:
+            with self.lock:
+                self._jobs.pop(session_id, None)
             self._job_lock.release()
             raise
 
@@ -283,6 +305,23 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            if path == '/findings' or path.startswith('/findings/'):
+                if query:
+                    raise ValueError('Findings routes accept no query parameters')
+                return self._findings_handle(method, path, body)
+            if method == 'GET':
+                extra = self._context_accounting_get(path, query)
+                if extra is not None:
+                    return 200, extra
+            elif method == 'POST':
+                extra = self._context_accounting_post(path, body)
+                if extra is not None:
+                    return 200, extra
+            handlers = (self._evaluation_get, self._memory_audit_get, self._dependency_updates_get, self._tuning_get, self._doctor_get) if method == 'GET' else (self._evaluation_post, self._dependency_updates_post, self._tuning_post, self._doctor_post) if method == 'POST' else ()
+            for handler in handlers:
+                handled, payload = handler(path, query if method == 'GET' else body)
+                if handled:
+                    return 200, payload
             handled, payload = self._research_get(path, query) if method == "GET" else self._research_post(path, body) if method == "POST" else (False, None)
             if handled:
                 return 200, payload
@@ -301,12 +340,17 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI):
                 if not self._job_lock.acquire(blocking=False):
                     return 409, {"error": "Stop the active task before changing the on-device runtime"}
                 try:
+                    if self._stopping:
+                        return 503, {"error": "Engine is shutting down"}
                     if path == "/inference/configure":
                         return 200, self.inference.configure(body)
                     if path == "/inference/start":
-                        result = self.inference.start(body or None)
-                        self._using_inference = True
-                        return 202, result
+                        with self._lifecycle_lock:
+                            if self._stopping:
+                                return 503, {"error": "Engine is shutting down"}
+                            result = self.inference.start(body or None)
+                            self._using_inference = True
+                            return 202, result
                     if path == "/inference/stop":
                         result = self.inference.stop()
                         self._using_inference = False

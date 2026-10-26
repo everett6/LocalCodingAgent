@@ -21,6 +21,15 @@ class Tool(abc.ABC):
     name: ToolName
     description: str
     parameters: dict[str, Any]  # JSON Schema for parameters
+    # Unknown/custom tools are serialized unless they explicitly declare all
+    # three effects. These declarations never bypass permissions or schemas.
+    read_only: bool = False
+    mutating: bool = True
+    retry_safe: bool = False
+
+    def effects(self):
+        from local_coder.tools.scheduling import tool_effects
+        return tool_effects(self)
     
     @abc.abstractmethod
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -133,6 +142,13 @@ class ToolRegistry:
         """Register a tool instance."""
         self._tools[tool.name] = tool
     
+    def effects_for(self, name: str):
+        from local_coder.tools.scheduling import ToolEffects, tool_effects
+        try:
+            return tool_effects(self.get_tool(ToolName(name)))
+        except ValueError:
+            return ToolEffects()
+
     def get_tool(self, name: ToolName) -> Tool | None:
         """Get a registered tool by name."""
         return self._tools.get(name)
@@ -329,6 +345,7 @@ class ToolRegistry:
                 duration_ms=int((time.time() - start_time) * 1000)
             )
 
+        execution_started = False
         try:
             self._leaf_scope(name_enum, arguments)
             if name_enum in {ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE} and not getattr(self, "memory_enabled", True):
@@ -358,6 +375,7 @@ class ToolRegistry:
             if name_enum == ToolName.DELEGATE_TASK:
                 current = self.task_context.get() or {}
                 arguments = {**arguments, "_delegation_depth": current.get("depth", 0)}
+            execution_started = True
             result = await tool.execute(**arguments)
             if result.success and name_enum == ToolName.READ_FILE:
                 language = await self._language_before_edit([arguments["path"]])
@@ -382,5 +400,7 @@ class ToolRegistry:
             return ToolResult(
                 success=False, 
                 output=f"Error executing tool {tool_name}: {str(e)}",
+                data={"execution_outcome": "unknown" if execution_started else "not_started",
+                      "mutation_completion_unknown": execution_started and self.effects_for(tool_name).mutating},
                 duration_ms=int((time.time() - start_time) * 1000)
             )

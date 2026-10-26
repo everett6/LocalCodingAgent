@@ -53,3 +53,7 @@ isolated before/after regression checks; see [local-security-evidence.md](local-
   attention distributions and GPU utilization require actual backend telemetry.
 - Generated-code isolation, outbound network controls, and credential stripping
   must be enforced by the runtime, not only by prompt instructions.
+
+## Reliability workflows
+
+Evaluation reports, retrieval audits, model usage reservations, canonical findings UI, supported offline advisory ranges, explicit local tuning, Doctor and guarded read scheduling are now connected. Current behavior and limits are documented in [reliability-workflows.md](reliability-workflows.md).

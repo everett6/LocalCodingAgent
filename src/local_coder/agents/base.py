@@ -33,6 +33,7 @@ from local_coder.verification.syntax import check_syntax
 from local_coder.workspace import Workspace
 from local_coder.providers.quota import ProviderQuotaExhausted
 from local_coder.orchestrator.blocked import AgentBlocked
+from local_coder.tools.scheduling import ToolBatchJournal, ToolEffects, scheduled_calls
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,8 @@ class BaseAgent:
         self._last_prompt_tokens = 0
         self._summary_calls = 0
         self._tool_outcomes: dict[str, bool] = {}
+        self._tool_batch_active = False
+        self._last_complete_checkpoint: str | None = None
 
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop, optionally primed
@@ -159,6 +162,8 @@ class BaseAgent:
             raise ValueError("Checkpoint model changed; explicitly select a model before resuming the quota-paused task")
         await run.validate_pending_batch()
         self._run = run
+        self._tool_batch_active = False
+        self._last_complete_checkpoint = str(run._runtime.state_dir / f"checkpoint_{run.run_id}_{run.iteration}.json")
         self.runtime = run._runtime
         self.state = run.state
         self._metrics = run.metrics.model_copy(deep=True)
@@ -233,12 +238,23 @@ class BaseAgent:
                 "profile": redact_data(str(getattr(config, "profile", "generic")))}
 
     async def _pause_for_quota(self, exc: ProviderQuotaExhausted) -> None:
-        path = await self._checkpoint_boundary({"quota_paused": True, "quota_notice": exc.data})
+        if self._tool_batch_active:
+            # Quota may be exhausted by a nested model call after a tool has
+            # already mutated the workspace. Preserve both the last COMPLETE
+            # checkpoint and the pending marker; neither counters nor protocol
+            # history describe a resumable boundary while this batch is active.
+            path = self._last_complete_checkpoint
+            exc.data.update(recovery_required=True, automatic_resume=False,
+                            recovery_reason="Interrupted tool batch; inspect its effects and reconcile the pending journal before starting a new task")
+        else:
+            path = await self._checkpoint_boundary({"quota_paused": True, "quota_notice": exc.data})
         if path is not None:
             exc.data["checkpoint"] = path
         self._emit_event("quota_exhausted", str(exc), task_id=self.state.task_id if self.state else None, data=exc.data)
 
     async def _checkpoint_boundary(self, extra_notes: dict | None = None) -> str | None:
+        if self._tool_batch_active:
+            raise ValueError("Cannot checkpoint an incomplete tool batch; preserve the pending journal for explicit recovery")
         if self._run is None:
             return
         notes = {
@@ -265,6 +281,7 @@ class BaseAgent:
         if permissions is not None:
             notes["allowed_tools"] = sorted(name.value for name in permissions)
         path = await self._run.checkpoint_boundary(self.state, self._metrics, notes)
+        self._last_complete_checkpoint = path
         self._emit_event("checkpoint_saved", "Saved complete agent round", task_id=self.state.task_id,
                          data={"path": path})
         return path
@@ -414,6 +431,8 @@ class BaseAgent:
             self._last_prompt_tokens = 0
             self._summary_calls = 0
             self._tool_outcomes = {}
+            self._tool_batch_active = False
+            self._last_complete_checkpoint = None
             self.state = AgentState(
                 task_id=task.task_id,
                 objective=task.objective,
@@ -625,6 +644,10 @@ class BaseAgent:
                     issues=[] if self._tests_passed else ["Verification tests failed"],
                 )
             
+            if len({tc.id for tc in response.tool_calls}) != len(response.tool_calls):
+                return self._build_response(task, ModelResponse(content="Duplicate tool-call IDs; no tools executed."),
+                                            TaskStatus.FAILED, issues=["Tool-call IDs must be unique within a response"])
+
             # Admit a complete batch before executing any of it. Otherwise a
             # two-tool response could leave a half-executed, unresumable batch.
             if self.state.tool_calls_used + len(response.tool_calls) > self.max_tool_calls:
@@ -646,17 +669,18 @@ class BaseAgent:
             ))
             self.state.messages = list(messages)
             self.state.tool_calls.extend(response.tool_calls)
+            self._tool_batch_active = True
             if self._run is not None:
                 await self._run.begin_tool_batch(response.tool_calls)
             
-            # Execute tool calls
-            for tc in response.tool_calls:
-                self._emit_event(
-                    "tool_call",
-                    f"Calling {tc.name}({json.dumps(tc.arguments)[:100]})",
-                    task_id=task.task_id,
-                )
-                
+            def effects(tc):
+                lookup = getattr(self.tool_registry, "effects_for", None)
+                return lookup(tc.name) if callable(lookup) else ToolEffects()
+
+            journal = ToolBatchJournal(self._run, response.tool_calls, effects)
+
+            async def invoke(tc):
+                self._emit_event("tool_call", f"Calling {tc.name}", task_id=task.task_id)
                 repair = repairs.get(tc.id)
                 blocked = repair.error if repair is not None else None
                 if blocked is None and tc.name not in presented_tools and (self._active_profile.tool_allowlist is not None or getattr(self, "delegation_depth", 0)):
@@ -666,6 +690,8 @@ class BaseAgent:
                 if blocked is not None:
                     result = ToolResult(tool_call_id=tc.id, success=False, output=blocked)
                 else:
+                    effect = effects(tc)
+                    await journal.mark(tc, "started", unknown=effect.mutating)
                     try:
                         context = getattr(self.tool_registry, "task_context", None)
                         token = context.set({"task_id": task.task_id, "role": self.role.value, "files": task.files,
@@ -675,19 +701,29 @@ class BaseAgent:
                         finally:
                             if token is not None:
                                 context.reset(token)
+                    except ProviderQuotaExhausted:
+                        await journal.mark(tc, "unknown" if effect.mutating else "interrupted", unknown=effect.mutating)
+                        raise
                     except AgentBlocked:
                         raise
                     except Exception as exc:
-                        result = ToolResult(
-                            tool_call_id=tc.id,
-                            success=False,
-                            output=f"Tool execution failed: {exc}",
-                        )
+                        result = ToolResult(tool_call_id=tc.id, success=False, output=f"Tool execution failed: {exc}",
+                                            data={"execution_outcome": "unknown", "mutation_completion_unknown": effect.mutating})
+                    if effect.mutating and (result.data.get("mutation_completion_unknown") or result.data.get("execution_outcome") == "unknown"):
+                        await journal.mark(tc, "unknown", unknown=True)
+                        raise AgentBlocked(self._build_response(task, ModelResponse(content=(
+                            f"Tool {tc.name} ({tc.id}) may have changed the workspace before failing. "
+                            "Inspect its effects and reconcile the pending tool journal before starting a new task; automatic replay is blocked.")),
+                            TaskStatus.BLOCKED, issues=["Mutation completion is unknown; explicit recovery required"]))
                     if result.success and result.files_changed:
                         self._append_syntax_errors(result, task)
+                result.tool_call_id = tc.id
+                await journal.mark(tc, "completed", outcome="successful" if result.success else "unsuccessful")
                 if repair is not None and repair.notes:
                     result.output = f"[Note: {'; '.join(repair.notes)}]\n{result.output}"
+                return result
 
+            async for tc, result in scheduled_calls(response.tool_calls, invoke, effects):
                 self._progress_journal.append({"tool": tc.name, "success": result.success,
                                                "arguments": json.dumps(tc.arguments, default=str)[:400], "observation": (result.error or result.output or "")[:240]})
                 self._progress_journal = self._progress_journal[-20:]
@@ -798,7 +834,8 @@ class BaseAgent:
                         f"Nudged the model after {self._repeated_failure_count} identical failing calls to {tc.name}",
                         task_id=task.task_id,
                     )
-            # Never save between tool results in the same assistant response.
+            # Only a fully consumed batch establishes a complete protocol boundary.
+            self._tool_batch_active = False
             await self._checkpoint_boundary()
         
         # Max iterations reached

@@ -4,6 +4,10 @@ const { discoverEngine } = require('./discovery.cjs');
 function isAllowedApiRequest(path, method) {
   if (typeof path !== 'string' || path.length > 4096 || !path.startsWith('/') || path.startsWith('//') || /[\\#\r\n]/.test(path)) return false;
   const pathname = path.split('?')[0];
+  if (method === 'GET' && ['/evaluations', '/findings', '/memory/retrievals', '/context/accounting', '/research/advisories/updates', '/inference/tuning/history', '/doctor'].includes(pathname)) return true;
+  if (method === 'GET' && (/^\/evaluations\/[a-f0-9]{32}$/.test(pathname) || /^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}$/.test(pathname) || /^\/findings\/[a-f0-9]{24}$/.test(pathname) || /^\/memory\/retrievals\/[a-f0-9]{32}$/.test(pathname))) return true;
+  if (method === 'POST' && ['/evaluations/run', '/evaluations/model/run', '/context/tokenizer', '/research/advisories/update', '/inference/tuning/start', '/inference/tuning/apply', '/doctor/repair'].includes(pathname)) return true;
+  if (method === 'POST' && (/^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}\/cancel$/.test(pathname) || /^\/findings\/[a-f0-9]{24}\/(review|prepare|verify|suppress|reopen)$/.test(pathname))) return true;
   if (method === 'GET' && ['/research/capabilities', '/research/evidence', '/research/report', '/research/dependencies', '/research/advisories', '/memory/structure'].includes(pathname)) return true;
   if (method === 'POST' && ['/research/audit', '/research/sarif/import', '/research/advisories/import'].includes(pathname)) return true;
   if (method === 'GET') return ['/goals', '/bug-hunting/models', '/status', '/settings', '/events', '/workspace', '/diff', '/file', '/files', '/sessions', '/engagements', '/engagements/defaults', '/inference', '/inference/discovery', '/providers/models', '/providers/usage', '/providers/quota', '/providers/profiles', '/security-playbooks', '/memory', '/memory/status', '/memory/search', '/harness', '/snapshots', '/approvals', '/integrations/mcp', '/integrations/skills', '/language/status'].includes(pathname)
