@@ -345,3 +345,51 @@ asyncio.run(Agent(Model(), Registry()).execute(AgentTask(role=AgentRole.SECURITY
         assert [message.content for message in model.calls[0][-2:]] == ["one", "two"]
     asyncio.run(scenario())
     assert (tmp_path / "effects.txt").read_text() == "one\ntwo\n"
+
+
+@pytest.mark.parametrize("edit_after_check", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+def test_goal_verification_remembers_test_revision(tmp_path, edit_after_check, resume):
+    from local_coder.memory.goals import GoalLedger
+
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.test", "commit", "--allow-empty",
+                    "-m", "init"], check=True, capture_output=True)
+
+    async def scenario():
+        runtime = AgentRuntime(str(tmp_path))
+        ledger = GoalLedger(tmp_path)
+
+        class EditingRegistry(Registry):
+            async def execute_tool(self, role, name, arguments):
+                if name == "write_file":
+                    (tmp_path / "changed.py").write_text("changed = True")
+                return ToolResult(success=True, output="ok")
+
+        calls = [ModelResponse(tool_calls=[ToolCall(name="run_tests", arguments={})])]
+        if edit_after_check:
+            calls.append(ModelResponse(tool_calls=[ToolCall(name="write_file", arguments={})]))
+        calls.append(ModelResponse(content="Verified."))
+        registry = EditingRegistry(runtime)
+        registry.goal_ledger = ledger
+        agent = HarnessAgent(ScriptedModel(calls), registry)
+        task = AgentTask(role=AgentRole.SECURITY, objective="Verify project")
+        if resume:
+            agent.model = ScriptedModel([calls[0], ProcessCrash()])
+            with pytest.raises(ProcessCrash):
+                await agent.execute(task)
+            checkpoint = runtime.state_dir / f"checkpoint_{agent.state.run_id}_1.json"
+            recovered = await runtime.recover_from_checkpoint(agent.state.run_id, str(checkpoint))
+            agent = HarnessAgent(ScriptedModel(calls[1:]), registry)
+            response = await agent.resume(recovered)
+        else:
+            response = await agent.execute(task)
+        assert response.status == TaskStatus.COMPLETED
+        goal = ledger.get(task.task_id)
+        assert goal["status"] == ("verifying" if edit_after_check else "completed")
+        assert goal["evidence_stale"] is edit_after_check
+        checkpoints = list(runtime.state_dir.glob("checkpoint_*.json"))
+        assert any(json.loads(path.read_text())["notes"].get("test_revisions") for path in checkpoints)
+
+    asyncio.run(scenario())

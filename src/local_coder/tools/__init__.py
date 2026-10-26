@@ -23,6 +23,7 @@ def create_tool_registry(
     approval: ApprovalConfig | None = None,
     approval_callback: ApprovalCallback | None = None,
     safety_harness: Any = None,
+    improvement_evaluator: Any = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry and register all available tools.
 
@@ -52,6 +53,8 @@ def create_tool_registry(
     from local_coder.skills import SkillLibrary, SkillLibraryTool
     from local_coder.types import AgentRole, ToolName
     registry.context_memory = ContextMemory(project_root)
+    from local_coder.memory.goals import GoalLedger
+    registry.goal_ledger = GoalLedger(project_root)
     from local_coder.statedir import state_path
     import json
     language_config = state_path(project_root, ".local-coder/language/settings.json")
@@ -71,7 +74,8 @@ def create_tool_registry(
         registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
     for tool in (MemorySearchTool(registry.context_memory), MemoryWriteTool(registry.context_memory), TaskMemoryTool(registry.context_memory),
                  LanguageContextTool(registry.language_service), MCPTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
-                 HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision),
+                 HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision,
+                                   improvement_evaluator=improvement_evaluator),
                  DelegateTaskTool(), GeneratedToolTool(registry.evolution, runner=registry.sandbox.run)):
         registry.register(tool)
     for role, allowed in registry._permissions.items():
@@ -81,6 +85,7 @@ def create_tool_registry(
             allowed.update({ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL, ToolName.DELEGATE_TASK, ToolName.MCP_CALL})
         if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.REVIEWER}:
             allowed.add(ToolName.MCP_CALL)
+    registry._permissions[AgentRole.BUG_HUNTER].add(ToolName.DELEGATE_TASK)
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
     from local_coder.tools.context_archive import RecoverContextTool

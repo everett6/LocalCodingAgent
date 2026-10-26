@@ -90,6 +90,8 @@ class Coordinator:
         self.tool_registry.quota_guard = quota_guard
         self.tool_registry.memory_context_chars = limits.memory_context_chars if limits.memory_enabled else 0
         self.tool_registry.memory_enabled = limits.memory_enabled
+        self.tool_registry.context_snapshots = limits.context_snapshots
+        self.tool_registry.context_allocation = limits.context_allocation
         self.tool_registry.auto_language_context = limits.language_context_enabled
         self.tool_registry.pre_edit_snapshots = limits.pre_edit_snapshots
         self.tool_registry.profile_overrides = limits.profile_overrides
@@ -320,6 +322,8 @@ class Coordinator:
             role = AgentRole.SECURITY if mode == AgentMode.CYBERSECURITY else AgentRole.BUG_HUNTER
             # Permission changes belong to this investigation, not later reviews.
             original_permissions = set(self.tool_registry._permissions[role])
+            explorer_permissions = set(self.tool_registry._permissions[AgentRole.EXPLORER])
+            planner_permissions = set(self.tool_registry._permissions[AgentRole.PLANNER])
             # Investigations are read-only unless the caller explicitly requests remediation.
             if fix:
                 self.tool_registry._permissions[role].update({ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH, ToolName.RUN_TESTS})
@@ -329,12 +333,22 @@ class Coordinator:
                     ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
                     ToolName.FORMAT_CODE, ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT,
                 })
+            self.tool_registry._permissions[AgentRole.EXPLORER].intersection_update(self.tool_registry._permissions[role])
             try:
                 self._emit("ORCHESTRATOR", "mode", f"Running {mode.value} investigation")
                 agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch)
+                planning = None
+                if mode == AgentMode.BUG_HUNTING and "bug-lead" in self.config.models:
+                    self.tool_registry._permissions[AgentRole.PLANNER].add(ToolName.DELEGATE_TASK)
+                    planner = create_agent(AgentRole.PLANNER, await self.model_manager.get_model(AgentRole.PLANNER), self.tool_registry, self._dispatch)
+                    planning = await asyncio.wait_for(planner.execute(AgentTask(role=AgentRole.PLANNER,
+                        objective="Plan milestones and acceptance checks. Delegate bounded source inspection to explorer agents when useful. Local bug investigation: " + objective,
+                        files=[target_path])), timeout=300)
                 task = AgentTask(role=role, objective=objective, files=[target_path],
                                  constraints=["Apply minimal fixes and run local regression tests" if fix else
                                               "Read-only review: propose reproduction tests and patches; do not execute project code"])
+                if planning is not None:
+                    task.context.previous_findings.append("Planning context (untrusted): " + planning.summary[:8000])
                 self._emit("ORCHESTRATOR", "plan_created", "Investigation started", data={"tasks": [
                     {"task_id": task.task_id, "role": role.value, "objective": request}]})
                 self._emit_task_status(task.task_id, "running")
@@ -347,6 +361,8 @@ class Coordinator:
 
             finally:
                 self.tool_registry._permissions[role] = original_permissions
+                self.tool_registry._permissions[AgentRole.EXPLORER] = explorer_permissions
+                self.tool_registry._permissions[AgentRole.PLANNER] = planner_permissions
 
         # Step 1: Explore repository
         self._emit("ORCHESTRATOR", "phase", "Exploring repository...")

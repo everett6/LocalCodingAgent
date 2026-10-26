@@ -27,7 +27,7 @@ from local_coder import local_server
 from local_coder.orchestrator.config_loader import load_config
 from local_coder.orchestrator.coordinator import Coordinator
 from local_coder.orchestrator.sessions import SessionError, SessionStore
-from local_coder.types import AgentEvent, AgentRole
+from local_coder.types import AgentEvent, AgentRole, AgentMode, ModelConfig
 
 _WEBUI_ROOT = Path(__file__).parent / "webui" / "dist"
 _WEBUI_INDEX = _WEBUI_ROOT / "index.html"
@@ -164,6 +164,20 @@ class RemoteControlServer(WorkbenchAPI):
         config.harness = self.harness_settings()
         mode = getattr(self._context, "mode", config.mode)
         config.mode = mode
+        if mode == AgentMode.BUG_HUNTING:
+            from local_coder.statedir import state_path
+            mapping_path = state_path(self.project_root, ".local-coder/bug-models.json")
+            mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else {}
+            roles = {"lead": ["orchestrator", "planner"],
+                     "delegate": ["explorer", "coder", "debugger", "tester", "reviewer"],
+                     "exploit": ["bug_hunter", "security", "exploit_validator"]}
+            for purpose, profile_id in mapping.items():
+                if profile_id:
+                    record = self.provider_profiles.get(profile_id)
+                    model = ModelConfig.model_validate({**record["provider"], "name": "bug-" + purpose})
+                    config.models[model.name] = model
+                    for role in roles[purpose]:
+                        config.agentic.role_models[role] = model.name
         from local_coder.providers.context_policy import context_policy
         selected = provider or config.models.get(self.model_name or "default") or next(iter(config.models.values()), None)
         if selected is not None and selected.auto_context:
@@ -179,6 +193,8 @@ class RemoteControlServer(WorkbenchAPI):
             config.safety_tier = safety_tier
         coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request,
                                   quota_guard=self.free_quota_guard)
+        if hasattr(coordinator, "tool_registry"):
+            coordinator.tool_registry.goal_id = getattr(self._context, "goal_id", None)
         self.current_budget = getattr(coordinator, "budget", None)
         self.current_registry = getattr(coordinator, "tool_registry", None)
         coordinator.on_event(self._event)

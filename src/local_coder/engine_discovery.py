@@ -14,8 +14,11 @@ def canonical_workspace(workspace):
 def publish_connection(workspace, origin, token):
     if not token:
         return None
-    parent = Path.home() / '.local-coder'
-    directory = parent / 'connections'
+    configured = os.environ.get('LOCAL_CODER_CONNECTION_DIR')
+    directory = Path(configured) if configured else Path.home() / '.local-coder' / 'connections'
+    if not directory.is_absolute():
+        raise ValueError('Engine connection directory must be absolute')
+    parent = directory.parent
     for folder in (parent, directory):
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         if folder.is_symlink() or (os.name != 'nt' and folder.stat().st_uid != os.getuid()):

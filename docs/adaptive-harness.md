@@ -1,5 +1,44 @@
 # Adaptive scaffolding
 
+## Paired self-improvement cycles
+
+`improvement_cycle(store, candidates, evaluator)` evaluates the current active
+overlay and one to three declarative candidate patches against the same fixed
+host-owned benchmark. Each evaluation has a 30-second timeout by default (at most
+60 seconds). Candidates do not build on one another. The evaluator must be async,
+inherit the request's scope and budget, and return actual `cases`, `passed`,
+`total_tokens` and `model_calls` measurements plus a boolean `success`.
+
+A candidate qualifies only when case counts match, passed cases do not decrease,
+neither token use nor model calls increases, and at least one measure improves.
+Zero-case, malformed, nonfinite and failed-baseline results cannot validate a
+revision. Baseline measurements and candidate results are persisted with the
+existing private revision history. Timeouts leave candidates inactive.
+
+The loop saves qualifying revisions; it never activates them. Review the exact
+revision and its benchmark evidence before using the existing activation action.
+Later task outcomes remain observations, and rollback uses the existing approved
+revision lifecycle. Passing a benchmark measures that case set only.
+
+Host integration can pass `improvement_evaluator=` to `create_tool_registry` or
+`HarnessEvolveTool`, then call `harness_evolve(action="improve", candidates=[...])`.
+The evaluator is a trusted callable supplied by the application, never executable
+model text. The default application does not configure a task benchmark; the
+action reports that prerequisite instead of treating the existing contract smoke
+check as proof of improvement. Ordinary proposal/validation remains available.
+
+```python
+from local_coder.harness.improvement import improvement_cycle
+
+# evaluate_on_fixed_cases must measure the same authorized cases for each overlay.
+report = await improvement_cycle(store, [
+    {"strategy": "small_steps"},
+    {"strategy": "hypothesis_then_test", "max_strategy_attempts": 2},
+], evaluate_on_fixed_cases)
+```
+
+## Existing scaffold controls
+
 The harness can propose instructions, skill text, Python helpers and declarative loop plans. These proposals never rewrite engine code. Existing permissions, workspace scope, approval, checkpoints and request budgets remain engine controls outside the evolving scaffold.
 
 `resolve_profile(model_config, role, overrides=None)` selects short instructions for the requested model family and role. It recognizes DeepSeek, GLM, Kimi and Qwen identifiers, including OpenRouter model IDs, and falls back to generic instructions. Explicit controls can change instructions, preferred existing tools, a tool allowlist, approved middleware, strategy and a smaller strategy-attempt limit. A profile only intersects/reorders the schemas supplied by the engine; naming an unavailable tool grants nothing. Unknown fields, arbitrary middleware and unbounded retry limits are rejected.
@@ -85,3 +124,12 @@ model tool can answer an approval. Expiry, cancellation and oversized unreviewab
 requests deny by default. Tiers 1–3 need confirmation for local PoC generation;
 tiers 4–5 permit that bounded generation automatically. MCP mutations retain their
 own explicit human-approval requirement across tiers.
+
+Paired improvement cycles snapshot candidate controls and evaluator results so
+mutable inputs cannot change the baseline during a run. An ordinary evaluator
+failure records the candidate error and continues to the next bounded candidate;
+cancellation stops the cycle. Comparisons require the same measurement keys and
+case count, nondecreasing passes, and nonincreasing tokens and model calls, with
+at least one improvement. Additional numeric observations must remain unchanged
+because they have no declared optimization direction. A failed baseline stops
+evaluation, and successful candidates still require separate activation.
