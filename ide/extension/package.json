@@ -86,6 +86,18 @@
       {
         "command": "localCoder.updateIDE",
         "title": "Local Coder: Check for IDE Updates"
+      },
+      {
+        "command": "localCoder.languageContext",
+        "title": "Local Coder: Inspect Language Context"
+      },
+      {
+        "command": "localCoder.snapshotDiff",
+        "title": "Local Coder: Compare Edit Snapshot"
+      },
+      {
+        "command": "localCoder.memoryInspector",
+        "title": "Local Coder: Inspect Context Memory"
       }
     ],
     "viewsContainers": {
@@ -152,6 +164,18 @@
         },
         {
           "command": "localCoder.engagementReport",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.languageContext",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.snapshotDiff",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.memoryInspector",
           "when": "view == localCoder.tasks"
         }
       ]

@@ -106,10 +106,8 @@ class RemoteControlServer(WorkbenchAPI):
         # --set / --temperature from the command line that started the server.
         self.config_overrides = list(config_overrides or [])
         self.temperature = temperature
-        # The HTTP server has no terminal to prompt with, so there is never
-        # an interactive approval callback here -- ASK-risk actions are
-        # denied unless the operator explicitly opted into --yolo when
-        # starting the server.
+        # The authenticated workbench supplies a human approval inbox.
+        # Unanswered requests expire as denials; model tools cannot respond.
         self.yolo = yolo
         self.token = token
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
@@ -166,7 +164,13 @@ class RemoteControlServer(WorkbenchAPI):
         if self.yolo:
             config.approval.require_approval_for_commands = False
             config.approval.require_approval_for_commits = False
-        coordinator = Coordinator(config=config, project_root=self.project_root)
+        config.harness = self.harness_settings()
+        safety_tier = self.harness_safety_tier()
+        if safety_tier is not None:
+            config.safety_tier = safety_tier
+        coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request)
+        self.current_budget = getattr(coordinator, "budget", None)
+        self.current_registry = getattr(coordinator, "tool_registry", None)
         coordinator.on_event(self._event)
         return coordinator
 

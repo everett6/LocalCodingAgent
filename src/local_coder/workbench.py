@@ -9,13 +9,12 @@ import time
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
-from pydantic import SecretStr
-
 from local_coder.types import AgentEvent, AgentMode, ModelBackend, ModelConfig
 from local_coder.workspace import Workspace
+from local_coder.harness_api import HarnessAPI
 
 
-class WorkbenchAPI:
+class WorkbenchAPI(HarnessAPI):
     def _init_workbench(self):
         from local_coder.redteam import EngagementStore
         self.engagements = EngagementStore(self.project_root)
@@ -28,6 +27,7 @@ class WorkbenchAPI:
         self._context = threading.local()
         self.instance_id = uuid4().hex
         self._stopping = False
+        self._init_harness_api()
 
     def reconcile_sessions(self):
         # Only the engine holding the workspace lease may reconcile process state.
@@ -38,6 +38,7 @@ class WorkbenchAPI:
 
     def drain_jobs(self, timeout=12):
         self._stopping = True
+        self.approvals.cancel_all()
         with self.lock:
             jobs = list(self._jobs.values())
             for job in jobs:
@@ -102,6 +103,8 @@ class WorkbenchAPI:
                 profile=body.get("profile", "generic"),
                 strategy_attempt_limit=int(body.get("strategy_attempt_limit", 3)),
                 max_tokens=max(128, min(int(body.get("max_tokens", 4096)), 32768)),
+                input_cost_per_million=body.get("input_cost_per_million"),
+                output_cost_per_million=body.get("output_cost_per_million"),
                 context_length=max(1024, min(int(body.get("context_length", 32768)), 2000000)))
         self._using_inference = False
         return self._settings()
@@ -232,6 +235,9 @@ class WorkbenchAPI:
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            extra = self._harness_get(path, query) if method == "GET" else self._harness_post(path, body) if method == "POST" else None
+            if extra is not None:
+                return 200, extra
             if path == "/security-playbooks" and method == "GET":
                 from local_coder.security_playbooks import PLAYBOOKS
                 return 200, {"playbooks": list(PLAYBOOKS.values())}

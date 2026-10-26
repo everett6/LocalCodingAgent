@@ -679,3 +679,18 @@ local models make far more often than frontier ones.
 
 Each can be turned off per agent class with `parse_text_tool_calls`,
 `require_read_before_overwrite`, and `check_syntax_after_edits`.
+
+## Context memory and evolving harness
+
+The desktop sidebar now includes **Project memory**, **Harness controls**, and
+**Connections & skills**. Context is retrieved within a fixed budget before each
+agent step; file snapshots, shared model-call/token/cost caps, declarative model
+profiles and bounded leaf delegation keep long tasks reviewable. The IDE adds
+**Local Coder: Language Context**, **Compare Agent Snapshot**, and **Inspect Project Memory** commands.
+
+See [context memory](docs/context-memory.md), [adaptive scaffolding](docs/adaptive-harness.md),
+[language context](docs/language-context.md), [MCP and skills](docs/mcp-and-skills.md),
+and [local security generation](docs/exploit-generation.md) for interfaces and limits.
+GitHub MCP is an explicit connection using your chosen environment variable; it
+starts disabled. The built-in vector backend uses local lexical hashes, with no
+model download or claim of neural semantic search.

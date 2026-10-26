@@ -190,6 +190,8 @@ def load_config(
             context_length=model_data.get("context_length", 8192),
             temperature=temperature if temperature is not None else model_data.get("temperature", 0.2),
             max_tokens=model_data.get("max_tokens", 4096),
+            input_cost_per_million=model_data.get("input_cost_per_million"),
+            output_cost_per_million=model_data.get("output_cost_per_million"),
             quantization=model_data.get("quantization"),
             gpu_layers=model_data.get("gpu_layers"),
             estimated_vram_mb=model_data.get("estimated_vram_mb"),
@@ -253,7 +255,9 @@ def load_config(
         roles=tool_roles,
     )
 
+    from local_coder.types import HarnessSettings
     return ProjectConfig(
+        harness=HarnessSettings.model_validate(data.get("harness", {})),
         models=models,
         resources=resources,
         verification=verification,

@@ -35,6 +35,16 @@ function validateProvider(provider) {
   if (url.protocol === 'http:' && !['localhost','127.0.0.1','[::1]'].includes(url.hostname)) throw new Error('Remote providers require HTTPS');
   return {...provider};
 }
+function isAllowedEngineRequest(route, method) {
+  if (typeof route !== 'string' || route.length > 4096 || /[\\#\r\n]/.test(route) || !['GET','POST'].includes(method)) return false;
+  const pathname = route.split('?')[0];
+  if (!route.startsWith('/') || route.startsWith('//') || /%(2e|2f|5c|00)/i.test(pathname)) return false;
+  try { if (new URL(route, 'http://127.0.0.1').pathname !== pathname) return false; } catch { return false; }
+  if (/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route)) return true;
+  if (method !== 'GET') return false;
+  return ['/memory','/memory/status','/memory/search','/snapshots','/language/status'].includes(pathname)
+    || /^\/snapshots\/[a-f0-9]{32}\/diff$/.test(pathname);
+}
 class EngineConnection {
   constructor(options) {
     this.options=options;
@@ -114,9 +124,8 @@ class EngineConnection {
   }
   async request(route,method='GET',body,timeout=30000) {
     if(this.closed&&route!=='/shutdown')throw new Error('Engine connection is closed');
+    if(!isAllowedEngineRequest(route,method))throw new Error('Unsupported engine API route or method');
     if(!this.url)await this.start();
-    if(!/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route))throw new Error('Unsupported engine API route');
-    if(!['GET','POST'].includes(method))throw new Error('Unsupported engine API method');
     const payload=body===undefined?null:JSON.stringify(body);
     return new Promise((resolve,reject)=>{
       const req=http.request(new URL(route,this.url),{method,headers:{Authorization:`Bearer ${this.token}`,...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{})},timeout},res=>{
@@ -187,4 +196,4 @@ class EngineConnection {
   }
 
 }
-module.exports={EngineConnection,validateLoopbackURL,validateJob,validateProvider};
+module.exports={EngineConnection,validateLoopbackURL,validateJob,validateProvider,isAllowedEngineRequest};

@@ -4,6 +4,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {EngineConnection,validateJob,validateProvider}=require('./engine.cjs');
+const {registerHarnessViews}=require('./harness-views.cjs');
 let active;
 const presets=[
   {label:'DeepSeek V4.1 Flash · OpenRouter',backend:'openai_compatible',model_id:'deepseek/deepseek-v4.1-flash-1017',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_deepseek',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
@@ -68,6 +69,7 @@ function activate(context){
     })().catch(async error=>{services.delete(folder.uri.fsPath);await engine.stop();throw error;});
     return entry.ready;
   }
+  registerHarnessViews(vscode,context,async()=>{const folder=await chooseFolder();return folder?service(folder):undefined;});
   const tree={onDidChangeTreeData:changed.event,getTreeItem:item=>item,getChildren:async item=>{
     if(!item)return (vscode.workspace.workspaceFolders||[]).filter(folder=>folder.uri.scheme==='file').map(folder=>{
       const node=new vscode.TreeItem(folder.name,vscode.TreeItemCollapsibleState.Expanded);node.folder=folder;node.contextValue='localCoder.workspace';

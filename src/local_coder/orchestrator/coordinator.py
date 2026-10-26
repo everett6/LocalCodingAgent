@@ -3,6 +3,7 @@ import hashlib
 import os
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -75,6 +76,26 @@ class Coordinator:
         )
         self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config)
+        from local_coder.core.budgets import BudgetLedger
+        from local_coder.statedir import state_path
+        limits = config.harness
+        self.budget = BudgetLedger(max_requests=limits.max_requests, max_tokens=limits.max_tokens,
+                                   max_request_tokens=limits.max_request_tokens, max_cost_usd=limits.max_cost_usd,
+                                   state_path=state_path(project_root, f".local-coder/budgets/{uuid.uuid4().hex}.json"))
+        self.model_manager.budget = self.budget
+        self.model_manager.on_close = self.tool_registry.close
+        self.tool_registry.budget = self.budget
+        self.tool_registry.memory_context_chars = limits.memory_context_chars if limits.memory_enabled else 0
+        self.tool_registry.memory_enabled = limits.memory_enabled
+        self.tool_registry.auto_language_context = limits.language_context_enabled
+        self.tool_registry.pre_edit_snapshots = limits.pre_edit_snapshots
+        self.tool_registry.profile_overrides = limits.profile_overrides
+        self.tool_registry.sandbox.backend = limits.sandbox_backend
+        self.tool_registry.sandbox.image = limits.sandbox_image
+        self.tool_registry.max_subagents = limits.max_subagents
+        delegate = self.tool_registry.get_tool(ToolName.DELEGATE_TASK)
+        if delegate is not None:
+            delegate.callback = self._delegate_task
         self.tool_registry.runtime = self.runtime
         self.runtime.model_name_for = self._model_name_for
         self.resource_manager = ResourceManager(config.resources)
@@ -83,6 +104,35 @@ class Coordinator:
         # draft prompt (e.g. the same file across a fix-loop retry) can hit
         # the cache instead of paying for another small-model round trip.
         self._prompt_cache = PromptCache()
+
+    async def _delegate_task(self, request):
+        """Leaf agents share the exact registry, scope, approval callback and ledger."""
+        from local_coder.workspace import Workspace
+        current = self.tool_registry.task_context.get() or {}
+        if current.get("depth", 0) or not current.get("task_id"):
+            raise ValueError("Delegation requires an active parent task and permits one level only")
+        if self.tool_registry.get_tool(ToolName.DELEGATE_TASK)._requests > self.config.harness.max_subagents:
+            raise ValueError("Shared sub-agent limit reached")
+        child, parent = AgentRole(request["role"]), AgentRole(current["role"])
+        if not self.tool_registry._permissions[child].issubset(self.tool_registry._permissions[parent]):
+            raise ValueError("Child capabilities exceed parent capabilities")
+        workspace = Workspace(self.project_root)
+        roots = [workspace.resolve(path) for path in current.get("files", [])]
+        files = request.get("files") or list(current.get("files", []))
+        for path in files:
+            target = workspace.resolve(path)
+            if roots and not any(target == root or target.is_relative_to(root) for root in roots):
+                raise ValueError("Child task path exceeds inherited scope")
+        agent = create_agent(child, await self.model_manager.get_model(child), self.tool_registry, self._dispatch,
+                             context_window_chars=self.config.agentic.context_window_chars,
+                             compact_context_chars=self.config.agentic.compact_context_chars)
+        agent.delegation_depth = 1
+        task = AgentTask(role=child, objective=request["objective"], files=files,
+                         constraints=["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate."])
+        self._emit("ORCHESTRATOR", "subagent_started", f"Started scoped {child.value} leaf task", data={"task_id": task.task_id, "parent_task_id": current["task_id"]})
+        response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+        self._emit("ORCHESTRATOR", "subagent_finished", f"Leaf task {response.status.value}", data={"task_id": task.task_id})
+        return {"success": response.status == TaskStatus.COMPLETED, "output": response.summary}
 
     def _model_name_for(self, model) -> str | None:
         """Capture the resolved config key instead of rerouting roles on restart."""
@@ -213,6 +263,9 @@ class Coordinator:
         coding runs also save completed phases to the optional checkpoint.
         """
         self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
+        delegate = self.tool_registry.get_tool(ToolName.DELEGATE_TASK)
+        if delegate is not None:
+            delegate.reset_request()
 
         objective = f"{history}\n\nCurrent request: {request}" if history else request
 
@@ -253,7 +306,6 @@ class Coordinator:
 
         if mode in (AgentMode.CYBERSECURITY, AgentMode.BUG_HUNTING):
             from local_coder.workspace import Workspace
-            from local_coder.types import ToolName
             Workspace(self.project_root).resolve(target_path)
             role = AgentRole.SECURITY if mode == AgentMode.CYBERSECURITY else AgentRole.BUG_HUNTER
             # Permission changes belong to this investigation, not later reviews.

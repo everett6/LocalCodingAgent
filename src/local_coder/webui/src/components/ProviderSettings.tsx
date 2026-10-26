@@ -3,10 +3,11 @@ import { X, KeyRound } from 'lucide-react'
 import { api, presets } from '../api'
 import type { Provider } from '../api'
 import { LocalInferenceSettings } from './LocalInferenceSettings'
-export function ProviderSettings({ provider, close, saved }: { provider: Provider | null; close: () => void; saved: (provider: Provider) => void }) {
+type PricedProvider = Provider & { input_cost_per_million?: number | null; output_cost_per_million?: number | null }
+export function ProviderSettings({ provider, close, saved }: { provider: PricedProvider | null; close: () => void; saved: (provider: Provider) => void }) {
   const [tab, setTab] = useState(provider?.name === 'on-device' ? 'local' : 'cloud')
   const dialog = useRef<HTMLDialogElement>(null)
-  const [form, setForm] = useState<Provider>(provider || presets.glm)
+  const [form, setForm] = useState<PricedProvider>(provider || presets.glm)
   const [key, setKey] = useState('')
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -26,6 +27,8 @@ export function ProviderSettings({ provider, close, saved }: { provider: Provide
     <label>Or use an environment variable<input value={form.api_key_env || ''} placeholder="PROVIDER_API_KEY" onChange={event => setForm({ ...form, api_key_env: event.target.value })} /></label>
     <div className="form-row"><label>Harness profile<select value={form.profile || 'generic'} onChange={event => setForm({ ...form, profile: event.target.value })}><option value="generic">Standard</option><option value="glm53">GLM 5.3 · preserved reasoning</option><option value="qwen38">Qwen 3.8 · streamed tools</option><option value="openrouter_deepseek">OpenRouter · DeepSeek</option><option value="openrouter_glm">OpenRouter · GLM</option><option value="openrouter_kimi">OpenRouter · Kimi</option></select></label><label>Output token budget<input type="number" min={128} max={32768} value={form.max_tokens || 4096} onChange={event => setForm({ ...form, max_tokens: Number(event.target.value) })} /></label></div>
     <label>Recovery strategy attempts<input type="number" min={1} max={10} value={form.strategy_attempt_limit || 3} onChange={event => setForm({ ...form, strategy_attempt_limit: Number(event.target.value) })} /></label>
+    <div className="form-row"><label>Input price · USD per million tokens<input type="number" min={0} step="any" value={form.input_cost_per_million ?? ''} placeholder="Optional" onChange={event => setForm({ ...form, input_cost_per_million: event.target.value === '' ? null : Number(event.target.value) })} /></label><label>Output price · USD per million tokens<input type="number" min={0} step="any" value={form.output_cost_per_million ?? ''} placeholder="Optional" onChange={event => setForm({ ...form, output_cost_per_million: event.target.value === '' ? null : Number(event.target.value) })} /></label></div>
+    <p className="hint">A strict task dollar cap requires both prices. Enter the rates for your provider; a blank price is unknown, and zero means free.</p>
     <p className="hint">Keys stay in this engine’s memory until it closes. Use environment variables for your own persistent setup. Model access, billing and endpoint region depend on your provider.</p>{error && <p role="alert" className="error-text">{error}</p>}<button className="primary" disabled={saving}>{saving ? 'Saving…' : 'Save connection'}</button>
   </form>}</dialog>
 }

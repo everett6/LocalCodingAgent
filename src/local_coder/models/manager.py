@@ -16,6 +16,7 @@ class ModelManager:
     
     def __init__(self, config: ProjectConfig):
         self.config = config
+        self.budget = None
         self._models: Dict[str, LocalModel] = {}
         self._lock = asyncio.Lock()
         # Reachability of models that have fallbacks, probed once per manager.
@@ -30,7 +31,11 @@ class ModelManager:
         async with self._lock:
             for name, model_config in self.config.models.items():
                 if name not in self._models:
-                    self._models[name] = self._create_backend(model_config)
+                    model = self._create_backend(model_config)
+                    if self.budget is not None:
+                        from local_coder.core.budgets import BudgetedModel
+                        model = BudgetedModel(model, self.budget)
+                    self._models[name] = model
 
     def _create_backend(self, config: ModelConfig) -> LocalModel:
         """Factory for creating backend instances."""
@@ -128,3 +133,6 @@ class ModelManager:
                 if hasattr(model, "close"):
                     await model.close()
             self._models.clear()
+        callback = getattr(self, "on_close", None)
+        if callback is not None:
+            await callback()

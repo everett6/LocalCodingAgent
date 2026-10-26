@@ -49,6 +49,11 @@ test('native commands keep credentials in SecretStorage and submit real provider
   vm.runInNewContext(fs.readFileSync(extensionPath,'utf8'),sandbox,{filename:extensionPath});
   try{
     sandbox.module.exports.activate(context);
+    const manifest=require('../package.json');
+    for(const command of ['localCoder.languageContext','localCoder.snapshotDiff','localCoder.memoryInspector']){
+      assert.equal(typeof commands.get(command),'function');
+      assert.ok(manifest.contributes.commands.some(item=>item.command===command));
+    }
     picks.push(items=>items.find(item=>item.label.includes('Z.ai')));
     await commands.get('localCoder.configureProvider')();
     const posted=requests.find(item=>item.url==='/settings'&&item.method==='POST').body;
