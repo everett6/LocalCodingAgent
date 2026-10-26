@@ -112,3 +112,15 @@ completion is unknown—including a partial patch or quota error inside its batc
 retains the last complete checkpoint and replay guard. Recovery identifies the
 uncertain operation and requires inspection rather than repeating it. Ordinary
 completed test failures remain available for debugging.
+
+## IDE update sandbox continuity
+
+Linux fork updates preserve the already configured root-owned Chromium sandbox
+helper only when its bounded SHA-256 matches the incoming regular helper.
+Changed or unconfigured helpers stop publication with a manual setup message.
+Failed transfer/publication restores the original directory and helper; if that
+rollback also fails, both recovery paths are retained rather than deleted.
+A completed update moves the configured helper forward: its historical directory
+backup contains the incoming unconfigured helper. Manual rollback must move the
+configured matching helper back, or perform administrator sandbox setup, before
+launching that backup. The updater never disables the sandbox or changes ownership.
