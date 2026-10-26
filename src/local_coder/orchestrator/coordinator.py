@@ -31,6 +31,7 @@ from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
 from local_coder.verification.failures import summarize_failures
 from local_coder.verification.test_runner import detect_framework
+from local_coder.providers.quota import ProviderQuotaExhausted
 
 
 class RunCheckpoint(Protocol):
@@ -51,6 +52,7 @@ class Coordinator:
         config: ProjectConfig,
         project_root: str,
         approval_callback: ApprovalCallback | None = None,
+        quota_guard=None,
     ):
         self.config = config
         self.project_root = project_root
@@ -75,7 +77,7 @@ class Coordinator:
             safety_harness=self.safety_harness,
         )
         self.tool_registry.apply_settings(config.tools)
-        self.model_manager = ModelManager(config)
+        self.model_manager = ModelManager(config, quota_guard=quota_guard)
         from local_coder.core.budgets import BudgetLedger
         from local_coder.statedir import state_path
         limits = config.harness
@@ -85,6 +87,7 @@ class Coordinator:
         self.model_manager.budget = self.budget
         self.model_manager.on_close = self.tool_registry.close
         self.tool_registry.budget = self.budget
+        self.tool_registry.quota_guard = quota_guard
         self.tool_registry.memory_context_chars = limits.memory_context_chars if limits.memory_enabled else 0
         self.tool_registry.memory_enabled = limits.memory_enabled
         self.tool_registry.auto_language_context = limits.language_context_enabled
@@ -138,7 +141,7 @@ class Coordinator:
         """Capture the resolved config key instead of rerouting roles on restart."""
         return next((name for name, loaded in self.model_manager._models.items() if loaded is model), None)
 
-    async def resume_checkpoint(self, path: str) -> AgentResponse:
+    async def resume_checkpoint(self, path: str, *, allow_model_change: bool = False) -> AgentResponse:
         """Resume the latest complete round for a workspace-local checkpoint's run.
 
         Paths are absolute or relative to the project root. Invalid/legacy files
@@ -168,6 +171,8 @@ class Coordinator:
         try:
             if not recovered.notes.get("boundary_complete"):
                 raise ValueError("Checkpoint is not a complete agent round")
+            if type(allow_model_change) is not bool or (allow_model_change and recovered.notes.get("quota_paused") is not True):
+                raise ValueError("Model changes require explicit approval of a quota-paused checkpoint")
             final_path = self.runtime.state_dir / f"run_{run_id}_final.json"
             if final_path.exists():
                 if final_path.resolve().parent != self.runtime.state_dir:
@@ -193,14 +198,19 @@ class Coordinator:
                 scope = EngagementStore(self.project_root).load(task.engagement_id)['scope']
                 if scope['active_http'] and self.config.safety_tier == SafetyTier.TIER_1_PARANOIA:
                     raise ValueError("Read-only safety tier does not allow active HTTP observations")
+            model = await self.model_manager.get_model(task.role, None if allow_model_change else task.model_name)
+            if allow_model_change:
+                task = task.model_copy(update={"model_name": self._model_name_for(model)})
+                recovered.task = task
             agent = create_agent(
-                task.role, await self.model_manager.get_model(task.role, task.model_name),
+                task.role, model,
                 self.tool_registry, self._dispatch,
                 context_window_chars=self.config.agentic.context_window_chars,
                 compact_context_chars=self.config.agentic.compact_context_chars,
             )
             self._emit_task_status(task.task_id, "running", "Resuming saved checkpoint")
-            response = await asyncio.wait_for(agent.resume(recovered), timeout=task.timeout_seconds)
+            continuation = agent.resume(recovered, allow_model_change=True) if allow_model_change else agent.resume(recovered)
+            response = await asyncio.wait_for(continuation, timeout=task.timeout_seconds)
             completed = response.status == TaskStatus.COMPLETED
             self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
             self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed",
@@ -524,6 +534,8 @@ class Coordinator:
                 if not tasks:
                     raise ValueError("No tasks found in plan")
                 return TaskPlan(objective=request, tasks=tasks, notes=[plan_data])
+            except ProviderQuotaExhausted:
+                raise
             except Exception as e:
                 self._emit("ORCHESTRATOR", "plan_error", f"Failed to parse plan JSON: {e}")
                 # Fallback on failure
@@ -631,7 +643,15 @@ class Coordinator:
                 dag.mark_running(task.task_id)
                 self._emit_task_status(task.task_id, "running")
             semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
-            await asyncio.gather(*(self._run_dag_task(dag, task, semaphore, checkpoint) for task in ready_tasks))
+            running = [asyncio.create_task(self._run_dag_task(dag, task, semaphore, checkpoint)) for task in ready_tasks]
+            try:
+                await asyncio.gather(*running)
+            except ProviderQuotaExhausted:
+                for sibling in running:
+                    if not sibling.done():
+                        sibling.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
 
         return AgentResponse(
             task_id="plan_execution",
@@ -738,6 +758,8 @@ class Coordinator:
                 issues=[],
                 follow_up_required=False
             )
+        except ProviderQuotaExhausted:
+            raise
         except Exception as e:
             return AgentResponse(
                 task_id=task.task_id,

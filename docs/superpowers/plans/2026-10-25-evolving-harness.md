@@ -56,3 +56,12 @@
 - [x] Add per-request token/cost budget ledger, pre-edit file snapshots, conditional rollback, sandbox adapter and editor diff views.
 - [x] Wire new tools, automatic retrieval, model overlays, delegation and registry controls.
 - [x] Run complete clean-worktree Python tests, frontend build/lint, desktop/IDE checks and synthetic end-to-end runs; document limits and ship reviewable source.
+
+### Task 7: Automatic provider and local setup (user follow-up)
+- [x] Add full live OpenRouter catalog, exact free variants, key-free saved profiles and native catalog selection.
+- [x] Add daily request allowance admission, recoverable quota pauses and explicit paid continuation with spending limits.
+- [x] Allocate mode-aware context within detected capacity and conservative request limits.
+- [x] Reproduce the encoded-archive decompression failure and preserve raw archive bytes for checksum validation.
+- [x] Discover local model/runtime metadata, expose searchable results, and save protected path-only preferences.
+- [x] Prefill source-only engagement defaults, normalize URL schemes and simplify review setup.
+- [x] Connect authenticated desktop and IDE routes and verify automatic setup without paid inference calls.

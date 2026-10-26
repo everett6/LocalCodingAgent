@@ -1,5 +1,6 @@
 """Shared request admission and conservative token/cost accounting."""
 from __future__ import annotations
+import asyncio
 import json
 import math
 import os
@@ -52,9 +53,10 @@ class BudgetLedger:
         output=max(1,int(max_tokens));tokens=prompt_bound+output
         input_price=getattr(config,'input_cost_per_million',None)
         output_price=getattr(config,'output_cost_per_million',None)
-        if any(p is not None and (not math.isfinite(p) or p<0) for p in [input_price,output_price]):
+        request_price=getattr(config,'request_cost_usd',0)
+        if any(p is not None and (isinstance(p,bool) or not isinstance(p,(int,float)) or not math.isfinite(p) or p<0) for p in [input_price,output_price,request_price]):
             raise BudgetExceeded('Invalid model pricing')
-        cost=(prompt_bound*input_price+output*output_price)/1_000_000 if input_price is not None and output_price is not None else None
+        cost=(prompt_bound*input_price+output*output_price)/1_000_000+request_price if input_price is not None and output_price is not None and request_price is not None else None
         with self._lock:
             status=self.status()
             if len(self.entries)>=self.limits['max_requests']:raise BudgetExceeded('Model request limit reached')
@@ -77,30 +79,55 @@ class BudgetLedger:
             if response is not None and type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and prompt+completion>0:
                 entry.update(tokens=prompt+completion,prompt_tokens=prompt,completion_tokens=completion,usage='provider_reported')
                 ip=getattr(config,'input_cost_per_million',None);op=getattr(config,'output_cost_per_million',None)
-                if ip is not None and op is not None:entry['cost_usd']=(prompt*ip+completion*op)/1_000_000
+                request_price=getattr(config,'request_cost_usd',0)
+                if ip is not None and op is not None and request_price is not None:entry['cost_usd']=(prompt*ip+completion*op)/1_000_000+request_price
             # Failed/unknown requests retain the reservation; do not treat retries as free.
             self._save()
 
+    def release_unattempted(self, identity):
+        """Release admission rejected before invoking a backend, never HTTP failures."""
+        with self._lock:
+            entry = next((item for item in self.entries if item['id'] == identity), None)
+            if entry is None or entry['status'] != 'reserved':
+                return False
+            self.entries.remove(entry)
+            self._save()
+            return True
+
 
 class BudgetedModel:
-    def __init__(self,model,ledger):self.model=model;self.ledger=ledger
+    def __init__(self,model,ledger,quota_guard=None):self.model=model;self.ledger=ledger;self.quota_guard=quota_guard
     @property
     def config(self):
         return getattr(self.model, 'config', SimpleNamespace(model_id='unconfigured', temperature=0.2, max_tokens=4096,
                        context_length=None, strategy_attempt_limit=3, profile='generic'))
     def __getattr__(self,name):return getattr(self.model,name)
-    async def generate(self,messages,**kwargs):
+    async def _admit(self, messages, kwargs):
         output=kwargs.get('max_tokens') or getattr(self.config,'max_tokens',4096)
-        identity=self.ledger.reserve(self.config,messages,output,kwargs.get('tools'))
+        identity=self.ledger.reserve(self.config,messages,output,kwargs.get('tools')) if self.ledger is not None else None
+        try:
+            if self.quota_guard is not None:
+                await asyncio.to_thread(self.quota_guard.admit,self.config)
+        except BaseException:
+            # No backend call has started. Local budget rejection must not
+            # consume quota; quota rejection must not consume the local budget.
+            if identity is not None:self.ledger.release_unattempted(identity)
+            raise
+        return identity
+    async def generate(self,messages,**kwargs):
+        identity=await self._admit(messages,kwargs)
         try:
             result=await self.model.generate(messages,**kwargs)
         except BaseException:
-            self.ledger.settle(identity,error=True,config=self.config);raise
-        self.ledger.settle(identity,result,config=self.config);return result
+            if identity is not None:self.ledger.settle(identity,error=True,config=self.config)
+            raise
+        if identity is not None:self.ledger.settle(identity,result,config=self.config)
+        return result
     async def stream(self,messages,**kwargs):
-        identity=self.ledger.reserve(self.config,messages,kwargs.get('max_tokens') or getattr(self.config,'max_tokens',4096),kwargs.get('tools'))
+        identity=await self._admit(messages,kwargs)
         failed=True
         try:
             async for text in self.model.stream(messages,**kwargs):yield text
             failed=False
-        finally:self.ledger.settle(identity,error=failed,config=self.config)
+        finally:
+            if identity is not None:self.ledger.settle(identity,error=failed,config=self.config)

@@ -126,10 +126,11 @@ def test_dns_changes_never_retarget_a_saved_engagement(tmp_path,monkeypatch):
     assert EngagementStore(str(tmp_path)).load(record['id'])['requests_used']==0
 
 
-def test_engagement_api_requires_a_scope_and_rejects_fix_or_plan(tmp_path):
+def test_engagement_api_defaults_to_local_scope_and_rejects_fix_or_plan(tmp_path):
     from local_coder.remote import RemoteControlServer
     server=RemoteControlServer(str(tmp_path))
-    assert server.handle('POST','/jobs',{'request':'Review boundaries','mode':'red_team'})[0]==400
+    defaults = server.handle('GET', '/engagements/defaults')[1]['settings']
+    assert defaults['origins'] == [] and defaults['active_http'] is False
     assert server.handle('POST','/engagements',{'name':'lab','objective':'test','active_http':True,'origins':['https://example.test']})[0]==400
     status,engagement=server.handle('POST','/engagements',{'name':'lab','objective':'test'})
     assert status==201

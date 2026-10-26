@@ -171,11 +171,14 @@ class ModelConfig(BaseModel):
     model_id: str  # The model identifier for the backend (e.g., 'qwen2.5-coder:7b')
     base_url: str = "http://localhost:11434"  # Default Ollama URL
     context_length: int = 8192
+    auto_context: bool = True
+    context_source: str = Field(default="configured", max_length=100)
     temperature: float = 0.2
     strategy_attempt_limit: int = Field(default=3, ge=1, le=10)
     max_tokens: int = 4096
     input_cost_per_million: float | None = Field(default=None, ge=0)
     output_cost_per_million: float | None = Field(default=None, ge=0)
+    request_cost_usd: float | None = Field(default=0, ge=0)
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None

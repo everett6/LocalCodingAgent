@@ -158,17 +158,27 @@ class RemoteControlServer(WorkbenchAPI):
             config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
         elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
-        if provider is not None and (provider.profile.startswith("openrouter_") or self._using_inference):
-            config.agentic.context_window_chars = min(provider.context_length * 3, 240000)
-            config.agentic.compact_context_chars = config.agentic.context_window_chars // 2
         if self.yolo:
             config.approval.require_approval_for_commands = False
             config.approval.require_approval_for_commits = False
         config.harness = self.harness_settings()
+        mode = getattr(self._context, "mode", config.mode)
+        config.mode = mode
+        from local_coder.providers.context_policy import context_policy
+        selected = provider or config.models.get(self.model_name or "default") or next(iter(config.models.values()), None)
+        if selected is not None and selected.auto_context:
+            policy = context_policy(selected, mode, config.harness)
+            config.agentic.context_window_chars = policy["context_window_chars"]
+            config.agentic.compact_context_chars = policy["compact_context_chars"]
+            config.harness.memory_context_chars = policy["memory_chars"]
+            for model in config.models.values():
+                if model.auto_context:
+                    model.max_tokens = context_policy(model, mode, config.harness)["completion_tokens"]
         safety_tier = self.harness_safety_tier()
         if safety_tier is not None:
             config.safety_tier = safety_tier
-        coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request)
+        coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request,
+                                  quota_guard=self.free_quota_guard)
         self.current_budget = getattr(coordinator, "budget", None)
         self.current_registry = getattr(coordinator, "tool_registry", None)
         coordinator.on_event(self._event)

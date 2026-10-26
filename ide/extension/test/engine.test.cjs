@@ -19,6 +19,11 @@ test('validates bounded job input and provider protocol before transport', () =>
   assert.throws(() => validateProvider({backend:'ollama',model_id:'x',base_url:'file:///tmp/key',profile:'generic'}));
   assert.equal(validateProvider({backend:'openai_compatible',model_id:'qwen',base_url:'https://example.org/v1',profile:'qwen38',max_tokens:8192}).profile,'qwen38');
 });
+test('native provider metadata preserves bounded automatic context and rejects invalid controls', () => {
+  const provider={backend:'openai_compatible',model_id:'vendor/model',base_url:'https://openrouter.ai/api/v1',profile:'generic',max_tokens:16384,context_length:262144,auto_context:true,context_source:'openrouter',input_cost_per_million:0,output_cost_per_million:0.2,request_cost_usd:0};
+  assert.equal(validateProvider(provider).auto_context,true);
+  for(const changes of [{auto_context:'yes'},{context_length:Infinity},{context_length:0},{input_cost_per_million:-1},{output_cost_per_million:NaN},{request_cost_usd:-1}])assert.throws(()=>validateProvider({...provider,...changes}));
+});
 test('shared engine authenticates requests and is not terminated on dispose', async () => {
   let seen,shutdowns=0;
   const server=http.createServer((req,res)=>{if(req.url==='/shutdown')shutdowns++;seen=req.headers.authorization;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({project_root:'/tmp',sessions:[]}));});

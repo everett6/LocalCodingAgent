@@ -80,7 +80,19 @@ jobs:
       - run: npm run build --prefix ide
         env:
           NODE_OPTIONS: --max-old-space-size=6144
+      - name: Configure the built Chromium sandbox helper
+        run: |
+          test -f ide/VSCode-linux-x64/chrome-sandbox
+          sudo chown root:root ide/VSCode-linux-x64/chrome-sandbox
+          sudo chmod 4755 ide/VSCode-linux-x64/chrome-sandbox
       - run: xvfb-run -a npm run smoke --prefix ide
+      - name: Preserve native smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-coder-ide-smoke-diagnostics
+          path: ide/.build/vscode-smoke.log
+          if-no-files-found: ignore
       - name: Package own fork and checksum manifest
         env:
           VERSION: ${{ steps.pin.outputs.version }}

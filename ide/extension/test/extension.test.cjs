@@ -8,7 +8,7 @@ const {createRequire}=require('node:module');
 
 test('native commands keep credentials in SecretStorage and submit real provider, harness, and investigation payloads',async()=>{
   const requests=[],commands=new Map(),inputs=[],picks=[],messages=[],state=new Map(),secrets=new Map(),subscriptions=[];
-  let provider=null,sessions=[];
+  let provider=null,sessions=[],catalogUnavailable=false;
   const server=http.createServer(async(req,res)=>{
     let text='';for await(const chunk of req)text+=chunk;
     const body=text?JSON.parse(text):undefined;
@@ -18,6 +18,7 @@ test('native commands keep credentials in SecretStorage and submit real provider
     if(req.url==='/status')value={project_root:process.cwd(),sessions};
     if(req.url==='/settings'&&req.method==='GET')value={provider};
     if(req.url==='/settings'&&req.method==='POST'){provider={...body,api_key:undefined,key_set:!!body.api_key};value={provider};}
+    if(req.url==='/providers/models?source=openrouter'){if(catalogUnavailable){res.writeHead(503);res.end('{}');return;}value={models:[{id:'vendor/catalog-model',name:'Catalog model',context_length:262144,max_output_tokens:16384,profile:'generic',input_cost_per_million:0,output_cost_per_million:0.2}],source:'network'};}
     if(req.url==='/engagements'&&req.method==='GET')value={engagements:[]};
     if(req.url==='/engagements'&&req.method==='POST')value={id:'eng-0123456789ab',scope:body};
     if(req.url==='/jobs'){sessions=[{session_id:'test-job',request:body.request,status:'running',phase:'run'}];value=sessions[0];}
@@ -65,6 +66,18 @@ test('native commands keep credentials in SecretStorage and submit real provider
     await commands.get('localCoder.configureProvider')();
     const openrouter=requests.filter(item=>item.url==='/settings'&&item.method==='POST').at(-1).body;
     assert.equal(openrouter.profile,'openrouter_deepseek');assert.equal(openrouter.context_length,1048576);assert.equal(openrouter.api_key_env,'OPENROUTER_API_KEY');
+    answers.push('8192','OPENROUTER_API_KEY');
+    picks.push(items=>items.find(item=>item.catalog),items=>items.find(item=>item.model?.id==='vendor/catalog-model'));
+    await commands.get('localCoder.configureProvider')();
+    const catalogProvider=requests.filter(item=>item.url==='/settings'&&item.method==='POST').at(-1).body;
+    assert.equal(catalogProvider.model_id,'vendor/catalog-model');assert.equal(catalogProvider.context_length,262144);assert.equal(catalogProvider.auto_context,true);assert.equal(catalogProvider.input_cost_per_million,0);assert.equal(catalogProvider.output_cost_per_million,0.2);
+    catalogUnavailable=true;
+    answers.push('vendor/custom-manual','https://openrouter.ai/api/v1','4096','OPENROUTER_API_KEY');
+    picks.push(items=>items.find(item=>item.catalog));
+    await commands.get('localCoder.configureProvider')();
+    const manualProvider=requests.filter(item=>item.url==='/settings'&&item.method==='POST').at(-1).body;
+    assert.equal(manualProvider.model_id,'vendor/custom-manual');assert.equal(manualProvider.auto_context,true);
+    assert.ok(messages.some(message=>message.includes('catalog is unavailable')));
     answers.push('Find reproducible security issues','.');picks.push(1);
     await commands.get('localCoder.security')();
     const job=requests.find(item=>item.url==='/jobs').body;

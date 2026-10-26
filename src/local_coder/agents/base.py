@@ -29,6 +29,7 @@ from local_coder.agents.tool_repair import (
 )
 from local_coder.verification.syntax import check_syntax
 from local_coder.workspace import Workspace
+from local_coder.providers.quota import ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,8 @@ class BaseAgent:
     ):
         from local_coder.core.budgets import BudgetedModel
         budget = getattr(tool_registry, "budget", None)
-        self.model = BudgetedModel(model, budget) if budget is not None and not isinstance(model, BudgetedModel) else model
+        quota_guard = getattr(tool_registry, "quota_guard", None)
+        self.model = BudgetedModel(model, budget, quota_guard=quota_guard) if (budget is not None or quota_guard is not None) and not isinstance(model, BudgetedModel) else model
         self.strategy_attempt_limit = getattr(getattr(model, "config", None), "strategy_attempt_limit", self.strategy_attempt_limit)
         self.tool_registry = tool_registry
         self._event_callback = event_callback
@@ -131,15 +133,24 @@ class BaseAgent:
                 self._settle_draft(draft_prediction, response)
             await self._finish_run(response)
             return response
+        except ProviderQuotaExhausted as exc:
+            await self._pause_for_quota(exc)
+            await self._release_interrupted_run()
+            raise
         except BaseException:
             await self._release_interrupted_run()
             raise
 
-    async def resume(self, run: AgentRun) -> AgentResponse:
+    async def resume(self, run: AgentRun, *, allow_model_change: bool = False) -> AgentResponse:
         """Continue a recovered complete round without rerunning preparation/tools."""
         if run.task.role != self.role:
             raise ValueError("Checkpoint agent role does not match")
         run.validate_resume()
+        if type(allow_model_change) is not bool or (allow_model_change and run.notes.get("quota_paused") is not True):
+            raise ValueError("Model changes require explicit approval of a quota-paused checkpoint")
+        identity = run.notes.get("model_identity")
+        if identity is not None and identity != self._model_identity() and not allow_model_change:
+            raise ValueError("Checkpoint model changed; explicitly select a model before resuming the quota-paused task")
         await run.validate_pending_batch()
         self._run = run
         self.runtime = run._runtime
@@ -152,18 +163,23 @@ class BaseAgent:
         self.max_iterations = self.state.max_iterations
         self.max_tool_calls = self.state.max_tool_calls
         self.max_test_runs = self.state.max_test_runs
-        self.context_window_chars = run.notes.get("context_window_chars", self.context_window_chars)
-        self.compact_context_chars = run.notes.get("compact_context_chars", self.compact_context_chars)
+        saved_window = run.notes.get("context_window_chars", self.context_window_chars)
+        saved_compact = run.notes.get("compact_context_chars", self.compact_context_chars)
+        self.context_window_chars = min(saved_window, self.context_window_chars) if allow_model_change else saved_window
+        self.compact_context_chars = min(saved_compact, self.compact_context_chars, self.context_window_chars) if allow_model_change else saved_compact
         self._last_failing_call_signature = run.notes.get("last_failing_call_signature")
         self._repeated_failure_count = run.notes.get("repeated_failure_count", 0)
         self._stagnation_warned = run.notes.get("stagnation_warned", False)
         self._strategy_attempts = run.notes.get("strategy_attempts", 0)
         self._progress_journal = run.notes.get("progress_journal", [])
-        self.strategy_attempt_limit = run.notes.get("strategy_attempt_limit", self.strategy_attempt_limit)
+        saved_attempt_limit = run.notes.get("strategy_attempt_limit", self.strategy_attempt_limit)
+        self.strategy_attempt_limit = min(saved_attempt_limit, self.strategy_attempt_limit) if allow_model_change else saved_attempt_limit
         self._summary_calls = run.notes.get("summary_calls", 0)
-        self._last_prompt_tokens = run.notes.get("last_prompt_tokens", 0)
-        self.max_tool_output_chars = run.notes.get("max_tool_output_chars", self.max_tool_output_chars)
-        self.max_tool_output_lines = run.notes.get("max_tool_output_lines", self.max_tool_output_lines)
+        self._last_prompt_tokens = 0 if allow_model_change else run.notes.get("last_prompt_tokens", 0)
+        saved_output_chars = run.notes.get("max_tool_output_chars", self.max_tool_output_chars)
+        saved_output_lines = run.notes.get("max_tool_output_lines", self.max_tool_output_lines)
+        self.max_tool_output_chars = min(saved_output_chars, self.max_tool_output_chars) if allow_model_change else saved_output_chars
+        self.max_tool_output_lines = min(saved_output_lines, self.max_tool_output_lines) if allow_model_change else saved_output_lines
         self._archive_references = run.notes.get("context_archive_refs", [])
         for reference in self._archive_references:
             self._register_archive(reference)
@@ -171,6 +187,10 @@ class BaseAgent:
             response = await self._execute_loop(run.task, None, resumed=True)
             await self._finish_run(response)
             return response
+        except ProviderQuotaExhausted as exc:
+            await self._pause_for_quota(exc)
+            await self._release_interrupted_run()
+            raise
         except BaseException:
             await self._release_interrupted_run()
             raise
@@ -180,7 +200,37 @@ class BaseAgent:
             await self.runtime.release_run(self._run.run_id)
             self._run = None
 
-    async def _checkpoint_boundary(self) -> None:
+    def _model_identity(self) -> dict:
+        """Pin model/endpoint identity without persisting credentials or URL queries."""
+        from urllib.parse import urlsplit, urlunsplit
+        from local_coder.integrations.mcp import redact_data
+        config = getattr(self.model, "config", None)
+        backend = getattr(config, "backend", "unknown")
+        backend = getattr(backend, "value", str(backend))
+        raw_url = str(getattr(config, "base_url", ""))
+        try:
+            parsed = urlsplit(raw_url)
+            authority = parsed.hostname or ""
+            if ':' in authority:
+                authority = '[' + authority + ']'
+            if parsed.port is not None:
+                authority += ':' + str(parsed.port)
+            safe_url = urlunsplit((parsed.scheme, authority, parsed.path, '', ''))
+        except ValueError:
+            safe_url = "invalid-endpoint"
+        model_id = str(getattr(config, "model_id", "unconfigured"))
+        return {"backend": redact_data(backend), "model_id": redact_data(model_id),
+                "model_hash": hashlib.sha256(model_id.encode()).hexdigest(),
+                "base_url": redact_data(safe_url), "endpoint_hash": hashlib.sha256(raw_url.encode()).hexdigest(),
+                "profile": redact_data(str(getattr(config, "profile", "generic")))}
+
+    async def _pause_for_quota(self, exc: ProviderQuotaExhausted) -> None:
+        path = await self._checkpoint_boundary({"quota_paused": True, "quota_notice": exc.data})
+        if path is not None:
+            exc.data["checkpoint"] = path
+        self._emit_event("quota_exhausted", str(exc), task_id=self.state.task_id if self.state else None, data=exc.data)
+
+    async def _checkpoint_boundary(self, extra_notes: dict | None = None) -> str | None:
         if self._run is None:
             return
         notes = {
@@ -198,13 +248,16 @@ class BaseAgent:
             "summary_calls": self._summary_calls,
             "max_tool_output_chars": self.max_tool_output_chars,
             "max_tool_output_lines": self.max_tool_output_lines,
+            "model_identity": self._model_identity(),
         }
+        notes.update(extra_notes or {})
         permissions = getattr(self.tool_registry, "_permissions", {}).get(self.role)
         if permissions is not None:
             notes["allowed_tools"] = sorted(name.value for name in permissions)
         path = await self._run.checkpoint_boundary(self.state, self._metrics, notes)
         self._emit_event("checkpoint_saved", "Saved complete agent round", task_id=self.state.task_id,
                          data={"path": path})
+        return path
 
     async def _finish_run(self, response: AgentResponse) -> None:
         memory = getattr(self.tool_registry, "context_memory", None)
@@ -384,6 +437,12 @@ class BaseAgent:
                     )
                     generation_error = None
                     break
+                except ProviderQuotaExhausted:
+                    # No model round completed: keep the last complete protocol
+                    # boundary and its counters resumable instead of retrying.
+                    self.state.iteration = iteration
+                    self.state.messages = list(messages)
+                    raise
                 except Exception as exc:
                     generation_error = exc
                     from local_coder.core.budgets import BudgetExceeded
@@ -903,6 +962,8 @@ class BaseAgent:
                 max_input_chars=summary_input_chars,
                 max_summary_tokens=min(self.max_summary_tokens, getattr(getattr(self.model, "config", None), "max_tokens", self.max_summary_tokens)),
             ) if summary_input_chars > 0 else None
+        except ProviderQuotaExhausted:
+            raise
         except Exception as exc:
             logger.warning("Context summarization failed: %s", exc)
             summarized = None

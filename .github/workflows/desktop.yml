@@ -35,7 +35,7 @@ jobs:
         working-directory: src/local_coder/webui
       - run: python -m pip install -e ".[dev]" pyinstaller
       - name: Portable backend regression tests
-        run: python -m pytest -q tests/test_cloud_providers.py tests/test_reasoning_harness.py tests/test_recovery_context.py tests/test_investigations.py tests/test_workbench_api.py tests/test_remote_routes.py tests/test_remote_security.py tests/test_framework.py tests/test_http_workbench.py tests/test_process_cancellation.py tests/test_request_context.py tests/test_harness_recovery.py tests/test_workbench_integration.py tests/test_redteam.py tests/test_file_lock.py
+        run: python -m pytest -q tests/test_cloud_providers.py tests/test_reasoning_harness.py tests/test_recovery_context.py tests/test_investigations.py tests/test_workbench_api.py tests/test_remote_routes.py tests/test_remote_security.py tests/test_framework.py tests/test_http_workbench.py tests/test_process_cancellation.py tests/test_request_context.py tests/test_harness_recovery.py tests/test_workbench_integration.py tests/test_redteam.py tests/test_file_lock.py tests/test_context_policy.py tests/test_inference_discovery.py tests/test_inference_installer_regressions.py tests/test_provider_api.py tests/test_provider_catalog.py tests/test_provider_profiles.py tests/test_provider_quota.py tests/test_quota_integration.py tests/test_redteam_defaults.py tests/test_workbench_automation.py
       - name: Complete non-trading suite on Linux
         if: runner.os == 'Linux'
         run: python -m pytest -q --ignore=tests/test_trading.py

@@ -13,7 +13,11 @@ Module._load = function(id, ...args) {
 const { installedIDE, spawnIDE } = require('../main.cjs');
 Module._load = originalLoad;
 test('discovers IDE alongside installed manager without environment override', () => {
-  assert.equal(installedIDE({ managerExecutable: '/opt/local-coder/release/manager/local-coder', platform: 'linux', exists: value => value === '/opt/local-coder/release/ide/local-coder-ide' }), '/opt/local-coder/release/ide/local-coder-ide');
+  const release = path.resolve(os.tmpdir(), 'local-coder-release-fixture');
+  for (const [platform, relative] of [['linux', 'local-coder-ide'], ['win32', 'Local Coder IDE.exe'], ['darwin', 'Local Coder IDE.app/Contents/MacOS/Local Coder IDE']]) {
+    const expected = path.join(release, 'ide', relative);
+    assert.equal(installedIDE({ managerExecutable: path.join(release, 'manager', 'local-coder'), platform, exists: value => value === expected }), expected);
+  }
 });
 test('detects native startup failure after spawn and preserves private diagnostics', async () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'local-coder-launch-'));

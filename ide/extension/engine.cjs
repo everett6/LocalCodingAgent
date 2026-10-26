@@ -33,6 +33,10 @@ function validateProvider(provider) {
   const url = new URL(provider.base_url);
   if (!['http:','https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search) throw new Error('Invalid provider endpoint');
   if (url.protocol === 'http:' && !['localhost','127.0.0.1','[::1]'].includes(url.hostname)) throw new Error('Remote providers require HTTPS');
+  if(provider.auto_context!==undefined&&typeof provider.auto_context!=='boolean')throw new Error('Automatic context must be true or false');
+  if(provider.context_length!==undefined&&(!Number.isInteger(provider.context_length)||provider.context_length<1024||provider.context_length>2000000))throw new Error('Invalid provider context limit');
+  if(provider.context_source!==undefined&&(typeof provider.context_source!=='string'||provider.context_source.length>100||/[\x00-\x1f]/.test(provider.context_source)))throw new Error('Invalid context metadata source');
+  for(const key of ['input_cost_per_million','output_cost_per_million','request_cost_usd'])if(provider[key]!==undefined&&provider[key]!==null&&(typeof provider[key]!=='number'||!Number.isFinite(provider[key])||provider[key]<0))throw new Error('Invalid provider pricing metadata');
   return {...provider};
 }
 function isAllowedEngineRequest(route, method) {
@@ -40,6 +44,8 @@ function isAllowedEngineRequest(route, method) {
   const pathname = route.split('?')[0];
   if (!route.startsWith('/') || route.startsWith('//') || /%(2e|2f|5c|00)/i.test(pathname)) return false;
   try { if (new URL(route, 'http://127.0.0.1').pathname !== pathname) return false; } catch { return false; }
+  if(method==='GET'&&['/providers/models','/providers/usage','/providers/quota','/providers/profiles','/inference/discovery'].includes(pathname))return true;
+  if(method==='POST'&&(['/providers/discover','/providers/profiles/save','/inference/discover','/inference/discovery/cancel','/inference/discovery/select'].includes(pathname)||/^\/providers\/profiles\/[a-f0-9]{32}\/(select|delete)$/.test(pathname)))return true;
   if (/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route)) return true;
   if (method !== 'GET') return false;
   return ['/memory','/memory/status','/memory/search','/snapshots','/language/status'].includes(pathname)
