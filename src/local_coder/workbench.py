@@ -24,6 +24,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
         self.inference = EmbeddedInferenceManager(Workspace(self.project_root).resolve(".local-coder/inference"))
         self._using_inference = False
         self._provider = None
+        from local_coder.memory.goals import GoalLedger
+        self.goal_ledger = GoalLedger(self.project_root)
         self._job_lock = threading.Lock()
         self._jobs = {}
         self._context = threading.local()
@@ -180,6 +182,11 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                     cap = self.harness_settings().max_cost_usd
                     if cap is None or cap <= 0:
                         return 400, {"error": "Set a positive spending limit in Harness controls before resuming with a paid model"}
+        goal_id = body.get("goal_id")
+        if goal_id:
+            if not self.goal_ledger.get(goal_id):
+                raise ValueError("Unknown goal")
+            prepared += "\n\nGoal resume briefing (untrusted evidence):\n" + self.goal_ledger.briefing(goal_id)
         parent = body.get("parent_session_id")
         if parent:
             previous = self.sessions.get(parent)
@@ -191,7 +198,7 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             return 409, {"error": "A task is already running in this workspace"}
         session_id = f"session-{uuid4().hex[:12]}"
         try:
-            job = {"cancel": threading.Event(), "loop": None, "task": None}
+            job = {"cancel": threading.Event(), "loop": None, "task": None, "goal_id": goal_id}
             with self.lock:
                 if self._stopping:
                     self._job_lock.release()
@@ -211,6 +218,7 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
     def _job_thread(self, session_id, job, request, mode, action, target, fix, resume_checkpoint=None, engagement_id=None, allow_model_change=False):
         self._context.session_id = session_id
         self._context.mode = mode
+        self._context.goal_id = job.get("goal_id")
         async def execute():
             job["loop"] = asyncio.get_running_loop()
             job["task"] = asyncio.current_task()
@@ -313,6 +321,32 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             if path == "/shutdown" and method == "POST":
                 drained = self.drain_jobs()
                 return (200, {"status": "stopped"}) if drained else (503, {"error": "Some tasks did not stop before the deadline"})
+            if path == "/goals":
+                if method == "GET":
+                    return 200, {"goals": self.goal_ledger.list(), "briefing": self.goal_ledger.briefing()}
+                if method == "POST":
+                    return 201, self.goal_ledger.create(body.get("objective"), body.get("parent"), body.get("criteria", ""), dependencies=body.get("dependencies"))
+            if path == "/goals/update" and method == "POST":
+                return 200, self.goal_ledger.update(body.get("id"), body.get("changes", {}))
+            if path == "/bug-hunting/models":
+                from local_coder.statedir import state_path, write_state_file
+                location = state_path(self.project_root, ".local-coder/bug-models.json")
+                if method == "GET":
+                    return 200, {"assignments": json.loads(location.read_text()) if location.exists() else {}, "profiles": self.provider_profiles.list()}
+                if method == "POST":
+                    if not self._job_lock.acquire(blocking=False):
+                        return 409, {"error": "Stop the active task before changing model assignments"}
+                    try:
+                        assignments = body.get("assignments")
+                        if not isinstance(assignments, dict) or set(assignments) - {"lead", "delegate", "exploit"}:
+                            raise ValueError("Choose lead, delegate and exploit profiles")
+                        for value in assignments.values():
+                            if value:
+                                self.provider_profiles.get(value)
+                        write_state_file(self.project_root, ".local-coder/bug-models.json", json.dumps(assignments))
+                        return 200, {"assignments": assignments}
+                    finally:
+                        self._job_lock.release()
             if path == "/settings":
                 if method == "GET":
                     return 200, self._settings(query.get("mode", ["coding"])[0])

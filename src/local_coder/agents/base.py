@@ -260,6 +260,9 @@ class BaseAgent:
         return path
 
     async def _finish_run(self, response: AgentResponse) -> None:
+        ledger = getattr(self.tool_registry, "goal_ledger", None)
+        if ledger is not None and ledger.get(response.task_id):
+            await asyncio.to_thread(ledger.finish, response)
         memory = getattr(self.tool_registry, "context_memory", None)
         if memory is not None and getattr(self.tool_registry, "memory_enabled", True):
             await asyncio.to_thread(memory.ingest, "decision", response.summary[:20000], task_id=response.task_id,
@@ -361,6 +364,13 @@ class BaseAgent:
         return messages
 
     async def _execute_loop(self, task: AgentTask, draft_prediction, resumed=False) -> AgentResponse:
+        ledger = getattr(self.tool_registry, "goal_ledger", None)
+        if ledger is not None:
+            parent = getattr(self.tool_registry, "goal_id", None)
+            if getattr(self, "delegation_depth", 0):
+                parent = (self.tool_registry.task_context.get() or {}).get("task_id", parent)
+            await asyncio.to_thread(ledger.create, task.objective, parent, "\n".join(task.success_criteria), task.task_id)
+            await asyncio.to_thread(ledger.update, task.task_id, {"status": "running"})
         # Build initial messages
         messages = list(self.state.messages) if resumed else self._build_messages(task)
         if draft_prediction is not None:

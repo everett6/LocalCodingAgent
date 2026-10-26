@@ -53,6 +53,8 @@ def create_tool_registry(
     from local_coder.skills import SkillLibrary, SkillLibraryTool
     from local_coder.types import AgentRole, ToolName
     registry.context_memory = ContextMemory(project_root)
+    from local_coder.memory.goals import GoalLedger
+    registry.goal_ledger = GoalLedger(project_root)
     from local_coder.statedir import state_path
     import json
     language_config = state_path(project_root, ".local-coder/language/settings.json")
@@ -83,6 +85,7 @@ def create_tool_registry(
             allowed.update({ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL, ToolName.DELEGATE_TASK, ToolName.MCP_CALL})
         if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.REVIEWER}:
             allowed.add(ToolName.MCP_CALL)
+    registry._permissions[AgentRole.BUG_HUNTER].add(ToolName.DELEGATE_TASK)
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
     from local_coder.tools.context_archive import RecoverContextTool
