@@ -48,6 +48,7 @@ async function bundle(folder,relative=''){
   }
 }
 await bundle(path.join(root,'extension'));
+outputs.set('extensions/local-coder/discovery.cjs',await fs.readFile(path.join(root,'../desktop/discovery.cjs')));
 let stamp={files:{}};
 const stampPath=path.join(upstream,'.build','local-coder-fork.json');
 if(await exists(stampPath))stamp=JSON.parse(await fs.readFile(stampPath,'utf8'));

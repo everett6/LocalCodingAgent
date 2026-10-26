@@ -16,13 +16,20 @@ async function request(pathname, method = 'GET', body) {
   const response = await fetch(origin + pathname, { method, headers: { Authorization: `Bearer ${token}`, ...(payload ? { 'Content-Type': 'application/json' } : {}) }, body: payload, redirect: 'error', signal: AbortSignal.timeout(30000) });
   return { status: response.status, data: await response.json() };
 }
+function startupStatus(message) {
+  const file = path.join(app.getPath('userData'), 'logs', 'startup.log');
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const fd = fs.openSync(file, 'a', 0o600);
+  try { fs.fchmodSync(fd, 0o600); fs.writeSync(fd, `${new Date().toISOString()} ${message}\n`); } finally { fs.closeSync(fd); }
+}
 async function startEngine(folder) {
   token = randomBytes(32).toString('hex');
   const command = app.isPackaged ? path.join(process.resourcesPath, 'backend', process.platform === 'win32' ? 'local-coder-engine.exe' : 'local-coder-engine') : (process.env.LOCAL_CODER_PYTHON || 'python');
   sidecar = new Sidecar({ command, token, args: app.isPackaged ? [] : ['-m', 'local_coder.desktop_engine'], cwd: folder,
     env: { ...process.env, PYTHONPATH: app.isPackaged ? '' : path.join(root, 'src'), LOCAL_CODER_DESKTOP_PROJECT: folder, LOCAL_CODER_REMOTE_TOKEN: token },
     onExit: () => { if (!quitting && !switching) { origin = null; dialog.showErrorBox('Local engine stopped', 'The engine exited unexpectedly. Close and reopen Local Coder. Saved task reports remain in your workspace.'); } } });
-  origin = await sidecar.start(); project = folder;
+  origin = await sidecar.start(); token = sidecar.token; project = folder;
+  startupStatus(sidecar.child ? 'engine_ready owned' : 'engine_ready shared');
 }
 async function chooseProject() {
   if (switching) return;
@@ -120,9 +127,9 @@ app.whenReady().then(async () => {
       { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
       { label: 'View', submenu: [{ role: 'reload' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     ]));
-    window.once('ready-to-show', () => window.show());
+    window.once('ready-to-show', () => { window.show(); startupStatus('window_ready'); });
     await window.loadURL(origin);
-  } catch (error) { dialog.showErrorBox('Cannot start Local Coder', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
+  } catch (error) { startupStatus('startup_failed: ' + error.message); dialog.showErrorBox('Cannot start Local Coder', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
 });
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', event => { if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });

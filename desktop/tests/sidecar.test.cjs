@@ -43,3 +43,18 @@ test('stop authenticates and drains the engine before terminating it', async () 
     assert.match(output, /drained/);
   } finally { await sidecar.stop(); }
 });
+
+test('manager attaches to authenticated workspace engine without spawning or stopping it', async () => {
+  const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http=require('node:http'),crypto=require('node:crypto');
+  const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'manager-attach-'));
+  const directory=path.join(workspace,'connections');fs.mkdirSync(directory,{mode:0o700});
+  let requests=0;
+  const server=http.createServer((req,res)=>{requests++;assert.equal(req.headers.authorization,'Bearer shared-test');res.end(JSON.stringify({project_root:workspace,sessions:[]}));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const origin=`http://127.0.0.1:${server.address().port}`;
+  const key=crypto.createHash('sha256').update(workspace).digest('hex');
+  fs.writeFileSync(path.join(directory,key+'.json'),JSON.stringify({workspace,origin,token:'shared-test',pid:process.pid}),{mode:0o600});
+  const sidecar=new Sidecar({command:'/must-not-spawn',cwd:workspace,token:'fresh-token',discoveryDirectory:directory,timeout:300});
+  try {assert.equal(await sidecar.start(),origin);assert.equal(sidecar.token,'shared-test');assert.equal(sidecar.child,null);await sidecar.stop();assert.equal(server.listening,true);assert.equal(requests,1);}
+  finally {await sidecar.stop();await new Promise(resolve=>server.close(resolve));fs.rmSync(workspace,{recursive:true,force:true});}
+});

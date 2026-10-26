@@ -29,7 +29,7 @@
 - The parent `dist/local-coder-engine`, `extension/bin`, prepared source extension,
   intermediate packaged extension, and final native application copies all have
   the same SHA-256:
-  `43ad3c99789c79a0aba8d4cd0e196db88e8eca93fbb8b0f8f5fba2c6bd5e3b1e`.
+  `852584546188c1f09798576bce80f3619b68c6b6af36bbc080aadd106517ade6`.
 
 Ignored local logs are in `.build/compile.log`, `.build/package.log`,
 `.build/vscode-smoke.log`, and `.build/tests-node24.log`.
@@ -93,3 +93,15 @@ in user settings. Repository scheduled checks and release publication require
 the workflow to be present on the default branch; this feature branch alone
 does not activate the daily schedule. Real-model speedups and Windows/macOS
 native operation remain unmeasured.
+
+## Workspace startup repair
+
+An existing unauthenticated development preview held the workspace lease and
+prevented both desktop clients from starting another engine. That preview was
+stopped. The authenticated engine now publishes an owner-only connection record;
+the manager and standalone IDE verify and reuse it, including when launched
+simultaneously. Cross-language tests exercise all three startup orders, assert
+one engine process, and verify that closing a borrower preserves its owner.
+308 previous backend checks plus the new cross-language check (309 total),
+18 IDE checks and 9 desktop checks pass. Only extension/runtime resources changed
+inside the existing Code OSS native package; core editor compilation is unchanged.

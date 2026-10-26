@@ -82,3 +82,16 @@ test('owned shutdown kills a tool descendant even if it has its own process grou
     await engine.stop();fs.rmSync(workspace,{recursive:true,force:true});
   }
 });
+
+test('standalone IDE discovers the existing authenticated project engine', async () => {
+  const fs=require('node:fs'),os=require('node:os'),crypto=require('node:crypto');
+  const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'ide-attach-')),directory=path.join(workspace,'connections');fs.mkdirSync(directory,{mode:0o700});
+  let shutdowns=0;
+  const server=http.createServer((req,res)=>{assert.equal(req.headers.authorization,'Bearer shared-test');if(req.url==='/shutdown')shutdowns++;res.end(JSON.stringify({project_root:workspace,sessions:[]}));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const origin=`http://127.0.0.1:${server.address().port}`,key=crypto.createHash('sha256').update(workspace).digest('hex');
+  fs.writeFileSync(path.join(directory,key+'.json'),JSON.stringify({workspace,origin,token:'shared-test',pid:process.pid}),{mode:0o600});
+  const engine=new EngineConnection({workspace,executable:'/must-not-spawn',discoveryDirectory:directory});
+  try {await engine.start();assert.equal(engine.owned,false);assert.equal(engine.child,null);assert.equal((await engine.request('/status')).project_root,workspace);await engine.stop();assert.equal(shutdowns,0);assert.equal(server.listening,true);}
+  finally {await engine.stop();await new Promise(resolve=>server.close(resolve));fs.rmSync(workspace,{recursive:true,force:true});}
+});

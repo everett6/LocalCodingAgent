@@ -1,4 +1,5 @@
 const { spawn, execFile } = require('node:child_process');
+const { discoverEngine } = require('./discovery.cjs');
 
 function isAllowedApiRequest(path, method) {
   if (typeof path !== 'string' || path.length > 4096 || !path.startsWith('/') || path.startsWith('//') || /[\\#\r\n]/.test(path)) return false;
@@ -8,11 +9,27 @@ function isAllowedApiRequest(path, method) {
   return false;
 }
 class Sidecar {
-  constructor({ command, args = [], cwd, env = process.env, timeout = 30000, token, onExit = () => {} }) {
-    Object.assign(this, { command, args, cwd, env, timeout, token, onExit }); this.child = null; this.origin = null;
+  constructor({ command, args = [], cwd, env = process.env, timeout = 30000, token, discoveryDirectory, onExit = () => {} }) {
+    Object.assign(this, { command, args, cwd, env, timeout, token, discoveryDirectory, onExit }); this.child = null; this.origin = null;
   }
   async start() {
     if (this.child) throw new Error('Engine already started');
+    const attach = async () => {
+      const connection = await discoverEngine(this.cwd, this.discoveryDirectory);
+      if (!connection) return false;
+      this.origin = connection.origin; this.token = connection.token; return true;
+    };
+    if (await attach()) return this.origin;
+    try { return await this._spawn(); } catch (error) {
+      await this.stop();
+      for (let attempt = 0; error.message.includes('exited') && attempt < 10; attempt++) {
+        if (await attach()) return this.origin;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      throw error;
+    }
+  }
+  async _spawn() {
     return new Promise((resolve, reject) => {
       const child = spawn(this.command, this.args, { cwd: this.cwd, env: this.env, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
       this.child = child;
@@ -30,7 +47,7 @@ class Sidecar {
       });
       child.stderr.on('data', () => {}); // Do not persist model prompts or credentials in desktop logs.
       child.once('error', error => finish(new Error(`Cannot start the local engine: ${error.code || 'unknown error'}`)));
-      child.once('exit', code => { finish(new Error(`Local engine exited before readiness (${code})`)); if (this.child === child) { this.child = null; this.onExit(code); } });
+      child.once('exit', code => { finish(new Error(`Local engine exited before readiness (${code})`)); if (this.child === child) { this.child = null; if (this.origin) this.onExit(code); } });
     });
   }
   async stop() {

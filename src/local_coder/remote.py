@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import os
 import subprocess
 import mimetypes
 from urllib.parse import urlsplit, unquote
@@ -113,6 +114,7 @@ class RemoteControlServer(WorkbenchAPI):
         self._init_workbench()
         self._lease_file = None
         self._lease = None
+        self._connection_file = None
 
     def _event(self, event: AgentEvent) -> None:
         with self.lock:
@@ -166,6 +168,8 @@ class RemoteControlServer(WorkbenchAPI):
         workbench = self.workbench_handle(method, path, body)
         if workbench is not None:
             return workbench
+        if method == "GET" and path == "/identity":
+            return 200, {"project_root": self.project_root, "pid": os.getpid()}
         if method == "GET" and path == "/status":
             return 200, {"project_root": self.project_root, "sessions": self.sessions.list()}
         if method == "GET" and path == "/events":
@@ -378,12 +382,19 @@ class RemoteControlServer(WorkbenchAPI):
         try:
             server = WorkspaceHTTPServer((host, port), Handler)
             self.reconcile_sessions()
+            from local_coder.engine_discovery import publish_connection
+            self._connection_file = publish_connection(self.project_root, f"http://127.0.0.1:{server.server_port}", self.token) if host == "127.0.0.1" else None
             return server
         except BaseException:
+            if "server" in locals():
+                server.server_close()
             self.release_workspace()
             raise
 
     def release_workspace(self):
+        if self._connection_file is not None:
+            self._connection_file.unlink(missing_ok=True)
+            self._connection_file = None
         if self._lease is not None:
             self._lease.__exit__(None, None, None)
             self._lease = None

@@ -21,7 +21,8 @@
       "main.cjs",
       "preload.cjs",
       "sidecar.cjs",
-      "package.json"
+      "package.json",
+      "discovery.cjs"
     ],
     "extraResources": [
       {

@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
-    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', '.github/workflows/ide-upstream.yml']
+    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', 'desktop/discovery.cjs', '.github/workflows/ide-upstream.yml']
   pull_request:
-    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', '.github/workflows/ide-upstream.yml']
+    paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', 'desktop/discovery.cjs', '.github/workflows/ide-upstream.yml']
 permissions:
   contents: read
 concurrency:

@@ -68,3 +68,20 @@ application is `release/linux-unpacked/local-coder-desktop`. The bundled engine
 passed authenticated API, built JavaScript asset, and graceful shutdown checks.
 Five desktop bridge/lifecycle tests pass. Windows/macOS packages remain subject
 to their native CI build and signing; they were not tested on this Linux host.
+
+### Shared workspace startup
+
+The manager and standalone IDE discover an existing authenticated engine for the
+same canonical project folder. Only one engine holds the workspace lease; the
+other app reuses it after checking its private connection record and authenticated
+identity endpoint. Simultaneous launches retry discovery when the other app wins
+the lease. Closing an attached app does not terminate the owner's engine.
+
+Connection records live under `~/.local-coder/connections/` with owner-only
+permissions, contain an ephemeral local access token, and are removed on clean
+shutdown. Stale records are rejected using process liveness, loopback-only origin,
+file permissions, workspace identity and authentication. An unauthenticated
+browser preview is deliberately not adopted: stop it before opening the desktop
+apps on that project. The owner app must remain open while the other app uses its
+engine. Manager startup milestones and failures are recorded in its private
+`logs/startup.log`, without the connection token.

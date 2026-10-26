@@ -1,5 +1,8 @@
 'use strict';
 const http = require('node:http');
+const path = require('node:path');
+const fs = require('node:fs');
+const {discoverEngine}=require(fs.existsSync(path.join(__dirname,'discovery.cjs'))?'./discovery.cjs':'../../desktop/discovery.cjs');
 const {spawn,execFile} = require('node:child_process');
 const {randomBytes} = require('node:crypto');
 
@@ -58,6 +61,7 @@ class EngineConnection {
       this.token=this.options.sharedToken;
       return;
     }
+    if(await this._attachDiscovered())return;
     if(!this.options.executable)throw new Error('Build the Local Coder engine or configure its executable in user settings');
     this.token=randomBytes(32).toString('hex');
     const child=spawn(this.options.executable,this.options.args||[],{
@@ -94,7 +98,19 @@ class EngineConnection {
       });
       child.stdout.resume();
       child.on('exit',()=>{this.url=null;this.token=null;this.child=null;if(!this.stopping)this.options.onExit?.();});
-    }catch(error){await this.stop();throw error;}
+    }catch(error){
+      await this.stop();
+      for(let attempt=0;error.message.includes('exited')&&attempt<10;attempt++){
+        if(await this._attachDiscovered()){this.closed=false;this.stopping=false;return;}
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      throw error;
+    }
+  }
+  async _attachDiscovered(){
+    const connection=await discoverEngine(this.options.workspace,this.options.discoveryDirectory);
+    if(!connection)return false;
+    this.url=connection.origin;this.token=connection.token;this.owned=false;return true;
   }
   async request(route,method='GET',body,timeout=30000) {
     if(this.closed&&route!=='/shutdown')throw new Error('Engine connection is closed');
