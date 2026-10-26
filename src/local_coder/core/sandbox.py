@@ -175,7 +175,11 @@ class SandboxRunner:
                 if args is None:
                     os.close(descriptor)
                     raise SandboxUnavailable('Bubblewrap confinement became unavailable')
-                if not runtime.is_relative_to(Path('/usr')):args+=['--ro-bind',str(runtime),str(runtime)]
+                runtimes = {runtime}
+                if not getattr(sys, 'frozen', False):
+                    runtimes.add(Path(sys.base_prefix).resolve())
+                for prefix in sorted(runtimes):
+                    if not prefix.is_relative_to(Path('/usr')):args+=['--ro-bind',str(prefix),str(prefix)]
                 # Only the selected runtime, helper and JSON input cross the boundary.
                 args+=['--ro-bind',temporary,'/work','--chdir','/work']
                 args=self._seal_bwrap(args)+['--']
