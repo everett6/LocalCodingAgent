@@ -23,6 +23,7 @@ def create_tool_registry(
     approval: ApprovalConfig | None = None,
     approval_callback: ApprovalCallback | None = None,
     safety_harness: Any = None,
+    improvement_evaluator: Any = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry and register all available tools.
 
@@ -71,7 +72,8 @@ def create_tool_registry(
         registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
     for tool in (MemorySearchTool(registry.context_memory), MemoryWriteTool(registry.context_memory), TaskMemoryTool(registry.context_memory),
                  LanguageContextTool(registry.language_service), MCPTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
-                 HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision),
+                 HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision,
+                                   improvement_evaluator=improvement_evaluator),
                  DelegateTaskTool(), GeneratedToolTool(registry.evolution, runner=registry.sandbox.run)):
         registry.register(tool)
     for role, allowed in registry._permissions.items():

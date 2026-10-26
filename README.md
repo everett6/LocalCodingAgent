@@ -691,6 +691,9 @@ profiles and bounded leaf delegation keep long tasks reviewable. The IDE adds
 See [context memory](docs/context-memory.md), [adaptive scaffolding](docs/adaptive-harness.md),
 [language context](docs/language-context.md), [MCP and skills](docs/mcp-and-skills.md),
 and [local security generation](docs/exploit-generation.md) for interfaces and limits.
+See [context budgets and debugging](docs/context-management.md),
+[adversarial regression scope](docs/adversarial-testing.md), and
+[optional Rust acceleration](native/README.md) for the added development workflows.
 GitHub MCP is an explicit connection using your chosen environment variable; it
 starts disabled. The built-in vector backend uses local lexical hashes, with no
 model download or claim of neural semantic search.

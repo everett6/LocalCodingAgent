@@ -21,7 +21,7 @@ import threading
 from typing import Any, Callable, Iterator
 import uuid
 
-from local_coder.context.code_index import SKIP_DIRS, SKIP_EXTENSIONS, tokenize
+from local_coder.context.code_index import SKIP_DIRS, SKIP_EXTENSIONS, tokenize, iter_tokens
 from local_coder.statedir import state_path
 
 _KINDS = {"conversation", "code", "tool", "finding", "decision", "evidence", "hypothesis", "failure"}
@@ -181,12 +181,8 @@ class ContextMemory:
             if not vector or len(vector) > 4096 or not all(math.isfinite(value) for value in vector):
                 raise ValueError("Local embedding backend returned invalid vector")
         else:
-            vector = [0.0] * 256
-            for token in tokenize(content):
-                features = [token] + [token[n:n + 3] for n in range(max(0, len(token) - 2))]
-                for feature in features:
-                    value = hashlib.blake2b(feature.encode(), digest_size=4).digest()
-                    vector[int.from_bytes(value[:2], "big") % 256] += 1 if value[2] & 1 else -1
+            from local_coder.memory.native import lexical_counts
+            vector = lexical_counts(iter_tokens(content))
         norm = math.sqrt(sum(value * value for value in vector)) or 1.0
         return [value / norm for value in vector]
 

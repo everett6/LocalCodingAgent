@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, Field, SecretStr
+from local_coder.context.allocation import ContextAllocation
 
 
 # === Enums ===
@@ -413,6 +414,8 @@ class HarnessSettings(BaseModel):
     memory_context_chars: int = Field(default=3000, ge=0, le=12000)
     language_context_enabled: bool = True
     pre_edit_snapshots: bool = True
+    context_snapshots: bool = False
+    context_allocation: ContextAllocation | None = None
     max_requests: int = Field(default=200, ge=1, le=10000)
     max_tokens: int = Field(default=1000000, ge=1024, le=100000000)
     max_request_tokens: int = Field(default=131072, ge=1024, le=2000000)

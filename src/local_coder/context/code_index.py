@@ -115,21 +115,25 @@ def tokenize(text: str) -> list[str]:
     ``parseConfigFile`` yields ``parseconfigfile``, ``parse``, ``config`` and
     ``file``; ``read_file_safe`` yields the whole name plus its parts.
     """
-    tokens: list[str] = []
-    for word in _WORD_RE.findall(text):
+    return list(iter_tokens(text))
+
+
+def iter_tokens(text: str):
+    """Yield the same search terms without retaining a document-sized list."""
+    for match in _WORD_RE.finditer(text):
+        word = match.group()
         parts: list[str] = []
         for piece in word.split("_"):
             if piece:
                 parts.extend(_CAMEL_RE.findall(piece))
         lowered = word.lower().strip("_")
         if len(parts) > 1 and lowered not in STOPWORDS:
-            tokens.append(lowered)
+            yield lowered
         for part in parts:
             p = part.lower()
             if len(p) < 2 or p in STOPWORDS or p.isdigit():
                 continue
-            tokens.append(_stem(p))
-    return tokens
+            yield _stem(p)
 
 
 @dataclass

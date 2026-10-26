@@ -308,6 +308,17 @@ class ToolRegistry:
                 duration_ms=int((time.time() - start_time) * 1000)
             )
             
+        # Validate model-supplied JSON before scope inspection, snapshots, hooks
+        # or execution. Engine-only arguments are injected after this gateway.
+        from jsonschema import Draft202012Validator
+        if not isinstance(arguments, dict) or any(not isinstance(key, str) or key.startswith("_") for key in arguments):
+            return ToolResult(success=False, output="Tool arguments must be an object without engine-only fields")
+        schema = {**tool.parameters, "additionalProperties": False}
+        errors = list(Draft202012Validator(schema).iter_errors(arguments))
+        if errors:
+            # Do not echo argument values (which can contain credentials).
+            return ToolResult(success=False, output="Tool arguments failed schema validation: " +
+                              ", ".join(sorted({str(error.validator) for error in errors})))
         scope_error = self._outside_write_scope(role, name_enum, tool, arguments)
         if scope_error:
             return ToolResult(

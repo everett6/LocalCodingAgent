@@ -90,6 +90,8 @@ class Coordinator:
         self.tool_registry.quota_guard = quota_guard
         self.tool_registry.memory_context_chars = limits.memory_context_chars if limits.memory_enabled else 0
         self.tool_registry.memory_enabled = limits.memory_enabled
+        self.tool_registry.context_snapshots = limits.context_snapshots
+        self.tool_registry.context_allocation = limits.context_allocation
         self.tool_registry.auto_language_context = limits.language_context_enabled
         self.tool_registry.pre_edit_snapshots = limits.pre_edit_snapshots
         self.tool_registry.profile_overrides = limits.profile_overrides

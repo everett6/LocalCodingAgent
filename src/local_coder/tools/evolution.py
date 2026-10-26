@@ -18,18 +18,20 @@ class HarnessEvolveTool(Tool):
     parameters = {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "action": {"type": "string", "enum": ["propose", "validate", "activate", "rollback", "history", "outcome"]},
+            "action": {"type": "string", "enum": ["propose", "validate", "activate", "rollback", "history", "outcome", "improve"]},
+            "candidates": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 3},
             "kind": {"type": "string", "enum": ["instructions", "skill", "tool", "loop_plan"]},
             "payload": {"type": "object"}, "revision_id": {"type": "string"},
             "outcome": {"type": "object"},
         }, "required": ["action"],
     }
 
-    def __init__(self, store: EvolutionStore, safety_harness, approval_callback, validator=None):
+    def __init__(self, store: EvolutionStore, safety_harness, approval_callback, validator=None, improvement_evaluator=None):
         self.store = store
         self.safety_harness = safety_harness
         self.approval_callback = approval_callback
         self.validator = validator
+        self.improvement_evaluator = improvement_evaluator
 
     async def _approved(self, description):
         if self.safety_harness.tier in {SafetyTier.TIER_4_AUTO_VALID, SafetyTier.TIER_5_YOLO}:
@@ -40,20 +42,25 @@ class HarnessEvolveTool(Tool):
         return (await result if inspect.isawaitable(result) else result) is True
 
     async def execute(self, action: str, kind: str | None = None, payload: dict | None = None,
-                      revision_id: str | None = None, outcome: dict | None = None, **kwargs: Any) -> ToolResult:
+                      revision_id: str | None = None, outcome: dict | None = None,
+                      candidates: list[dict] | None = None, **kwargs: Any) -> ToolResult:
         try:
             if set(kwargs) - {"_caller_role"}:
                 raise ValueError("Unknown arguments; validation/approval cannot be asserted by the model")
             if action == "history":
                 return ToolResult(success=True, output=json.dumps(self.store.history()), data={"revisions": self.store.history()})
-            if action not in {"propose", "validate", "activate", "rollback", "outcome"}:
+            if action not in {"propose", "validate", "activate", "rollback", "outcome", "improve"}:
                 raise ValueError("Unknown harness action")
             if action != "outcome":
-                candidate = {"kind": kind, "payload": payload} if action == "propose" else self.store.get_revision(revision_id)
+                candidate = ({"candidates": candidates} if action == "improve" else
+                             {"kind": kind, "payload": payload} if action == "propose" else self.store.get_revision(revision_id))
                 description = f"Harness {action}; inherited scope; exact candidate: {json.dumps(candidate, sort_keys=True)}"
                 if not await self._approved(description):
                     raise PermissionError("Harness changes require human approval below tier 4")
-            if action == "propose":
+            if action == "improve":
+                from local_coder.harness.improvement import improvement_cycle
+                result = await improvement_cycle(self.store, candidates, self.improvement_evaluator)
+            elif action == "propose":
                 result = self.store.propose(kind, payload)
             elif action == "validate":
                 result = await self.store.validate(revision_id, self.validator)
@@ -64,7 +71,7 @@ class HarnessEvolveTool(Tool):
             else:
                 result = self.store.record_outcome(revision_id, outcome)
             return ToolResult(success=True, output=json.dumps(result), data=result)
-        except (ValueError, PermissionError, OSError, TypeError) as exc:
+        except (ValueError, PermissionError, OSError, TypeError, TimeoutError) as exc:
             return ToolResult(success=False, output=str(exc), error=str(exc))
 
 
