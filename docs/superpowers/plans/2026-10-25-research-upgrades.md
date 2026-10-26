@@ -41,8 +41,12 @@ Changed/deleted helper files must not be retrieved as fresh; compaction must pre
 
 ### Task 6: Review and delivery
 - [x] Independently review integration and update truthful capability statuses.
-- [ ] Publish a new integration PR based on reviewed main, then update installed applications after verification.
+- [x] Publish a new integration PR based on reviewed main, then update installed applications after verification.
 
 ## GitHub integration
 
 PRs 17–20 were already merged. Reviewed and merged PR 21 at `351de56`, then reapplied the unfinished research changes on `codex/research-integration`. Kept the goals screen, working-memory refresh, canonical security evidence lifecycle and plan restrictions. Added three missed blocked-result checks in new upstream coordinator paths, portable unavailable reporting for the POSIX regression backend, explicit partial coverage, and offline dependency inventory/advisory tooling. The original unfinished work remains in a Git stash backup.
+
+## Delivery verification
+
+Published PR 22 at commit `9f1d1e4`. Python: 1,220 passed, three optional skips (two native-memory checks and Go). Node desktop/IDE: 48 passed. Frontend build/lint and packaged PyInstaller/Electron builds passed. Packaged-engine smoke verified authenticated goals, model teams, local audit/report/journal routes, offline advisory import/matching and structure context. The installed native IDE extension-host smoke passed. Updated both installed engines and the manager resources with a rollback copy, preserved the root-owned sandbox helpers, reopened both native applications and confirmed the manager reached window-ready with working research APIs. At delivery the offline adversarial/native-memory CI workflow passed; desktop packaging and full IDE CI builds were still running.
