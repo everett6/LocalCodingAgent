@@ -35,4 +35,28 @@ Unknown-completion mutations must not retry; changed branches/files must not hyd
 ### 8. Tool scheduling/recovery
 - [x] Extend tools/base.py and agents/base.py with declared effects, bounded concurrent reads and serialized mutation barriers. Test ordering, permission checks, cancellation and no replay after unknown mutation completion.
 ### 9. Integration and delivery
-- [ ] Wire mixins, navigation, native route allowlists and docs. Review independent modules, run focused/full Python and Node suites, frontend build/lint, package smoke checks, push PR and update installed apps with rollback.
+- [x] Wire mixins, navigation, native route allowlists and docs. Review independent modules, run focused/full Python and Node suites, frontend build/lint, package smoke checks, push PR and update installed apps with rollback.
+
+
+## Delivery verification
+
+Delivered implementation `db41c3c` on `codex/research-integration` (PR #22).
+Python suite: 1,435 passed, 3 optional skips (two Rust/native-memory checks and Go).
+Desktop/IDE Node suite: 62 passed. Frontend production build and lint passed.
+PyInstaller and Linux Electron packaging passed; the packaged authenticated engine
+smoke exercised all new inspectors, offline evaluations, a real local tokenizer
+fixture, findings/evidence, reports, dependency imports and symbol context.
+The installed IDE's native extension-host smoke passed activation, command
+registration, workspace verification and authenticated shared-engine refresh.
+
+Updated and reopened both installed Linux apps. Both engine SHA-256 values match
+the tested build. All new authenticated inspectors respond successfully, and both
+Chromium sandbox helpers retain root ownership and mode 4755. The manager reports
+engine/window readiness. Rollback files are retained under
+`~/.local/opt/local-coder/973967a/updates/db41c3c`.
+
+The IDE updater's loss of sandbox permissions was reproduced during delivery and
+fixed with bounded identical-helper preservation plus transactional rollback.
+Windows/macOS native packaging and optional unavailable language/runtime checks
+were not executed locally. No paid inference, real-model performance trial,
+external target activity or model downloads were used in validation.
