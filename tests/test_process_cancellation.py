@@ -1,6 +1,4 @@
 import asyncio
-import shlex
-import sys
 
 import pytest
 
@@ -15,11 +13,11 @@ def test_cancelling_test_tool_reaps_the_running_process(tmp_path, monkeypatch):
         processes.append(process)
         return process
     monkeypatch.setattr(asyncio, "create_subprocess_exec", track)
-    script = tmp_path / "sleep.py"
-    script.write_text("import time\ntime.sleep(30)\n")
+    script = tmp_path / "test_sleep.py"
+    script.write_text("import time\ndef test_wait():\n    time.sleep(30)\n")
     async def scenario():
         tool = RunTestsTool(str(tmp_path))
-        task = asyncio.create_task(tool.execute(framework=f'{shlex.quote(sys.executable)} {shlex.quote(str(script))}'))
+        task = asyncio.create_task(tool.execute(framework="pytest", target=script.name))
         for _ in range(100):
             if processes:
                 break

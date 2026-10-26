@@ -93,7 +93,12 @@ class GrepTool(Tool):
             if not lines:
                 return ToolResult(success=True, output="No matches found.", duration_ms=int((time.time()-start_t)*1000))
                 
-            out_lines = lines[:max_results]
+            # One match in a minified or generated file can be a
+            # multi-kilobyte line; the file:line prefix is what matters.
+            out_lines = [
+                line if len(line) <= 300 else line[:300] + f"...[{len(line)} chars]"
+                for line in lines[:max_results]
+            ]
             res_str = "\n".join(out_lines)
             if len(lines) > max_results:
                 res_str += f"\n... (Showing {max_results} of {len(lines)} matches)"

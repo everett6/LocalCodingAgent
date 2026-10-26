@@ -6,3 +6,4 @@ benchmark_results.json
 *.egg-info/
 dist/
 build/
+.venv/

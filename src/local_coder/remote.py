@@ -26,7 +26,7 @@ from local_coder.workspace import Workspace
 from local_coder import local_server
 from local_coder.orchestrator.config_loader import load_config
 from local_coder.orchestrator.coordinator import Coordinator
-from local_coder.orchestrator.sessions import SessionStore
+from local_coder.orchestrator.sessions import SessionError, SessionStore
 from local_coder.types import AgentEvent, AgentRole
 
 _WEBUI_ROOT = Path(__file__).parent / "webui" / "dist"
@@ -97,10 +97,15 @@ class RemoteControlServer(WorkbenchAPI):
         model_name: str | None = None,
         yolo: bool = False,
         token: str | None = None,
+        config_overrides: list[str] | None = None,
+        temperature: float | None = None,
     ):
         self.project_root = project_root
         self.config_path = config_path
         self.model_name = model_name
+        # --set / --temperature from the command line that started the server.
+        self.config_overrides = list(config_overrides or [])
+        self.temperature = temperature
         # The HTTP server has no terminal to prompt with, so there is never
         # an interactive approval callback here -- ASK-risk actions are
         # denied unless the operator explicitly opted into --yolo when
@@ -143,7 +148,10 @@ class RemoteControlServer(WorkbenchAPI):
             self.sessions.save(payload["session_id"], checkpoint=job["checkpoint"], events=list(job["events"]))
 
     def _coordinator(self) -> Coordinator:
-        config = load_config(self.config_path, project_root=self.project_root)
+        config = load_config(
+            self.config_path, project_root=self.project_root,
+            overrides=self.config_overrides, temperature=self.temperature,
+        )
         provider = self.local_inference_provider() if self._using_inference else self._provider
         if self._using_inference and provider is None:
             raise ValueError("The on-device model is not ready")
@@ -230,14 +238,14 @@ class RemoteControlServer(WorkbenchAPI):
             if not self._job_lock.acquire(blocking=False):
                 return 409, {"error": "A task is already running in this workspace"}
             try:
+                if path == "/run":
+                    return self._run_in_session(session_id, request)
                 coordinator = self._coordinator()
                 async def execute():
                     try:
                         if path == "/plan":
                             return await coordinator.plan_only(request)
-                        if path == "/review":
-                            return await coordinator.review_changes()
-                        return await coordinator.run(request)
+                        return await coordinator.review_changes()
                     finally:
                         await coordinator.model_manager.close_all()
                 result = asyncio.run(execute())
@@ -246,6 +254,38 @@ class RemoteControlServer(WorkbenchAPI):
             record = self.sessions.save(session_id, request=request, phase=path[1:], result=result)
             return 200, record
         return 404, {"error": "not found"}
+
+    def _run_in_session(self, session_id: str, request: str) -> tuple[int, dict[str, Any]]:
+        """/run in a persistent session, the same kind the CLI uses: a
+        repeated session_id is a follow-up that sees the earlier turns, and
+        a run that fails can be picked up with `local-coder resume <id>`."""
+        try:
+            session = self.sessions.open_or_create(session_id)
+            session.acquire()
+        except SessionError as exc:
+            return (409 if "already running" in str(exc) else 400), {"error": str(exc)}
+        try:
+            turn = session.start_turn(request)
+            coordinator = self._coordinator()
+            coordinator.on_event(session.record_event)
+            async def execute():
+                try:
+                    return await coordinator.run(
+                        request, checkpoint=session.checkpoint(turn), history=turn["context"],
+                    )
+                finally:
+                    manager = getattr(coordinator, "model_manager", None)
+                    if manager is not None:
+                        await manager.close_all()
+            try:
+                result = asyncio.run(execute())
+            except Exception as exc:
+                session.finish_turn(turn, "failed", error=self._redact(str(exc)))
+                return 500, {"error": self._redact(str(exc)), "session_id": session_id}
+            session.finish_turn(turn, "completed", report=result)
+            return 200, self.sessions.get(session_id)
+        finally:
+            session.release()
 
     def make_http_server(self, host: str = "127.0.0.1", port: int = 8787):
         try:

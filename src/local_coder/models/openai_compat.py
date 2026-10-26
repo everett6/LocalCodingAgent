@@ -7,7 +7,7 @@ from typing import AsyncIterator
 import httpx
 
 from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
-from local_coder.models.base import BaseModelBackend
+from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 
 
 class OpenAICompatibleBackend(BaseModelBackend):
@@ -96,14 +96,11 @@ class OpenAICompatibleBackend(BaseModelBackend):
         if "tool_calls" in msg_data and msg_data["tool_calls"]:
             for tc in msg_data["tool_calls"]:
                 func = tc.get("function", {})
-                args_str = func.get("arguments", "{}")
-                try:
-                    args = json.loads(args_str)
-                except (json.JSONDecodeError, TypeError):
-                    raise ValueError("Malformed tool arguments; request a fresh tool call") from None
-                if not isinstance(args, dict):
-                    raise ValueError("Malformed tool arguments: expected an object")
-                    
+                args = decode_tool_arguments(func.get("arguments", "{}"))
+                from local_coder.agents.tool_repair import RAW_ARGUMENTS_KEY
+                if RAW_ARGUMENTS_KEY in args:
+                    raise ValueError("Malformed tool arguments; request a fresh tool call")
+
                 parsed_tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
                     name=func.get("name", ""),

@@ -211,7 +211,10 @@ class AgentRun:
                 and 0 <= state.tool_calls_used <= state.max_tool_calls
                 and 0 <= state.test_runs <= state.max_test_runs):
             raise ValueError("Checkpoint counters exceed their saved limits")
-        if self.metrics.tool_calls != state.tool_calls_used or self.metrics.model_calls != state.iteration:
+        summary_calls = self.notes.get("summary_calls", 0)
+        if not isinstance(summary_calls, int) or isinstance(summary_calls, bool) or not 0 <= summary_calls <= self.metrics.model_calls:
+            raise ValueError("Checkpoint summary counter is invalid")
+        if self.metrics.tool_calls != state.tool_calls_used or self.metrics.model_calls != state.iteration + summary_calls:
             raise ValueError("Checkpoint metrics disagree with saved counters")
         if len(state.tool_calls) != state.tool_calls_used:
             raise ValueError("Checkpoint tool history disagrees with saved counters")
