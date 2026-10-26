@@ -16,7 +16,7 @@ run without an installed script with `python -m local_coder`.
 ## Requirements
 
 - Python 3.12+
-- A local OpenAI-compatible, Ollama, or llama.cpp model server
+- A local OpenAI-compatible/Ollama server, or a user-supplied cloud provider key
 - `pip install -e ".[dev]"` for development dependencies
 
 ## Run
@@ -535,26 +535,39 @@ hundreds of thousands of characters, and materializing that as one string
 just to hash it and throw it away was wasted allocation on every drafter
 call.
 
-## Browser UI
+## Main app, desktop and IDE
 
-`local-coder serve` starts the same HTTP control plane used for remote
-terminal sessions, and now also serves a single-page browser UI
-(`src/local_coder/webui/index.html`) at `/`. It's a Claude-Code-style chat
-view -- session list, a live color-coded event stream per agent role, and
-Run/Plan-only/Review-changes actions -- talking to the existing JSON API
-(`/status`, `/events`, `/plan`, `/run`, `/review`) via `fetch()`. There's no
-native Linux/Windows/macOS app or per-OS build: any modern browser on any of
-the three renders the same page identically, so this is the "app" for all
-of them.
+The main app is a conversation manager with projects, task history, a centered
+composer, live activity, workspace diffs and provider settings. It is served by
+`local-coder serve` and is also available as an Electron desktop shell.
 
-```bash
-local-coder serve --project . --port 8787   # add --yolo to auto-approve risky actions
+```sh
+cd src/local_coder/webui
+npm ci
+npm run build
+cd ../../..
+local-coder --project . serve --port 8787
 ```
 
-Then open `http://localhost:8787` (or `http://<host>:8787` for a
-non-loopback bind, which requires `--token` -- paste the same token into the
-page's token field; it's sent as an `Authorization: Bearer` header on every
-API call and kept in `localStorage`).
+Open `http://localhost:8787`. If the engine requires a token, enter it in the
+connection field. Tokens and provider keys are kept in memory rather than browser
+storage. PWA shell assets are served alongside compiled JavaScript; API responses
+are not cached by the service worker.
+
+**Settings** supports Anthropic Messages, authenticated OpenAI-compatible APIs,
+GLM 5.3 and Qwen 3.8 profiles, and local servers. Supply a key or an environment
+variable name, the endpoint and the model ID available on your account.
+
+Use **Security** or **Bug hunting** for evidence-based investigations. Read-only
+review is the default; opt into fixes and test execution explicitly. `/hunt`,
+`/audit`, `/plan`, `/review` and file mentions such as `@src/app.py` also work.
+See [harness details](docs/harness.md).
+
+The IDE is a **separate Code OSS source fork**, with Local Coder bundled as a
+first-party integration. It shares the Python harness and model providers.
+See [desktop setup](desktop/README.md) and [IDE source/build instructions](ide/README.md).
+Windows and macOS installers are built on their matching OS; release signing
+requires the publisher's credentials.
 
 ## Generation retries
 
@@ -636,6 +649,15 @@ Run the tests with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+### Red team mode
+
+The manager and Code OSS IDE include a dedicated **Red Team** engagement workflow:
+saved scope/exclusions, phased checklists, bounded opt-in HTTP observations,
+SARIF/Nuclei artifact import, attack-path hypotheses, and persistent evidence.
+Use `lc redteam --target src 'Review trust boundaries'` for local source review.
+See [engagement setup and limits](docs/harness.md#red-team-engagements) and the
+[upstream methodology reference](docs/references/pentest-harness.md).
+
 **Small-model guardrails:** three more checks in the same loop, for mistakes
 local models make far more often than frontier ones.
 

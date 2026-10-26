@@ -17,7 +17,8 @@ class OllamaBackend(BaseModelBackend):
         super().__init__(config)
         # api_key comes from the environment (api_key_env in the config), for
         # hosted OpenAI-compatible endpoints or a server behind an auth proxy.
-        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else None
+        key = config.resolve_api_key()
+        headers = {"Authorization": f"Bearer {key}"} if key else None
         self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0, headers=headers)
 
     def _encode_tool_arguments(self, arguments: dict):

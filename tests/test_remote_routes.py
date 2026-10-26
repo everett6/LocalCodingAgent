@@ -1,12 +1,20 @@
 """Tests for the local-server/GPU HTTP routes RemoteControlServer.handle()
 exposes for the browser UI's command bar and GPU usage indicator."""
+import subprocess
+
 from local_coder import local_server
-from local_coder.remote import RemoteControlServer
+from local_coder.remote import RemoteControlServer, _WEBUI_ASSETS, _WEBUI_INDEX
 from local_coder.types import AgentEvent
 
 
 def _server(tmp_path):
     return RemoteControlServer(str(tmp_path))
+
+
+def test_webui_install_assets_are_packaged():
+    assert _WEBUI_INDEX.is_file()
+    assert {path for path in _WEBUI_ASSETS} == {"/manifest.webmanifest", "/sw.js", "/icon.svg"}
+    assert all(asset.is_file() for asset, _content_type in _WEBUI_ASSETS.values())
 
 
 def test_events_get_a_monotonic_seq_that_survives_ring_buffer_eviction(tmp_path):
@@ -101,3 +109,50 @@ def test_local_server_stop_route_can_target_just_one(tmp_path, monkeypatch):
     assert status == 200
     assert calls == ["big"]
     assert "draft" not in payload
+
+
+def _init_repo(path):
+    def run(*args):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    run("init", "-q")
+    run("config", "user.email", "test@example.com")
+    run("config", "user.name", "Test")
+    (path / "a.py").write_text("line1\nline2\nline3\n")
+    run("add", "a.py")
+    run("commit", "-q", "-m", "initial")
+    run("checkout", "-q", "-b", "feature")
+    return path
+
+
+def test_workspace_route_reports_real_diff_stat_for_a_tracked_edit(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "a.py").write_text("line1\nCHANGED\nline3\nline4\n")
+
+    status, payload = _server(repo).handle("GET", "/workspace")
+
+    assert status == 200
+    assert payload["branch"] == "feature"
+    assert payload["total_additions"] == 2
+    assert payload["total_deletions"] == 1
+    assert payload["files"] == [{"path": "a.py", "additions": 2, "deletions": 1, "untracked": False}]
+
+
+def test_workspace_route_lists_untracked_files_with_zero_stat(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "new_file.py").write_text("brand new\n")
+
+    status, payload = _server(repo).handle("GET", "/workspace")
+
+    assert status == 200
+    assert {"path": "new_file.py", "additions": 0, "deletions": 0, "untracked": True} in payload["files"]
+
+
+def test_workspace_route_on_a_clean_tree_reports_no_changes(tmp_path):
+    repo = _init_repo(tmp_path)
+
+    status, payload = _server(repo).handle("GET", "/workspace")
+
+    assert status == 200
+    assert payload["files"] == []
+    assert payload["total_additions"] == 0
+    assert payload["status"] == ""

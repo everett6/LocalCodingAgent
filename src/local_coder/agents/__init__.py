@@ -10,8 +10,10 @@ from local_coder.agents.coder import CoderAgent
 from local_coder.agents.debugger import DebuggerAgent
 from local_coder.agents.tester import TesterAgent
 from local_coder.agents.reviewer import ReviewerAgent
-from local_coder.agents.security import SecurityAgent
+from local_coder.agents.security import SecurityAgent, SecurityAuditorAgent
 from local_coder.agents.exploit_validator import ExploitValidatorAgent
+from local_coder.agents.bug_hunter import BugHunterAgent
+from local_coder.agents.red_team import RedTeamAgent
 
 
 def create_agent(
@@ -30,7 +32,9 @@ def create_agent(
         AgentRole.DEBUGGER: DebuggerAgent,
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
-        AgentRole.SECURITY: SecurityAgent,
+        AgentRole.SECURITY: SecurityAuditorAgent,
+        AgentRole.BUG_HUNTER: BugHunterAgent,
+        AgentRole.RED_TEAM: RedTeamAgent,
         AgentRole.EXPLOIT_VALIDATOR: ExploitValidatorAgent,
     }
     
@@ -49,6 +53,9 @@ __all__ = [
     "TesterAgent",
     "ReviewerAgent",
     "SecurityAgent",
+    "SecurityAuditorAgent",
     "ExploitValidatorAgent",
+    "BugHunterAgent",
+    "RedTeamAgent",
     "create_agent",
 ]

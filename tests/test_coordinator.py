@@ -372,3 +372,76 @@ def test_execute_simple_wires_the_drafter_through_to_the_coder_agent(tmp_path):
     response = run(coordinator._execute_simple("Add a feature", "exploration notes"))
 
     assert response.status == TaskStatus.COMPLETED
+
+
+def test_plan_only_emits_plan_created_with_the_full_task_list(tmp_path):
+    """The browser UI's live todo-list checklist is built entirely from
+    this one event -- it must carry every task's id/role/objective up
+    front, not just a task count."""
+    import json as jsonlib
+
+    plan_json = jsonlib.dumps({"tasks": [
+        {"task_id": "1", "objective": "Add the helper", "role": "coder", "files": [],
+         "constraints": [], "success_criteria": [], "depends_on": []},
+        {"task_id": "2", "objective": "Add a test", "role": "tester", "files": [],
+         "constraints": [], "success_criteria": [], "depends_on": ["1"]},
+    ]})
+    coordinator = make_coordinator(tmp_path)
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(
+        0, result=FakeModel(f"```json\n{plan_json}\n```")
+    )
+    received = []
+    coordinator.on_event(received.append)
+
+    run(coordinator.plan_only("Add a helper function"))
+
+    plan_events = [e for e in received if e.event_type == "plan_created"]
+    assert len(plan_events) == 1
+    assert plan_events[0].data["tasks"] == [
+        {"task_id": "1", "role": "coder", "objective": "Add the helper"},
+        {"task_id": "2", "role": "tester", "objective": "Add a test"},
+    ]
+
+
+def test_execute_simple_emits_running_then_completed_task_status(tmp_path):
+    coordinator = make_coordinator(tmp_path)
+    coordinator.model_manager.get_model = lambda role: asyncio.sleep(0, result=FakeModel("Done."))
+    received = []
+    coordinator.on_event(received.append)
+
+    response = run(coordinator._execute_simple("Add a feature", "notes", task_id="the-task"))
+
+    status_events = [e for e in received if e.event_type == "task_status"]
+    assert [e.data["status"] for e in status_events] == ["running", "completed"]
+    assert all(e.data["task_id"] == "the-task" == response.task_id for e in status_events)
+
+
+def test_execute_plan_emits_task_status_for_every_dag_task(tmp_path):
+    """The live checklist needs a running->completed (or failed) transition
+    per task, keyed by task_id, for the DAG-scheduled multi-task path too
+    -- not just the single-task _execute_simple path."""
+    from local_coder.types import TaskPlan
+
+    coordinator = make_coordinator(tmp_path)
+    coordinator.model_manager.get_model = lambda role, model_name=None: asyncio.sleep(
+        0, result=FakeModel("Done.")
+    )
+    received = []
+    coordinator.on_event(received.append)
+
+    plan = TaskPlan(
+        objective="two independent tasks",
+        tasks=[
+            AgentTask(task_id="a", role=AgentRole.CODER, objective="x", files=["a.py"]),
+            AgentTask(task_id="b", role=AgentRole.CODER, objective="y", files=["b.py"]),
+        ],
+    )
+
+    result = run(asyncio.wait_for(coordinator._execute_plan(plan), timeout=5))
+
+    assert result.status == TaskStatus.COMPLETED
+    status_events = [e for e in received if e.event_type == "task_status"]
+    by_task = {}
+    for e in status_events:
+        by_task.setdefault(e.data["task_id"], []).append(e.data["status"])
+    assert by_task == {"a": ["running", "completed"], "b": ["running", "completed"]}

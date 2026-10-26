@@ -116,6 +116,10 @@ class BaseModelBackend(abc.ABC):
                 ]
             if msg.tool_call_id:
                 d["tool_call_id"] = msg.tool_call_id
+            if msg.role == "assistant" and msg.reasoning_content is not None:
+                d["reasoning_content"] = msg.reasoning_content
+            if msg.role == "assistant" and msg.reasoning_details is not None:
+                d["reasoning_details"] = msg.reasoning_details
             result.append(d)
         return result
 

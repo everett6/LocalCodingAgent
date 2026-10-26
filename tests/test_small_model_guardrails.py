@@ -239,9 +239,9 @@ def test_syntax_error_is_reported_in_the_same_turn(tmp_path):
         ModelResponse(tool_calls=[ToolCall(name="write_file", arguments={"path": "bad.py", "content": "def f(:\n"})]),
         ModelResponse(content="Done."),
     ])
-    assert outputs[0].startswith("Wrote to bad.py")
-    assert "no longer parses" in outputs[0]
-    assert "bad.py:1" in outputs[0]
+    assert "Syntax validation failed for 'bad.py'" in outputs[0]
+    assert "Python SyntaxError on line 1" in outputs[0]
+    assert not (tmp_path / "bad.py").exists()
 
 
 def test_schemas_by_name_indexes_registry_schemas(tmp_path):

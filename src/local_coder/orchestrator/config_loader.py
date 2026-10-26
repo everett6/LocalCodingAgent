@@ -195,6 +195,8 @@ def load_config(
             estimated_vram_mb=model_data.get("estimated_vram_mb"),
             api_key=api_key,
             api_key_env=api_key_env,
+            profile=model_data.get("profile", "generic"),
+            strategy_attempt_limit=model_data.get("strategy_attempt_limit", 3),
         )
 
     resources_data = data.get("resources", {})
@@ -230,6 +232,7 @@ def load_config(
         compact_context_chars=agentic_data.get("compact_context_chars", 12000),
         max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
         session_cache=agentic_data.get("session_cache", False),
+        repo_map_tokens=agentic_data.get("repo_map_tokens", 1024),
     )
 
     fallbacks = {}
@@ -259,7 +262,9 @@ def load_config(
         routing=routing,
         tools=tools,
         sources=sources,
-        state_dir=data.get("state_dir", ".local-coder")
+        state_dir=data.get("state_dir", ".local-coder"),
+        mode=data.get("mode", "coding"),
+        safety_tier=data.get("safety_tier", "tier_3_balanced"),
     )
 
 

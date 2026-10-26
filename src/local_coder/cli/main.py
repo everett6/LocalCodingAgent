@@ -83,6 +83,20 @@ class _RequestGroup(_JsonErrorMixin, click.Group):
 )
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option(
+    "--safety-tier", "--tier", "safety_tier",
+    type=click.Choice(["1", "2", "3", "4", "5", "paranoia", "strict", "balanced", "auto_valid", "yolo"], case_sensitive=False),
+    default="3",
+    show_default=True,
+    help="Select Safety Tier (1: Paranoia, 2: Strict, 3: Balanced, 4: Auto-Valid, 5: YOLO).",
+)
+@click.option(
+    "--mode", "-m",
+    type=click.Choice(["coding", "cybersecurity", "bug_hunting"], case_sensitive=False),
+    default="coding",
+    show_default=True,
+    help="Select Operating Mode: 'coding', 'cybersecurity', or 'bug_hunting'.",
+)
+@click.option(
     "--resume", "-r", is_flag=True,
     help="Continue the most recent session: pick up its unfinished request, or add a follow-up request to it.",
 )
@@ -97,7 +111,7 @@ class _RequestGroup(_JsonErrorMixin, click.Group):
 @click.version_option(version=__version__, prog_name="local-coder")
 @json_option
 @click.pass_context
-def cli(ctx, config, project, model, temperature, config_overrides, debug, resume, session_id, yolo):
+def cli(ctx, config, project, model, temperature, config_overrides, debug, safety_tier, mode, resume, session_id, yolo):
     """Local Coding Agent - AI-powered local code assistant.
 
     Run with a request to execute it:
@@ -126,6 +140,8 @@ def cli(ctx, config, project, model, temperature, config_overrides, debug, resum
     ctx.obj["project_root"] = project or _get_project_root()
     ctx.obj["debug"] = debug
     ctx.obj["model"] = model
+    ctx.obj["safety_tier"] = safety_tier
+    ctx.obj["mode"] = mode
     ctx.obj["temperature"] = temperature
     ctx.obj["config_overrides"] = list(config_overrides)
     ctx.obj["yolo"] = yolo
@@ -263,6 +279,81 @@ def test(ctx):
 
 @cli.command()
 @json_option
+@click.option("--target", "-t", default=".", help="Target directory or file to audit.")
+@click.option("--fix", is_flag=True, help="Automatically propose remediation patches for detected issues.")
+@click.pass_context
+def audit(ctx, target, fix):
+    """Run security audit on the codebase."""
+    _run_audit(target, fix, ctx.obj)
+
+
+@cli.command()
+@json_option
+@click.argument("request", nargs=-1, required=True)
+@click.option("--engagement", help="Reuse a saved engagement ID")
+@click.option("--name", default="Red team exercise", help="Engagement name")
+@click.option("--target", multiple=True, default=(".",), help="In-scope local path; repeat to add more")
+@click.option("--exclude", multiple=True, help="Excluded local path")
+@click.option("--origin", multiple=True, help="Exact authorized HTTP(S) origin")
+@click.option("--exclude-url", multiple=True, help="Excluded URL path prefix")
+@click.option("--authorization", default="", help="Rules-of-engagement/authorization reference; never paste a credential")
+@click.option("--active-http", is_flag=True, help="Enable bounded GET/HEAD/OPTIONS observations")
+@click.option("--max-requests", default=20, type=click.IntRange(1, 50))
+@click.pass_context
+def redteam(ctx, request, engagement, name, target, exclude, origin, exclude_url, authorization, active_http, max_requests):
+    """Run a scope-bound red team investigation with durable evidence."""
+    from local_coder.redteam import EngagementStore, EngagementScope
+    from local_coder.orchestrator.sessions import SessionStore
+    prompt = " ".join(request)
+    store = EngagementStore(ctx.obj["project_root"])
+    try:
+        record = store.load(engagement) if engagement else store.create(EngagementScope(
+            name=name, objective=prompt, paths=list(target), excluded_paths=list(exclude),
+            origins=list(origin), excluded_urls=list(exclude_url), authorization=authorization,
+            active_http=active_http, max_requests=max_requests))
+        config = _load_config(ctx.obj)
+        async def execute():
+            coordinator = _build_coordinator(config, {**ctx.obj, "mode": "red_team"})
+            events = []
+            if json_mode(ctx.obj):
+                coordinator.on_event(lambda e: events.append(e.model_dump(mode="json")))
+            try:
+                result = await coordinator.run(prompt, engagement_id=record["id"])
+                SessionStore(ctx.obj["project_root"]).save(f"local-{uuid.uuid4().hex[:8]}",
+                    request=prompt, mode="red_team", phase="run", engagement_id=record["id"], result=result)
+                if json_mode(ctx.obj):
+                    _emit_run(ctx.obj, phase="redteam", request=prompt, result=result,
+                              events=events, extra={"engagement_id": record["id"]})
+                    return
+                console.print(Panel(Markdown(result), title=f"Red Team · {record['id']}", border_style="red"))
+            finally:
+                await coordinator.model_manager.close_all()
+        asyncio.run(execute())
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command()
+@json_option
+@click.pass_context
+def undo(ctx):
+    """Aider-style instant rollback to the state before the last agent command."""
+    _run_undo(ctx.obj)
+
+
+@cli.command()
+@json_option
+@click.argument("request", nargs=-1, required=True)
+@click.pass_context
+def hunt(ctx, request):
+    """Run in Bug Hunting mode to search for edge cases and logic flaws."""
+    ctx.obj["mode"] = "bug_hunting"
+    request_str = " ".join(request)
+    _run_request(request_str, ctx.obj)
+
+
+@cli.command()
+@json_option
 @click.pass_context
 def status(ctx):
     """Show system status."""
@@ -333,8 +424,20 @@ def resume(ctx, session_id):
     from local_coder.orchestrator.sessions import SessionError, SessionStore
 
     if session_id:
+        store = SessionStore(ctx.obj["project_root"])
+        record = store.get(session_id)
+        if record and not record.get("persistent") and record.get("request"):
+            # Older workbench journals have a saved request rather than turns.
+            # Keep their engagement identity when replaying a scoped investigation.
+            legacy_ctx = {**ctx.obj, "session_id": None, "resume": False}
+            if record.get("mode"):
+                legacy_ctx["mode"] = record["mode"]
+            if record.get("engagement_id"):
+                legacy_ctx["engagement_id"] = record["engagement_id"]
+            _run_request(record["request"], legacy_ctx)
+            return
         try:
-            SessionStore(ctx.obj["project_root"]).open(session_id)
+            store.open(session_id)
         except SessionError as exc:
             raise click.ClickException(str(exc)) from exc
         ctx.obj["session_id"] = session_id
@@ -788,12 +891,31 @@ async def _cli_approval_callback(description: str) -> bool:
 
 
 def _build_coordinator(config, ctx_obj: dict):
-    """Construct a Coordinator wired for this CLI invocation: --yolo turns
-    off approval prompts entirely, otherwise ASK-risk actions are routed
-    to an interactive y/n prompt instead of being auto-denied."""
+    """Construct a Coordinator wired for this CLI invocation.
+    Configures the selected Safety Tier (1-5) and Operating Mode (coding, cybersecurity, bug_hunting).
+    """
     from local_coder.orchestrator.coordinator import Coordinator
+    from local_coder.safety import parse_safety_tier
+    from local_coder.types import SafetyTier, AgentMode
 
+    safety_tier = parse_safety_tier(ctx_obj.get("safety_tier", "3"))
     if ctx_obj.get("yolo"):
+        safety_tier = SafetyTier.TIER_5_YOLO
+
+    config.safety_tier = safety_tier
+    mode_str = ctx_obj.get("mode", "coding").lower()
+    try:
+        config.mode = AgentMode(mode_str)
+    except ValueError:
+        config.mode = AgentMode.CODING
+
+    if safety_tier in (SafetyTier.TIER_4_AUTO_VALID, SafetyTier.TIER_5_YOLO):
+        config.approval.require_approval_for_commands = False
+        config.approval.require_approval_for_commits = False
+        approval_callback = None
+    elif safety_tier == SafetyTier.TIER_1_PARANOIA:
+        approval_callback = None
+    elif ctx_obj.get("yolo"):
         config.approval.require_approval_for_commands = False
         config.approval.require_approval_for_commits = False
         approval_callback = None
@@ -871,16 +993,27 @@ def _run_request(request: str | None, ctx_obj: dict):
             session.reopen_turn(turn)
         else:
             turn = session.start_turn(request)
+            turn["mode"] = ctx_obj.get("mode", "coding")
+            if ctx_obj.get("engagement_id"):
+                turn["engagement_id"] = ctx_obj["engagement_id"]
+        run_ctx = dict(ctx_obj)
+        if turn.get("mode"):
+            run_ctx["mode"] = turn["mode"]
+        if turn.get("engagement_id"):
+            run_ctx["engagement_id"] = turn["engagement_id"]
 
         json_events: list = []
 
         async def _run():
-            coordinator = _build_coordinator(config, ctx_obj)
+            coordinator = _build_coordinator(config, run_ctx)
             coordinator.on_event(session.record_event)
             if json_mode(ctx_obj):
                 coordinator.on_event(lambda e: json_events.append(e.model_dump(mode="json")))
+            options = {}
+            if run_ctx.get("engagement_id"):
+                options["engagement_id"] = run_ctx["engagement_id"]
             return await coordinator.run(
-                turn["request"], checkpoint=session.checkpoint(turn), history=turn["context"],
+                turn["request"], checkpoint=session.checkpoint(turn), history=turn["context"], **options,
             )
 
         try:
@@ -1029,6 +1162,40 @@ def _interactive_mode(ctx_obj: dict):
                     _run_validate_finding(ctx_obj, user_input[len("/validate-finding"):].strip(), [])
                 elif cmd == "/test":
                     _run_tests(ctx_obj)
+                elif cmd == "/audit":
+                    parts = user_input.split(maxsplit=1)
+                    target = parts[1] if len(parts) == 2 else "."
+                    _run_audit(target, False, ctx_obj)
+                elif cmd == "/hunt":
+                    req = user_input[len("/hunt"):].strip()
+                    if req:
+                        hunt_ctx = dict(ctx_obj)
+                        hunt_ctx["mode"] = "bug_hunting"
+                        _run_request(req, hunt_ctx)
+                    else:
+                        console.print("[red]Please provide an objective or target for bug hunting.[/red]")
+                elif cmd == "/undo":
+                    _run_undo(ctx_obj)
+                elif cmd == "/mode":
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) == 2:
+                        new_mode = parts[1].strip().lower()
+                        if new_mode in ("coding", "cybersecurity", "bug_hunting"):
+                            ctx_obj["mode"] = new_mode
+                            console.print(f"[bold green]Switched operating mode to:[/bold green] [cyan]{new_mode}[/cyan]")
+                        else:
+                            console.print(f"[red]Unknown mode '{new_mode}'. Choose: coding, cybersecurity, bug_hunting[/red]")
+                    else:
+                        console.print(f"Current mode: [cyan]{ctx_obj.get('mode', 'coding')}[/cyan] (Options: coding, cybersecurity, bug_hunting)")
+                elif cmd in ("/safety", "/tier"):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) == 2:
+                        from local_coder.safety import parse_safety_tier
+                        t = parse_safety_tier(parts[1])
+                        ctx_obj["safety_tier"] = t.value
+                        console.print(f"[bold green]Switched Safety Tier to:[/bold green] [cyan]{t.value}[/cyan]")
+                    else:
+                        console.print(f"Current safety tier: [cyan]{ctx_obj.get('safety_tier', '3')}[/cyan] (Options: 1=Paranoia, 2=Strict, 3=Balanced, 4=Auto-Valid, 5=YOLO)")
                 elif cmd == "/checkpoint":
                     _run_checkpoint(ctx_obj)
                 elif cmd == "/checkpoints":
@@ -1055,9 +1222,11 @@ def _interactive_mode(ctx_obj: dict):
                         console.print(f"[red]{exc.message}[/red]")
                 elif cmd == "/help":
                     console.print(ui.build_help_table())
+                    console.print("[dim]Modes: /audit [path], /hunt <request>, /mode [coding|cybersecurity|bug_hunting], /safety [1-5], /undo[/dim]")
                 elif not _run_extension_command(user_input, ctx_obj):
                     console.print(ui.unknown_command_message(cmd))
             else:
+                console.print("[cyan]Inspecting the repo and building context…[/cyan]")
                 _run_request(user_input, ctx_obj)
 
         except BaseException as exc:
@@ -1293,6 +1462,62 @@ def _emit_run(ctx_obj, *, phase, request, result, events, session_id=None, extra
     emit(ctx_obj, data, ok=status == "completed" and not any(e["event_type"] == "model_error" for e in errors))
 
 
+def _run_audit(target: str, fix: bool, ctx_obj: dict):
+    from local_coder.orchestrator.sessions import SessionStore
+
+    console.print(Panel(f"Running security audit on [bold]{target}[/bold]", title="Local Coder - Security Audit", border_style="red"))
+
+    config = _load_config(ctx_obj)
+
+    async def _run():
+        from local_coder.types import AgentMode
+        config.mode = AgentMode.CYBERSECURITY
+        coordinator = _build_coordinator(config, {**ctx_obj, "mode": "cybersecurity"})
+        events = []
+        if json_mode(ctx_obj):
+            coordinator.on_event(lambda e: events.append(e.model_dump(mode="json")))
+        prompt = (
+            f"Conduct an adversarial security audit on '{target}'. Use run_sast, audit_config, and audit_dependencies tools. "
+            "Identify vulnerabilities, map source-to-sink flows, provide a defensive reproduction test case, "
+            "and propose exact remediations."
+        )
+        if fix:
+            prompt += " Apply and verify the remediation patches directly."
+        try:
+            result = await coordinator.run(prompt, target_path=target, fix=fix)
+            SessionStore(ctx_obj["project_root"]).save(
+                f"local-{uuid.uuid4().hex[:8]}", request=prompt, phase="audit", result=result
+            )
+            if json_mode(ctx_obj):
+                _emit_run(ctx_obj, phase="audit", request=prompt, result=result, events=events)
+                return
+            console.print(Panel(Markdown(result), title="Security Audit Report", border_style="red"))
+        except Exception as e:
+            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            raise click.ClickException(str(e)) from e
+
+    asyncio.run(_run())
+
+
+def _run_undo(ctx_obj: dict):
+    from local_coder.git.checkpoints import CheckpointManager
+
+    try:
+        mgr = CheckpointManager(ctx_obj["project_root"])
+        restored = mgr.undo()
+        if json_mode(ctx_obj):
+            emit(ctx_obj, {"checkpoint": _checkpoint_json(restored)})
+            return
+        console.print(Panel(
+            f"[bold green]Successfully rolled back workspace![/bold green]\nRestored to checkpoint: [cyan]{restored.checkpoint_id}[/cyan]",
+            title="Local Coder - Undo",
+            border_style="green",
+        ))
+    except Exception as exc:
+        console.print(f"[bold red]Undo failed:[/bold red] {exc}")
+        raise click.ClickException(str(exc)) from exc
+
+
 def _run_checkpoint(ctx_obj: dict):
     from local_coder.git import CheckpointManager
 
@@ -1396,7 +1621,7 @@ def _resolve_model_name(config, role) -> str:
 def _show_agents(ctx_obj: dict):
     from local_coder.agents import (
         CoderAgent, DebuggerAgent, ExplorerAgent, ExploitValidatorAgent, PlannerAgent, ReviewerAgent,
-        SecurityAgent, TesterAgent,
+        SecurityAuditorAgent, TesterAgent, BugHunterAgent, RedTeamAgent,
     )
     from local_coder.types import AgentRole
 
@@ -1413,7 +1638,9 @@ def _show_agents(ctx_obj: dict):
         AgentRole.DEBUGGER: DebuggerAgent,
         AgentRole.TESTER: TesterAgent,
         AgentRole.REVIEWER: ReviewerAgent,
-        AgentRole.SECURITY: SecurityAgent,
+        AgentRole.SECURITY: SecurityAuditorAgent,
+        AgentRole.BUG_HUNTER: BugHunterAgent,
+        AgentRole.RED_TEAM: RedTeamAgent,
         AgentRole.EXPLOIT_VALIDATOR: ExploitValidatorAgent,
     }
 

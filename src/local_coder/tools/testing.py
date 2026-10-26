@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 import time
+from local_coder.processes import communicate, process_options, split_command
 
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
@@ -84,7 +85,7 @@ class BuildTool(Tool):
             cmd = []
             
             if command:
-                cmd = command.split()
+                cmd = split_command(command)
             else:
                 if (root / "Makefile").exists():
                     cmd = ["make"]
@@ -101,9 +102,10 @@ class BuildTool(Tool):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=self.project_root
+                cwd=self.project_root,
+                **process_options()
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await communicate(proc)
             success = proc.returncode == 0
             
             output = stdout.decode()

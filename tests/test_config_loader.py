@@ -156,8 +156,8 @@ models:
 
     config = load_config(project_root=str(tmp_path))
 
-    assert config.models["hosted"].api_key == "sk-secret"
-    assert config.models["braced"].api_key == "sk-secret"
+    assert config.models["hosted"].resolve_api_key() == "sk-secret"
+    assert config.models["braced"].resolve_api_key() == "sk-secret"
     assert config.models["braced"].api_key_env == "TEST_LC_KEY"
     # Never serialized or shown in repr.
     assert "sk-secret" not in repr(config)

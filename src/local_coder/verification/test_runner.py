@@ -17,7 +17,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -25,6 +24,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+from local_coder.processes import communicate, process_options
 
 FRAMEWORKS = ("pytest", "unittest", "jest", "vitest", "mocha", "go", "cargo", "npm", "make")
 
@@ -717,16 +718,6 @@ def _test_env() -> dict[str, str]:
     return env
 
 
-def _kill_tree(proc: asyncio.subprocess.Process) -> None:
-    try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 async def run_tests(
     project_root: str | os.PathLike[str],
     framework: str = "auto",
@@ -759,16 +750,14 @@ async def run_tests(
                 stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(root),
                 env=_test_env(),
-                start_new_session=(os.name == "posix"),
+                **process_options(),
             )
         except FileNotFoundError:
             report.notes.append(f"{plan.argv[0]} was not found; is {framework} installed?")
             return report
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout, _ = await communicate(proc, timeout=timeout)
         except asyncio.TimeoutError:
-            _kill_tree(proc)
-            await proc.wait()
             report.timed_out = True
             report.duration_s = time.monotonic() - started
             report.notes.append(f"Timed out after {int(timeout)}s.")

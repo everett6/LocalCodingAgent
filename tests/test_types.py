@@ -34,7 +34,11 @@ class TestEnums:
     def test_agent_roles(self):
         assert AgentRole.ORCHESTRATOR.value == "orchestrator"
         assert AgentRole.CODER.value == "coder"
-        assert len(AgentRole) == 9
+        assert AgentRole.SECURITY.value == "security"
+        assert AgentRole.BUG_HUNTER.value == "bug_hunter"
+        assert AgentRole.RED_TEAM.value == "red_team"
+        assert AgentRole.EXPLOIT_VALIDATOR.value == "exploit_validator"
+        assert len(AgentRole) == 11
 
     def test_task_status(self):
         assert TaskStatus.PENDING.value == "pending"

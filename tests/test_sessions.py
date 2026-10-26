@@ -127,7 +127,7 @@ def test_rerun_with_checkpoint_skips_finished_phases(tmp_path):
         calls.append("plan")
         return TaskPlan(objective=request, tasks=[AgentTask(role=AgentRole.CODER, objective=request)])
 
-    async def execute(request, exploration):
+    async def execute(request, exploration, task_id=None):
         calls.append("execute")
         return ok(summary="edited")
 
@@ -169,7 +169,7 @@ def test_history_is_given_to_the_agents(tmp_path):
     async def plan(request, exploration):
         return TaskPlan(objective=request, tasks=[AgentTask(role=AgentRole.CODER, objective=request)])
 
-    async def execute(request, exploration):
+    async def execute(request, exploration, task_id=None):
         return ok()
 
     async def review(result):

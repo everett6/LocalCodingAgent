@@ -15,10 +15,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        # api_key comes from the environment (api_key_env in the config), for
-        # hosted OpenAI-compatible endpoints or a server behind an auth proxy.
-        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else None
-        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0, headers=headers)
+        key = config.resolve_api_key()
+        self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0,
+                                        headers={"Authorization": f"Bearer {key}"} if key else {})
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """Convert standard tools dict to OpenAI format if needed."""
@@ -26,6 +25,14 @@ class OpenAICompatibleBackend(BaseModelBackend):
             return None
         # Assuming tools are already in OpenAI JSON schema format
         return tools
+
+    def _profile_payload(self, payload):
+        if self.config.profile.startswith("openrouter_"):
+            payload["reasoning"] = {"effort": "high", "exclude": False}
+            payload["provider"] = {"require_parameters": True}
+            if self.config.profile == "openrouter_kimi":
+                payload.pop("temperature", None)
+        return payload
 
     async def generate(
         self,
@@ -56,21 +63,32 @@ class OpenAICompatibleBackend(BaseModelBackend):
             payload["tools"] = openai_tools
             payload["tool_choice"] = "auto"
 
+        if self.config.profile == "glm53":
+            payload.update(thinking={"type": "enabled", "clear_thinking": False}, reasoning_effort="max")
+        elif self.config.profile == "qwen38":
+            payload.update(enable_thinking=True, stream=True, stream_options={"include_usage": True})
+
+        self._profile_payload(payload)
         try:
             # Relative to base_url, which is expected to already include the
             # server's own "/v1" prefix (the OpenAI SDK convention, e.g.
             # "http://localhost:8090/v1") -- httpx joins a leading-slash path
             # onto base_url's own path rather than replacing it, so a
             # "/v1/..." path here would request ".../v1/v1/...".
-            response = await self.client.post("/chat/completions", json=payload)
-            response.raise_for_status()
-            data = response.json()
+            if payload["stream"]:
+                data = await self._collect_stream(payload)
+            else:
+                response = await self.client.post("/chat/completions", json=payload)
+                response.raise_for_status()
+                data = response.json()
         except httpx.HTTPError as e:
-            raise RuntimeError(f"OpenAI API request failed: {e}") from e
+            raise RuntimeError(f"Provider request failed (HTTP {e.response.status_code})" if isinstance(e, httpx.HTTPStatusError) else "Provider connection failed") from None
 
         latency_ms = (time.time() - start_time) * 1000.0
         
-        choice = data.get("choices", [{}])[0]
+        if data.get("error") or not data.get("choices"):
+            raise RuntimeError("Provider returned an error or no completion; check model access and quota")
+        choice = data["choices"][0]
         msg_data = choice.get("message", {})
         content = msg_data.get("content") or ""
         
@@ -79,6 +97,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
             for tc in msg_data["tool_calls"]:
                 func = tc.get("function", {})
                 args = decode_tool_arguments(func.get("arguments", "{}"))
+                from local_coder.agents.tool_repair import RAW_ARGUMENTS_KEY
+                if RAW_ARGUMENTS_KEY in args:
+                    raise ValueError("Malformed tool arguments; request a fresh tool call")
 
                 parsed_tool_calls.append(ToolCall(
                     id=tc.get("id", ""),
@@ -97,7 +118,41 @@ class OpenAICompatibleBackend(BaseModelBackend):
             total_tokens=usage.get("total_tokens", 0),
             latency_ms=latency_ms,
             model=data.get("model", self.config.model_id),
+            reasoning_content=msg_data.get("reasoning_content") or msg_data.get("reasoning"),
+            reasoning_details=msg_data.get("reasoning_details"),
         )
+
+    async def _collect_stream(self, payload):
+        """Assemble indexed tool deltas before any tool may execute."""
+        content, reasoning, calls, usage, details = [], [], {}, {}, []
+        finish, model = "stop", self.config.model_id
+        async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                raw = line[6:]
+                if raw.strip() == "[DONE]":
+                    break
+                data = json.loads(raw)
+                if data.get("error"):
+                    raise RuntimeError("Provider stream failed; check model access and quota")
+                usage = data.get("usage") or usage
+                model = data.get("model") or model
+                for choice in data.get("choices", []):
+                    finish = choice.get("finish_reason") or finish
+                    delta = choice.get("delta", {})
+                    content.append(delta.get("content") or "")
+                    reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+                    details.extend(delta.get("reasoning_details") or [])
+                    for call in delta.get("tool_calls") or []:
+                        assembled = calls.setdefault(call["index"], {"id": "", "function": {"name": "", "arguments": ""}})
+                        assembled["id"] += call.get("id") or ""
+                        for key in ("name", "arguments"):
+                            assembled["function"][key] += call.get("function", {}).get(key) or ""
+        return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning) or None,
+                                          "tool_calls": [calls[i] for i in sorted(calls)], "reasoning_details": details or None}, "finish_reason": finish}],
+                "usage": usage, "model": model}
 
     async def stream(
         self,
@@ -117,6 +172,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
             "stream": True,
         }
 
+        self._profile_payload(payload)
         try:
             async with self.client.stream("POST", "/chat/completions", json=payload) as response:
                 response.raise_for_status()
@@ -138,7 +194,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     except json.JSONDecodeError:
                         continue
         except httpx.HTTPError as e:
-            raise RuntimeError(f"OpenAI stream failed: {e}") from e
+            raise RuntimeError("Provider stream failed; check endpoint, model access and quota") from None
 
     async def is_available(self) -> bool:
         """Check if the server is reachable and model exists."""

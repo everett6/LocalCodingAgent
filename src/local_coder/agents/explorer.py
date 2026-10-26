@@ -1,39 +1,85 @@
 """Explorer agent for discovering codebase context."""
 from __future__ import annotations
-from local_coder.types import AgentRole
+from typing import Any
+
 from local_coder.agents.base import BaseAgent
+from local_coder.types import AgentRole
 
 
 class ExplorerAgent(BaseAgent):
     """Agent responsible for understanding and summarizing a codebase or directory."""
-    
+
     role = AgentRole.EXPLORER
-    
-    system_prompt = """You are an Explorer Agent responsible for codebase discovery and understanding.
-Your objective is to explore the provided repository/directory and find files relevant to the task.
 
-You must use the provided tools (like code_search, read_file, list_files, search_files, grep) to investigate the code.
-Start with code_search to find code by meaning, and use grep for exact text.
-Pay attention to:
-- Code structure and architecture
-- Frameworks and dependencies
-- Coding conventions and patterns
-- Which specific files need to be modified for the user's task
+    system_prompt = """You are a Super Explorer Agent for a next-generation coding platform.
+Your job is to understand the repository like a hybrid system combining Devin-style planning, Claude Code-style context handling, Codex-style execution discipline, and Cursor-style code intelligence.
 
-Once you have gathered sufficient information, DO NOT call any more tools.
-Instead, return a structured JSON response wrapped in a markdown code block:
+Start with code_search to find code by meaning and repo_map to inspect the repository structure.
+Use grep for exact text and read_file to verify relevant implementations.
 
+Your objective is to map the project architecture, identify the highest-value files, and explain how a multi-agent coding system should work on top of this repo.
+
+Use the available repo tools to inspect the project before answering. Prioritize:
+- architecture and major subsystems
+- framework/runtime boundaries
+- test and verification flows
+- file ownership and entry points
+- likely implementation hotspots for the task
+- operational constraints and risks
+
+Once you have sufficient evidence, stop calling tools and return a concise JSON payload wrapped in a markdown code block.
+
+Use this schema:
 ```json
 {
-  "project_type": "string (e.g., Python Web App, React Frontend)",
-  "languages": ["list", "of", "languages"],
-  "key_files": ["important", "files", "in", "repo"],
-  "architecture_notes": "Summary of architecture and patterns",
-  "relevant_files": ["files", "relevant", "to", "current", "task"],
-  "dependencies": ["main", "frameworks"],
-  "conventions": ["coding", "conventions", "observed"]
+  "project_type": "string describing the project",
+  "languages": ["language 1", "language 2"],
+  "key_files": ["most important files"],
+  "architecture_notes": "short but informative architecture summary",
+  "relevant_files": ["files directly relevant to this task"],
+  "dependencies": ["frameworks, libraries, or runtimes"],
+  "conventions": ["coding patterns observed"],
+  "multi_agent_fit": {
+    "planner": "how planning should operate here",
+    "coder": "how coding work should be scoped",
+    "tester": "how validation should happen",
+    "reviewer": "what review checks matter"
+  },
+  "risks": ["any technical or execution risks"]
 }
 ```
 
-Be concise but thorough. Focus on finding exactly what is needed for the given objective.
+Important:
+- Prefer factual findings over guesswork.
+- Keep output compact but concrete.
+- If the repository includes a UI, describe the product experience and visual system in the architecture_notes.
+- Treat this as the foundation for a larger platform that combines strong planning, tool use, verification, and user-facing polish.
 """
+
+    def build_platform_summary(self, project_summary: dict[str, Any]) -> dict[str, Any]:
+        """Translate repository facts into a multi-agent platform summary.
+
+        This intentionally captures the same concepts that make a coding platform feel
+        like a combined Devin/Claude Code/Codex/Cursor-style operating system:
+        planning + execution + verification + UX.
+        """
+        relevant = project_summary.get("relevant_files") or []
+        architecture = project_summary.get("architecture_notes") or ""
+        return {
+            "orchestration_mode": "hybrid-super-agent",
+            "strengths": [
+                "Devin-style task planning",
+                "Claude Code-style context management",
+                "Codex-style tool execution discipline",
+                "Cursor-style code intelligence",
+            ],
+            "focus_files": relevant,
+            "architecture_summary": architecture,
+            "recommended_agent_stack": [
+                "explorer",
+                "planner",
+                "coder",
+                "tester",
+                "reviewer",
+            ],
+        }

@@ -79,12 +79,16 @@ class ToolRegistry:
                 ToolName.LINT, ToolName.FORMAT_CODE,
             },
             AgentRole.REVIEWER: {
+                ToolName.SECURITY_PLAYBOOK,
+                ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
                 ToolName.READ_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
                 ToolName.RUN_TESTS, ToolName.LINT, ToolName.SECURITY_SCAN,
             },
             AgentRole.SECURITY: {
+                ToolName.SECURITY_PLAYBOOK, ToolName.RUN_TESTS,
+                ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
                 ToolName.READ_FILE, ToolName.LIST_FILES,
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
@@ -99,6 +103,16 @@ class ToolRegistry:
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF,
                 ToolName.SECURITY_SCAN, ToolName.RUN_TESTS, ToolName.RECORD_FINDING,
             },
+            AgentRole.BUG_HUNTER: {
+                ToolName.SECURITY_PLAYBOOK, ToolName.RUN_BUG_SCAN,
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH,
+                ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
+                ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
+                ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
+                ToolName.LINT, ToolName.FORMAT_CODE,
+            },
+            # Engagement tools are granted only by bind_engagement after validating scope.
+            AgentRole.RED_TEAM: set(),
             AgentRole.ORCHESTRATOR: set(ToolName),  # Full access
         }
 
@@ -163,6 +177,9 @@ class ToolRegistry:
                 role = AgentRole(role_name)
             except ValueError:
                 continue
+            if role == AgentRole.RED_TEAM:
+                # Only bind_engagement can establish these scoped capabilities.
+                continue
             self._permissions[role] = {known[n] for n in tool_names if n in known}
         for name in settings.disabled:
             tool = known.get(name)
@@ -215,6 +232,8 @@ class ToolRegistry:
             )
 
         try:
+            if name_enum == ToolName.RECOVER_CONTEXT:
+                arguments = {**arguments, "_caller_role": role}
             result = await tool.execute(**arguments)
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)

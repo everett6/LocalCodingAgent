@@ -91,6 +91,8 @@ def parse_arguments(text: str) -> dict[str, Any] | None:
     candidate = text.strip()
     if not candidate:
         return {}
+    if candidate in {"{", "["}:
+        return None
     fenced = _FENCED_BLOCK.match(candidate)
     if fenced:
         candidate = fenced.group(1).strip()

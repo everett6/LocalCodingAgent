@@ -11,23 +11,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-import fcntl
+from local_coder.file_lock import exclusive_lock
+from local_coder.workspace import Workspace
 
 
 class SessionStore:
     def __init__(self, project_root: str, state_dir: str = ".local-coder"):
-        self.path = Path(project_root) / state_dir / "sessions.json"
+        self.path = Workspace(project_root).resolve(Path(state_dir) / "sessions.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock_path = self.path.with_suffix(".lock")
+        self.lock_path = Workspace(project_root).resolve(self.path.with_suffix(".lock"))
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
         with self.lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
+            with exclusive_lock(lock_file):
                 yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -189,6 +187,7 @@ class Session:
         self.dir = store.sessions_dir / session_id
         self.state = state
         self._lock_file = None
+        self._lease = None
 
     @property
     def state_path(self) -> Path:
@@ -298,12 +297,14 @@ class Session:
     def acquire(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         lock_file = (self.dir / ".lock").open("a+")
+        lease = exclusive_lock(lock_file, blocking=False)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lease.__enter__()
         except OSError:
             lock_file.close()
             raise SessionError(f"Session {self.session_id} is already running in another process")
         self._lock_file = lock_file
+        self._lease = lease
         # Another process may have run this session since it was opened.
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -311,9 +312,12 @@ class Session:
 
     def release(self) -> None:
         if self._lock_file is not None:
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-            self._lock_file.close()
-            self._lock_file = None
+            try:
+                self._lease.__exit__(None, None, None)
+            finally:
+                self._lock_file.close()
+                self._lock_file = None
+                self._lease = None
 
     def __enter__(self) -> "Session":
         self.acquire()

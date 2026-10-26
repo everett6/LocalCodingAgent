@@ -91,13 +91,39 @@ class WriteFileTool(Tool):
         "required": ["path", "content"]
     }
     
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, safety_harness: Any = None):
         self.project_root = project_root
+        self.safety_harness = safety_harness
         
     async def execute(self, path: str, content: str, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
             target = _resolve_and_check_path(self.project_root, path)
+
+            if self.safety_harness:
+                allowed, _ = self.safety_harness.can_modify_files()
+                if not allowed:
+                    return ToolResult(
+                        success=False,
+                        output="Operation blocked: Current Safety Tier does not allow file modifications (Read-Only Mode).",
+                        error="Blocked by Safety Tier 1 (Paranoia)",
+                        duration_ms=int((time.time() - start_t) * 1000),
+                    )
+
+                # Output Filter: strict Tree-sitter / AST validation
+                valid, syntax_err = self.safety_harness.filter_output(path, content)
+                if not valid:
+                    return ToolResult(
+                        success=False,
+                        output=(
+                            f"Tree-sitter Output Filter: Syntax validation failed for '{path}'.\n"
+                            f"{syntax_err}\n"
+                            "The file was NOT modified to prevent repository corruption. "
+                            "Please fix the code syntax and output the corrected version."
+                        ),
+                        error=f"Output Filter Syntax Error: {syntax_err}",
+                        duration_ms=int((time.time() - start_t) * 1000),
+                    )
             
             def _write() -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -153,8 +179,9 @@ class EditFileTool(Tool):
         "required": ["path", "old_string", "new_string"]
     }
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, safety_harness: Any = None):
         self.project_root = project_root
+        self.safety_harness = safety_harness
 
     async def execute(
         self,
@@ -171,6 +198,10 @@ class EditFileTool(Tool):
 
         try:
             target = _resolve_and_check_path(self.project_root, path)
+            if self.safety_harness:
+                allowed, _ = self.safety_harness.can_modify_files()
+                if not allowed:
+                    return _fail("Operation blocked: Current Safety Tier does not allow file modifications (Read-Only Mode).")
             if not target.is_file():
                 return _fail(f"File not found: {path}")
             if not old_string:
@@ -209,6 +240,10 @@ class EditFileTool(Tool):
 
                 first_line = _line_number(content, content.find(old))
                 updated = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+                if self.safety_harness:
+                    valid, syntax_err = self.safety_harness.filter_output(path, updated)
+                    if not valid:
+                        return _fail(f"Syntax validation failed for '{path}': {syntax_err}. The file was NOT modified.")
                 with open(target, "w", encoding="utf-8", newline="") as f:
                     f.write(updated)
                 replaced = f"{count} occurrences" if count > 1 else "1 occurrence"
@@ -297,12 +332,23 @@ class ApplyPatchTool(Tool):
         "required": ["patch"]
     }
     
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, safety_harness: Any = None):
         self.project_root = project_root
+        self.safety_harness = safety_harness
         
     async def execute(self, patch: str, working_dir: str | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
+            if self.safety_harness:
+                allowed, _ = self.safety_harness.can_modify_files()
+                if not allowed:
+                    return ToolResult(
+                        success=False,
+                        output="Operation blocked: Current Safety Tier does not allow file modifications (Read-Only Mode).",
+                        error="Blocked by Safety Tier 1 (Paranoia)",
+                        duration_ms=int((time.time() - start_t) * 1000),
+                    )
+
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
             proc = await asyncio.create_subprocess_exec(
                 "patch", "-p1",

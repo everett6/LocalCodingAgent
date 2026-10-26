@@ -1,0 +1,16 @@
+{
+  "name": "local-coder-code-oss-fork",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "prepare:source": "node scripts/prepare.mjs",
+    "install:upstream": "node scripts/build.mjs install",
+    "compile": "node scripts/build.mjs compile",
+    "build": "node scripts/build.mjs package",
+    "start": "node scripts/launch.mjs",
+    "test": "node --test test/*.test.mjs extension/test/*.test.cjs",
+    "electron": "node scripts/build.mjs electron",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
