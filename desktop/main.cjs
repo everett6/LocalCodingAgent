@@ -127,11 +127,13 @@ app.whenReady().then(async () => {
       { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
       { label: 'View', submenu: [{ role: 'reload' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     ]));
+    window.on('close', () => startupStatus('window_close_requested'));
+    window.webContents.on('render-process-gone', (_event, details) => startupStatus(`renderer_stopped ${details.reason} ${details.exitCode}`));
     window.once('ready-to-show', () => { window.show(); startupStatus('window_ready'); });
     await window.loadURL(origin);
   } catch (error) { startupStatus('startup_failed: ' + error.message); dialog.showErrorBox('Cannot start Local Coder', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
 });
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', event => { if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });
+app.on('before-quit', event => { startupStatus('quit_requested'); if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });
 
 module.exports = { installedIDE, spawnIDE };

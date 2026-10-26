@@ -105,3 +105,11 @@ one engine process, and verify that closing a borrower preserves its owner.
 308 previous backend checks plus the new cross-language check (309 total),
 18 IDE checks and 9 desktop checks pass. Only extension/runtime resources changed
 inside the existing Code OSS native package; core editor compilation is unchanged.
+
+The repaired installed manager reached both `engine_ready owned` and
+`window_ready` milestones on the real project. The installed IDE client then
+attached to that live backend, verified the project identity, and detached
+without stopping it. Both installed application processes remained running.
+The installed native IDE extension-host smoke also passed. The manager records
+window-close requests, renderer exits and quit requests for diagnosing any
+subsequent closure independently of backend startup.

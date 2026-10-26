@@ -1,6 +1,6 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const root=path.resolve(__dirname,'../../..');
-const {Sidecar}=require(path.join(root,'desktop/sidecar.cjs')); 
+const {Sidecar}=require(path.join(root,'desktop/sidecar.cjs'));
 const {EngineConnection}=require(path.join(root,'ide/extension/engine.cjs'));
 (async()=>{
 const executable=path.resolve(process.argv[2]||path.join(root,'dist/local-coder-engine'));
