@@ -160,7 +160,7 @@ async def test_cancellation_reaps_server_and_child(tmp_path):
         status = Path(f'/proc/{child}/stat')
         try:
             state = status.read_text().split()[2]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             state = None  # The reaped process can disappear between observations.
         assert state in {None, 'Z'}
     await service.close()

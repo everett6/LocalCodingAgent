@@ -46,7 +46,8 @@ test('stop authenticates and drains the engine before terminating it', async () 
 
 test('manager attaches to authenticated workspace engine without spawning or stopping it', async () => {
   const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http=require('node:http'),crypto=require('node:crypto');
-  const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'manager-attach-'));
+  const realWorkspace=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'manager-attach-'))).split(path.sep).join('/');
+  const workspace=process.platform==='win32'?realWorkspace.toLowerCase():realWorkspace;
   const directory=path.join(workspace,'connections');fs.mkdirSync(directory,{mode:0o700});
   let requests=0;
   const server=http.createServer((req,res)=>{requests++;assert.equal(req.headers.authorization,'Bearer shared-test');res.end(JSON.stringify({project_root:workspace,sessions:[]}));});
