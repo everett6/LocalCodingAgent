@@ -320,6 +320,33 @@ def _patched_files(patch: str) -> list[str]:
     return files
 
 
+def patch_targets(project_root: str, patch: str, working_dir: str | None = None) -> list[str]:
+    """Validate both sides of every unified header before GNU patch sees them."""
+    if not isinstance(patch, str) or not patch or len(patch.encode()) > 2_000_000:
+        raise ValueError("Provide a bounded unified diff")
+    workspace = Workspace(project_root)
+    cwd = workspace.resolve(working_dir or ".")
+    targets = []
+    for line in patch.splitlines():
+        if not line.startswith(("--- ", "+++ ")):
+            continue
+        header = line[4:].split("\t", 1)[0].strip()
+        if header == "/dev/null":
+            continue
+        # Quoted/ambiguous filenames and context diffs are deliberately unsupported.
+        parts = header.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1] or header.startswith(("/", '"')) or ".." in Path(parts[1]).parts:
+            raise ValueError("Patch headers must use unquoted a/path and b/path filenames")
+        relative = workspace.relative_path(cwd / parts[1])
+        if Path(relative).parts[0] in {".git", ".local-coder"}:
+            raise ValueError("Patches cannot modify private engine or Git state")
+        if relative not in targets:
+            targets.append(relative)
+    if not targets:
+        raise ValueError("No valid unified diff file headers found")
+    return targets
+
+
 class ApplyPatchTool(Tool):
     name = ToolName.APPLY_PATCH
     description = "Apply a unified diff patch."
@@ -350,8 +377,9 @@ class ApplyPatchTool(Tool):
                     )
 
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
+            patch_targets(self.project_root, patch, working_dir)
             proc = await asyncio.create_subprocess_exec(
-                "patch", "-p1",
+                "patch", "--batch", "--forward", "--no-backup-if-mismatch", "--reject-file=-", "-p1",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=cwd
             )

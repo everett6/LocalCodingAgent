@@ -1,6 +1,8 @@
 """Base tool system with registry and permissions."""
 from __future__ import annotations
 import abc
+import asyncio
+import contextvars
 import time
 from typing import Any
 
@@ -42,9 +44,11 @@ class ToolRegistry:
     WRITE_SCOPES: dict[AgentRole, str] = {
         AgentRole.EXPLOIT_VALIDATOR: "tests/security_poc",
     }
+    leaf_tool_names = {"read_file", "list_files", "search_files", "grep", "code_search", "task_memory", "skill_library"}
     
     def __init__(self):
         self._tools: dict[ToolName, Tool] = {}
+        self.task_context = contextvars.ContextVar("local_coder_tool_task", default=None)
         self._permissions: dict[AgentRole, set[ToolName]] = {
             # Default permissions
             AgentRole.EXPLORER: {
@@ -193,6 +197,87 @@ class ToolRegistry:
                 if hasattr(tool, "default_timeout"):
                     tool.default_timeout = settings.command_timeout
 
+    async def evaluate_revision(self, revision):
+        """Measure local contract checks; never trust model-reported test success."""
+        started = time.monotonic()
+        kind, payload = revision["kind"], revision["payload"]
+        if kind == "tool":
+            result = await self.sandbox.run(payload["source"], {"probe": True}, timeout=5, name=payload["name"])
+            return {"success": result["success"] and bool(result.get("output", "").strip()),
+                    "measurements": {"duration_ms": result["duration_ms"], "exit_code": abs(result["exit_code"]), "output_bytes": len(result.get("output", "").encode())}}
+        from local_coder.models.profiles import validate_overlay, resolve_profile
+        checks = 0
+        if kind == "loop_plan":
+            validate_overlay(payload)
+            profile = resolve_profile(type("Config", (), {"model_id": "test", "profile": "generic"})(), AgentRole.CODER, payload)
+            schemas = self.get_schemas_for_role(AgentRole.CODER)
+            original = {s["function"]["name"] for s in schemas}
+            if not {s["function"]["name"] for s in profile.apply_tools(schemas)}.issubset(original):
+                return {"success": False, "measurements": {"checks": 1}}
+            checks = 2
+        else:
+            text = payload["text"]
+            if len(text) > 6000:
+                return {"success": False, "measurements": {"characters": len(text), "checks": 1}}
+            checks = 1
+        return {"success": True, "measurements": {"checks": checks, "duration_ms": int((time.monotonic()-started)*1000)}}
+
+    async def close(self):
+        for name in ("language_service", "mcp"):
+            service = getattr(self, name, None)
+            if service is not None:
+                await service.close()
+
+    def _write_targets(self, name, arguments):
+        if name in FILE_WRITING_TOOLS:
+            return [arguments.get(FILE_WRITING_TOOLS[name])]
+        if name == ToolName.APPLY_PATCH:
+            from local_coder.tools.filesystem import patch_targets
+            return patch_targets(self.project_root, arguments.get("patch", ""), arguments.get("working_dir"))
+        return []
+
+    def _leaf_scope(self, name, arguments):
+        current = self.task_context.get() or {}
+        if not current.get("depth"):
+            return
+        if name.value not in self.leaf_tool_names:
+            raise ValueError("Leaf tasks have only scoped read and task-memory capabilities")
+        if name == ToolName.MEMORY_TASK_STATE:
+            if arguments.get("task_id") != current.get("task_id"):
+                raise ValueError("Leaf memory must belong to the current task")
+            return
+        if name == ToolName.SKILL_LIBRARY:
+            return
+        workspace = Workspace(self.project_root)
+        roots = [workspace.resolve(path) for path in current.get("files", [])] or [workspace.root]
+        target = workspace.resolve(arguments.get("path") or ".")
+        if not any(target == root or target.is_relative_to(root) for root in roots):
+            raise ValueError("Tool path exceeds the leaf task's inherited scope; supply an in-scope path")
+
+    async def _language_before_edit(self, paths):
+        """Expose current symbols to the model before allowing an unread edit."""
+        if not getattr(self, "auto_language_context", False) or (self.task_context.get() or {}).get("depth"):
+            return ""
+        import hashlib
+        current = self.task_context.get() or {}
+        cache = getattr(self, "_language_reads", None)
+        if cache is None:
+            cache = self._language_reads = set()
+        context = []
+        for path in paths:
+            target = Workspace(self.project_root).resolve(path)
+            if not target.is_file() or target.stat().st_size > self.language_service.max_file_bytes:
+                continue
+            identity = (current.get("task_id"), str(target), hashlib.sha256(target.read_bytes()).hexdigest())
+            if identity in cache:
+                continue
+            result = await self.language_service.context(str(target), char_budget=1800)
+            cache.add(identity)
+            if len(cache) > 1000:
+                cache.intersection_update({identity})
+            context.append(result["text"])
+        return "\n".join(context)[:6000]
+
     async def execute_tool(
         self, role: AgentRole, tool_name: str, arguments: dict[str, Any]
     ) -> ToolResult:
@@ -232,9 +317,49 @@ class ToolRegistry:
             )
 
         try:
-            if name_enum == ToolName.RECOVER_CONTEXT:
+            self._leaf_scope(name_enum, arguments)
+            if name_enum in {ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE} and not getattr(self, "memory_enabled", True):
+                raise ValueError("Project context memory is disabled in harness settings")
+            if name_enum == ToolName.MEMORY_TASK_STATE and role == AgentRole.RED_TEAM:
+                current = self.task_context.get() or {}
+                if not current.get("task_id") or arguments.get("task_id") != current["task_id"]:
+                    raise ValueError("Red team task memory is confined to the current engagement task")
+            snapshot = None
+            targets = self._write_targets(name_enum, arguments)
+            root = getattr(self, "project_root", None)
+            if root:
+                for target in targets:
+                    if not isinstance(target, str):
+                        raise ValueError("File mutation requires an explicit workspace path")
+                    path = Workspace(root).resolve(target).relative_to(Workspace(root).root)
+                    if path.parts and path.parts[0] in {".git", ".local-coder"}:
+                        raise ValueError("Private engine state must be changed through its dedicated tools")
+            if targets:
+                language = await self._language_before_edit(targets)
+                if language:
+                    return ToolResult(success=False, output="Review the current language context before retrying the edit (no files changed):\n" + language)
+            if targets and getattr(self, "pre_edit_snapshots", False):
+                snapshot = await asyncio.to_thread(self.snapshots.capture, targets)
+            if name_enum in {ToolName.RECOVER_CONTEXT, ToolName.DELEGATE_TASK, ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL}:
                 arguments = {**arguments, "_caller_role": role}
+            if name_enum == ToolName.DELEGATE_TASK:
+                current = self.task_context.get() or {}
+                arguments = {**arguments, "_delegation_depth": current.get("depth", 0)}
             result = await tool.execute(**arguments)
+            if result.success and name_enum == ToolName.READ_FILE:
+                language = await self._language_before_edit([arguments["path"]])
+                if language:
+                    result.output += "\n\nLanguage context (untrusted evidence):\n" + language
+            if snapshot:
+                await asyncio.to_thread(self.snapshots.complete, snapshot["id"])
+                result.data["snapshot_id"] = snapshot["id"]
+            memory = getattr(self, "context_memory", None)
+            if memory and getattr(self, "memory_enabled", True) and name_enum not in {ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE}:
+                current = self.task_context.get() or {}
+                kind = "finding" if name_enum == ToolName.RECORD_FINDING and result.success else "tool" if result.success else "failure"
+                source = arguments.get("path") if name_enum in {ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.LANGUAGE_CONTEXT} else None
+                await asyncio.to_thread(memory.ingest, kind, result.output[:16000], source_path=source,
+                                        task_id=current.get("task_id"), metadata={"tool": tool_name, "success": result.success})
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)
             return result

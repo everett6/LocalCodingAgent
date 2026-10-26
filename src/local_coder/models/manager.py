@@ -14,8 +14,10 @@ from local_coder.models.router import fallback_chain, resolve_model_name
 class ModelManager:
     """Manages model instances, queues, and resources."""
     
-    def __init__(self, config: ProjectConfig):
+    def __init__(self, config: ProjectConfig, quota_guard=None):
         self.config = config
+        self.budget = None
+        self.quota_guard = quota_guard
         self._models: Dict[str, LocalModel] = {}
         self._lock = asyncio.Lock()
         # Reachability of models that have fallbacks, probed once per manager.
@@ -30,7 +32,11 @@ class ModelManager:
         async with self._lock:
             for name, model_config in self.config.models.items():
                 if name not in self._models:
-                    self._models[name] = self._create_backend(model_config)
+                    model = self._create_backend(model_config)
+                    if self.budget is not None or self.quota_guard is not None:
+                        from local_coder.core.budgets import BudgetedModel
+                        model = BudgetedModel(model, self.budget, quota_guard=self.quota_guard)
+                    self._models[name] = model
 
     def _create_backend(self, config: ModelConfig) -> LocalModel:
         """Factory for creating backend instances."""
@@ -39,10 +45,10 @@ class ModelManager:
         if config.backend == ModelBackend.OLLAMA:
             return OllamaBackend(config)
         elif config.backend == ModelBackend.OPENAI_COMPAT:
-            return OpenAICompatibleBackend(config)
+            return OpenAICompatibleBackend(config, quota_guard=self.quota_guard)
         elif config.backend == ModelBackend.LLAMACPP:
             # llama.cpp server uses an OpenAI-compatible API natively
-            return OpenAICompatibleBackend(config)
+            return OpenAICompatibleBackend(config, quota_guard=self.quota_guard)
         else:
             raise ValueError(f"Unsupported backend type: {config.backend}")
 
@@ -128,3 +134,6 @@ class ModelManager:
                 if hasattr(model, "close"):
                     await model.close()
             self._models.clear()
+        callback = getattr(self, "on_close", None)
+        if callback is not None:
+            await callback()

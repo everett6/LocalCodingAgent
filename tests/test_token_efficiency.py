@@ -1,6 +1,7 @@
 """Tests for context budgeting: tool-output truncation, pruning, summarization."""
 import asyncio
 import json
+import pytest
 from types import SimpleNamespace
 
 from local_coder.agents.base import BaseAgent
@@ -325,8 +326,10 @@ def test_spill_is_gitignored_and_never_follows_symlinks(tmp_path):
     other = tmp_path / "other"
     other.mkdir()
     (other / ".local-coder").symlink_to(outside)
-    agent2 = LoopAgent(ScriptedModel([]), create_tool_registry(str(other)), max_tool_output_chars=1000)
-    agent2._fit_tool_output(call("x", "run_tests"), big)
+    # Persistent context now opens during registry initialization, so refuse
+    # the untrusted state tree before any agent or spill can start.
+    with pytest.raises(ValueError, match="symlink"):
+        create_tool_registry(str(other))
     assert list(outside.iterdir()) == []
 
 

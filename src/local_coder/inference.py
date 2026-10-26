@@ -583,10 +583,17 @@ class EmbeddedInferenceManager:
                         self._installation.update(state="downloading", asset=asset["name"],
                                                   total_bytes=asset["size"])
                     count = 0
-                    with client.stream("GET", asset["browser_download_url"]) as download:
+                    # The release digest covers the exact archive bytes. Some CDNs
+                    # label those bytes Content-Encoding: gzip/deflate; iter_bytes
+                    # would decode them again and can raise zlib's "incorrect
+                    # header check" before archive verification. Request identity
+                    # and preserve the wire bytes; the official digest still gates
+                    # extraction and executable probing.
+                    with client.stream("GET", asset["browser_download_url"], headers={"Accept-Encoding": "identity"}) as download:
                         download.raise_for_status()
                         with archive.open("wb") as output:
-                            for chunk in download.iter_bytes(1048576):
+                            chunks = ([download.content] if download.is_stream_consumed else download.iter_raw(1048576))
+                            for chunk in chunks:
                                 if self._cancel.is_set():
                                     raise RuntimeError("Runtime installation cancelled.")
                                 count += len(chunk)

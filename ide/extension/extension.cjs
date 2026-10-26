@@ -4,8 +4,10 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {EngineConnection,validateJob,validateProvider}=require('./engine.cjs');
+const {registerHarnessViews}=require('./harness-views.cjs');
 let active;
 const presets=[
+  {label:'OpenRouter · full model catalog',backend:'openai_compatible',model_id:'',base_url:'https://openrouter.ai/api/v1',profile:'generic',api_key_env:'OPENROUTER_API_KEY',max_tokens:4096,catalog:true},
   {label:'DeepSeek V4.1 Flash · OpenRouter',backend:'openai_compatible',model_id:'deepseek/deepseek-v4.1-flash-1017',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_deepseek',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
   {label:'GLM 5.3 · OpenRouter',backend:'openai_compatible',model_id:'z-ai/glm-5.3',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_glm',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
   {label:'Kimi K3.1 Pro · OpenRouter',backend:'openai_compatible',model_id:'moonshotai/kimi-k3.1-pro',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_kimi',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
@@ -68,6 +70,7 @@ function activate(context){
     })().catch(async error=>{services.delete(folder.uri.fsPath);await engine.stop();throw error;});
     return entry.ready;
   }
+  registerHarnessViews(vscode,context,async()=>{const folder=await chooseFolder();return folder?service(folder):undefined;});
   const tree={onDidChangeTreeData:changed.event,getTreeItem:item=>item,getChildren:async item=>{
     if(!item)return (vscode.workspace.workspaceFolders||[]).filter(folder=>folder.uri.scheme==='file').map(folder=>{
       const node=new vscode.TreeItem(folder.name,vscode.TreeItemCollapsibleState.Expanded);node.folder=folder;node.contextValue='localCoder.workspace';
@@ -148,14 +151,34 @@ function activate(context){
   }
   async function configureProvider(givenFolder){
     const folder=givenFolder||await chooseFolder();if(!folder)return;
-    const preset=await vscode.window.showQuickPick(presets,{placeHolder:'Choose your provider (model access and billing are supplied by your account)'});if(!preset)return;
-    const model_id=await vscode.window.showInputBox({title:'Provider model ID',value:preset.model_id,prompt:'Exact model ID enabled on your account'});if(model_id===undefined)return;
-    const base_url=await vscode.window.showInputBox({title:'Provider endpoint',value:preset.base_url,prompt:'HTTPS endpoint, or HTTP on localhost for a local model'});if(base_url===undefined)return;
+    let preset=await vscode.window.showQuickPick(presets,{placeHolder:'Choose your provider (model access and billing are supplied by your account)'});if(!preset)return;
+    let catalogModel;
+    if(preset.catalog){
+      const entry=await service(folder);
+      let models=[];
+      try{
+        const catalog=await entry.engine.request('/providers/models?source=openrouter');
+        models=Array.isArray(catalog.models)?catalog.models.filter(item=>typeof item.id==='string'&&item.id.length>0&&item.id.length<=200&&!/[\x00-\x1f]/.test(item.id)):[];
+      }catch{vscode.window.showInformationMessage('The model catalog is unavailable. You can enter an exact model ID manually.');}
+      if(models.length){
+        const chosen=await vscode.window.showQuickPick([{label:'Enter a model ID manually',manual:true},...models.map(model=>({label:typeof model.name==='string'?model.name.slice(0,200):model.id,description:model.id,detail:[Number.isInteger(model.context_length)?`${model.context_length.toLocaleString()} context tokens`:null,Number.isInteger(model.max_output_tokens)?`${model.max_output_tokens.toLocaleString()} output tokens`:null,model.is_free?'Free model':null].filter(Boolean).join(' · '),model}))],{title:'OpenRouter models',placeHolder:'Search the full catalog by model name or ID',matchOnDescription:true,matchOnDetail:true});
+        if(!chosen)return;
+        catalogModel=chosen.model;
+        if(catalogModel){
+          const validProfiles=['generic','glm53','qwen38','openrouter_deepseek','openrouter_glm','openrouter_kimi'];
+          preset={...preset,model_id:catalogModel.id,profile:validProfiles.includes(catalogModel.profile)?catalogModel.profile:'generic',...(Number.isInteger(catalogModel.context_length)&&catalogModel.context_length>=1024?{context_length:Math.min(catalogModel.context_length,2000000)}:{})};
+        }
+      }
+    }
+    const model_id=catalogModel?preset.model_id:await vscode.window.showInputBox({title:'Provider model ID',value:preset.model_id,prompt:'Exact model ID enabled on your account'});if(model_id===undefined)return;
+    const base_url=catalogModel?preset.base_url:await vscode.window.showInputBox({title:'Provider endpoint',value:preset.base_url,prompt:'HTTPS endpoint, or HTTP on localhost for a local model'});if(base_url===undefined)return;
     const profiles=[{label:'Standard harness',value:'generic'},{label:'GLM 5.3 reasoning harness',value:'glm53'},{label:'Qwen 3.8 thinking and tools harness',value:'qwen38'},{label:'OpenRouter DeepSeek harness',value:'openrouter_deepseek'},{label:'OpenRouter GLM harness',value:'openrouter_glm'},{label:'OpenRouter Kimi harness',value:'openrouter_kimi'}];
     profiles.sort((a,b)=>Number(b.value===preset.profile)-Number(a.value===preset.profile));
-    const profile=await vscode.window.showQuickPick(profiles,{placeHolder:'Choose the model harness',ignoreFocusOut:true});if(!profile)return;
+    const profile=catalogModel?profiles.find(item=>item.value===preset.profile):await vscode.window.showQuickPick(profiles,{placeHolder:'Choose the model harness',ignoreFocusOut:true});if(!profile)return;
     const budget=await vscode.window.showInputBox({title:'Maximum output tokens',value:String(preset.max_tokens),validateInput:value=>Number.isInteger(Number(value))&&Number(value)>=128&&Number(value)<=32768?undefined:'Enter an integer from 128 to 32768'});if(budget===undefined)return;
-    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget),...(preset.context_length?{context_length:preset.context_length}:{})});
+    const metadata={auto_context:true,...(catalogModel?{context_source:'openrouter'}:{})};
+    for(const key of ['input_cost_per_million','output_cost_per_million','request_cost_usd'])if(catalogModel&&typeof catalogModel[key]==='number'&&Number.isFinite(catalogModel[key])&&catalogModel[key]>=0)metadata[key]=catalogModel[key];
+    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget),...(preset.context_length?{context_length:preset.context_length}:{}),...metadata});
     const api_key_env=await vscode.window.showInputBox({title:'Optional API key environment variable',prompt:'Leave blank to use a saved or pasted key; the engine process must inherit this variable',value:preset.api_key_env||''});if(api_key_env===undefined)return;
     if(api_key_env&&!/^[A-Za-z_][A-Za-z0-9_]*$/.test(api_key_env))throw new Error('Enter a valid environment variable name');
     if(api_key_env)provider.api_key_env=api_key_env;

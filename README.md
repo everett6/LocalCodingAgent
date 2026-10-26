@@ -679,3 +679,51 @@ local models make far more often than frontier ones.
 
 Each can be turned off per agent class with `parse_text_tool_calls`,
 `require_read_before_overwrite`, and `check_syntax_after_edits`.
+
+## Context memory and evolving harness
+
+The desktop sidebar now includes **Project memory**, **Harness controls**, and
+**Connections & skills**. Context is retrieved within a fixed budget before each
+agent step; file snapshots, shared model-call/token/cost caps, declarative model
+profiles and bounded leaf delegation keep long tasks reviewable. The IDE adds
+**Local Coder: Language Context**, **Compare Agent Snapshot**, and **Inspect Project Memory** commands.
+
+See [context memory](docs/context-memory.md), [adaptive scaffolding](docs/adaptive-harness.md),
+[language context](docs/language-context.md), [MCP and skills](docs/mcp-and-skills.md),
+and [local security generation](docs/exploit-generation.md) for interfaces and limits.
+GitHub MCP is an explicit connection using your chosen environment variable; it
+starts disabled. The built-in vector backend uses local lexical hashes, with no
+model download or claim of neural semantic search.
+
+## Automatic model and review setup
+
+Model settings browse the complete live OpenRouter catalog, including exact
+`:free` variants, context windows, output limits, prices and tool support. Named
+connection profiles store configuration and environment-variable references,
+never API key values. The native IDE also has an OpenRouter catalog picker.
+Automatic context allocation adapts to the operating mode and stays within
+the detected model window and the task's request budget. Its displayed prompt
+allowance is a conservative UTF-8/JSON bound, not an exact tokenizer count.
+
+OpenRouter's daily free allowance counts **requests**, not tokens. When reported
+capacity is exhausted, the job pauses at a recoverable checkpoint; it never
+switches to paid inference automatically. Choose an on-device model, wait for a
+confirmed reset, or explicitly select a paid model and positive spending limit
+before resuming. Unknown account limits remain unknown. See the
+[official rate-limit contract](https://openrouter.ai/docs/api_reference/limits).
+
+The On-device tab automatically discovers local GGUF files and compatible
+runtime executable headers. Search results distinguish model tensors from
+vocabulary fixtures and candidates from runtimes that have actually started.
+Selecting a path does not execute it or download model weights. The protected,
+path-only location manifest is `~/.config/local-coder/locations.env` on Linux;
+the UI shows the platform-specific path. It is parsed as data, never sourced
+as shell commands. Owner-only permissions protect preferences; they do not
+make files immutable against the owning operating-system account.
+
+Red Team's **Review this project** action prepares a local source-only
+engagement automatically. Private preferences live in
+`.local-coder/redteam.defaults.env`; hostnames receive an HTTPS scheme (HTTP
+for loopback). Optional HTTP scope still requires an explicitly created,
+authorized engagement. Saving setup or browsing model metadata sends no
+requests to engagement targets.

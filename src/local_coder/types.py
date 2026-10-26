@@ -102,6 +102,18 @@ class ToolName(str, enum.Enum):
     RECOVER_CONTEXT = "recover_context"
     SECURITY_SCAN = "security_scan"
     RECORD_FINDING = "record_finding"
+    GENERATE_EXPLOIT = "generate_exploit"
+    PRIVILEGE_ANALYSIS = "analyze_privilege_escalation"
+    FUZZ_INPUTS = "generate_fuzz_cases"
+    MEMORY_SEARCH = "memory_search"
+    MEMORY_WRITE = "memory_write"
+    MEMORY_TASK_STATE = "task_memory"
+    LANGUAGE_CONTEXT = "language_context"
+    HARNESS_EVOLVE = "harness_evolve"
+    DELEGATE_TASK = "delegate_task"
+    GENERATED_TOOL = "generated_tool"
+    MCP_CALL = "mcp_call"
+    SKILL_LIBRARY = "skill_library"
 
 
 # === Messages ===
@@ -159,9 +171,14 @@ class ModelConfig(BaseModel):
     model_id: str  # The model identifier for the backend (e.g., 'qwen2.5-coder:7b')
     base_url: str = "http://localhost:11434"  # Default Ollama URL
     context_length: int = 8192
+    auto_context: bool = True
+    context_source: str = Field(default="configured", max_length=100)
     temperature: float = 0.2
     strategy_attempt_limit: int = Field(default=3, ge=1, le=10)
     max_tokens: int = 4096
+    input_cost_per_million: float | None = Field(default=None, ge=0)
+    output_cost_per_million: float | None = Field(default=None, ge=0)
+    request_cost_usd: float | None = Field(default=0, ge=0)
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
@@ -390,8 +407,25 @@ class ToolSettings(BaseModel):
     roles: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class HarnessSettings(BaseModel):
+    """Bounded runtime controls; model profiles cannot disable these gates."""
+    memory_enabled: bool = True
+    memory_context_chars: int = Field(default=3000, ge=0, le=12000)
+    language_context_enabled: bool = True
+    pre_edit_snapshots: bool = True
+    max_requests: int = Field(default=200, ge=1, le=10000)
+    max_tokens: int = Field(default=1000000, ge=1024, le=100000000)
+    max_request_tokens: int = Field(default=131072, ge=1024, le=2000000)
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_subagents: int = Field(default=3, ge=0, le=3)
+    profile_overrides: dict[str, Any] = Field(default_factory=dict)
+    sandbox_backend: Literal["auto", "bubblewrap", "docker"] = "auto"
+    sandbox_image: str = "python:3.12-slim"
+
+
 class ProjectConfig(BaseModel):
     """Top-level project configuration."""
+    harness: HarnessSettings = Field(default_factory=HarnessSettings)
     models: dict[str, ModelConfig] = Field(default_factory=dict)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
     permissions: list[AgentPermissions] = Field(default_factory=list)
