@@ -124,3 +124,12 @@ model tool can answer an approval. Expiry, cancellation and oversized unreviewab
 requests deny by default. Tiers 1–3 need confirmation for local PoC generation;
 tiers 4–5 permit that bounded generation automatically. MCP mutations retain their
 own explicit human-approval requirement across tiers.
+
+Paired improvement cycles snapshot candidate controls and evaluator results so
+mutable inputs cannot change the baseline during a run. An ordinary evaluator
+failure records the candidate error and continues to the next bounded candidate;
+cancellation stops the cycle. Comparisons require the same measurement keys and
+case count, nondecreasing passes, and nonincreasing tokens and model calls, with
+at least one improvement. Additional numeric observations must remain unchanged
+because they have no declared optimization direction. A failed baseline stops
+evaluation, and successful candidates still require separate activation.

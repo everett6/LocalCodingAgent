@@ -14,6 +14,15 @@ to agents as context; matching arbitrary prose criteria to test coverage still
 requires review. Three or more unsuccessful attempts flag a stalled plan in the
 briefing. This is a progress heuristic, not an autonomous scheduling service.
 
+The agent captures a fingerprint after each test invocation and saves it in its
+checkpoint. Completion requires all recorded checks to refer to the same current
+revision. Edits after a check require verification again; older checkpoints
+without these fingerprints also require fresh checks. Starting another attempt
+clears the goal's previous evidence. An unmet completion gate retains the result
+as **verifying** with a blocker instead of losing the agent's response. Fingerprints
+are sequential filesystem snapshots; concurrent external writes can still race
+their capture.
+
 The `/goals` API supports creation and listing, including dependencies on existing
 goals. `/goals/update` records status, next action, blocker or decision changes.
 It cannot accept forged verification evidence. State changes and events commit

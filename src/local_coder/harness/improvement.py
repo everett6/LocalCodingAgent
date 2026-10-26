@@ -15,7 +15,7 @@ def measurements(result):
     values = result.get("measurements")
     if not isinstance(values, dict) or not {"cases", "passed", "total_tokens", "model_calls"}.issubset(values):
         raise ValueError("Benchmark requires cases, passed, total_tokens and model_calls")
-    if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values.values()):
+    if any(not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v) or v < 0 for k, v in values.items()):
         raise ValueError("Measurements must be finite and nonnegative")
     if type(values["cases"]) is not int or type(values["passed"]) is not int or not 0 <= values["passed"] <= values["cases"] or not values["cases"]:
         raise ValueError("Benchmark must execute a positive number of cases")
@@ -35,11 +35,12 @@ async def improvement_cycle(store, candidates, evaluator, *, timeout_seconds=30)
         raise ValueError("An improvement cycle accepts one to three candidates")
     if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 60:
         raise ValueError("Benchmark timeout must be between 1 and 60 seconds")
+    candidates = copy.deepcopy(candidates)
     for candidate in candidates:
         validate_overlay(candidate)
         if "instructions" in candidate:
             raise ValueError("Automatic cycles accept declarative controls only")
-    baseline = store.active_overlay()
+    baseline = copy.deepcopy(store.active_overlay())
 
     async def evaluate(overlay):
         async def run():
@@ -48,7 +49,8 @@ async def improvement_cycle(store, candidates, evaluator, *, timeout_seconds=30)
                 raise ValueError("Evaluator must be asynchronous and cancellable")
             result = await result
             measurements(result)
-            return result
+            # Evaluators may reuse their result dictionary between calls.
+            return copy.deepcopy(result)
         return await asyncio.wait_for(run(), timeout=timeout_seconds)
 
     initial = await evaluate(baseline)
@@ -64,17 +66,21 @@ async def improvement_cycle(store, candidates, evaluator, *, timeout_seconds=30)
         async def paired(_revision):
             measured = await evaluate(overlay)
             values = measurements(measured)
-            comparable = values["cases"] == base["cases"]
+            comparable = values["cases"] == base["cases"] and values.keys() == base.keys()
             quality = values["passed"] >= base["passed"]
             efficiency = all(values[k] <= base[k] for k in ("total_tokens", "model_calls"))
+            # Additional observations have no implicit optimization direction.
+            # Keep them fixed so an efficiency win cannot conceal a safety loss.
+            stable = all(values.get(k) == base[k] for k in base
+                         if k not in {"cases", "passed", "total_tokens", "model_calls"})
             improved = (values["passed"] > base["passed"] or
                         any(values[k] < base[k] for k in ("total_tokens", "model_calls")))
-            return {"success": measured["success"] and comparable and quality and efficiency and improved,
+            return {"success": measured["success"] and comparable and quality and efficiency and stable and improved,
                     "measurements": values}
 
         try:
             result = await store.validate(revision["revision_id"], paired)
-        except (ValueError, TimeoutError) as exc:
+        except Exception as exc:
             store.record_outcome(revision["revision_id"], {"evaluation_error": str(exc)})
             result = {"revision_id": revision["revision_id"], "state": "candidate", "error": str(exc)}
         results.append(result)

@@ -102,6 +102,7 @@ class BaseAgent:
         self._tests_run: list[str] = []
         self._tests_passed = True
         self._test_outcomes = {}
+        self._test_revisions: dict[str, str | None] = {}
         self.state: AgentState | None = None
         self.context_window_chars = context_window_chars
         self.compact_context_chars = compact_context_chars
@@ -159,6 +160,7 @@ class BaseAgent:
         self._files_changed = set(run.files_changed)
         self._tests_run = [result.test_name for result in self.state.test_results]
         self._test_outcomes = {result.test_name: result.passed for result in self.state.test_results}
+        self._test_revisions = dict(run.notes.get("test_revisions", {}))
         self._tests_passed = all(self._test_outcomes.values())
         self.max_iterations = self.state.max_iterations
         self.max_tool_calls = self.state.max_tool_calls
@@ -235,6 +237,7 @@ class BaseAgent:
             return
         notes = {
             "boundary_complete": True,
+            "test_revisions": self._test_revisions,
             "strategy_attempts": self._strategy_attempts,
             "strategy_attempt_limit": self.strategy_attempt_limit,
             "progress_journal": self._progress_journal[-20:],
@@ -262,7 +265,9 @@ class BaseAgent:
     async def _finish_run(self, response: AgentResponse) -> None:
         ledger = getattr(self.tool_registry, "goal_ledger", None)
         if ledger is not None and ledger.get(response.task_id):
-            await asyncio.to_thread(ledger.finish, response)
+            revisions = {self._test_revisions.get(name) for name in self._tests_run}
+            revision = next(iter(revisions)) if len(revisions) == 1 else None
+            await asyncio.to_thread(ledger.finish, response, verification_revision=revision)
         memory = getattr(self.tool_registry, "context_memory", None)
         if memory is not None and getattr(self.tool_registry, "memory_enabled", True):
             await asyncio.to_thread(memory.ingest, "decision", response.summary[:20000], task_id=response.task_id,
@@ -389,6 +394,7 @@ class BaseAgent:
             self._tests_run = []
             self._tests_passed = True
             self._test_outcomes = {}
+            self._test_revisions = {}
             self._last_failing_call_signature = None
             self._repeated_failure_count = 0
             self._stagnation_warned = False
@@ -655,6 +661,11 @@ class BaseAgent:
                     test_name = tc.arguments.get("target") or tc.arguments.get("test_path") or "project tests"
                     self._tests_run.append(test_name)
                     self._test_outcomes[test_name] = result.success
+                    if ledger is not None:
+                        try:
+                            self._test_revisions[test_name] = await asyncio.to_thread(ledger.revision)
+                        except (ValueError, OSError):
+                            self._test_revisions[test_name] = None
                     self._tests_passed = all(self._test_outcomes.values())
                     if not result.success:
                         self.state.phase = AgentPhase.REFLECTING

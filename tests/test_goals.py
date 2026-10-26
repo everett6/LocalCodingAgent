@@ -66,3 +66,96 @@ def test_bug_models_reach_coordinator_and_survive_restart(tmp_path, monkeypatch)
     assert cfg.models[cfg.agentic.role_models['planner']].model_id=='glm-5.3'
     for role in ['explorer','bug_hunter','exploit_validator']:
         assert cfg.models[cfg.agentic.role_models[role]].model_id=='chosen-deepseek-id'
+
+
+def finished(identity, checks=None):
+    return SimpleNamespace(task_id=identity, status=TaskStatus.COMPLETED,
+                           tests_run=['pytest'] if checks is None else checks,
+                           tests_passed=True, summary='Verified')
+
+
+def test_rerun_clears_previous_evidence(tmp_path):
+    ledger = repo(tmp_path)
+    goal = ledger.create('Test again')
+    ledger.finish(finished(goal['id']))
+    ledger.update(goal['id'], {'status': 'running'})
+    assert ledger.get(goal['id'])['evidence'] is None
+    ledger.finish(finished(goal['id'], []))
+    assert ledger.get(goal['id'])['evidence'] is None
+    with pytest.raises(ValueError, match='Completion'):
+        ledger.update(goal['id'], {'status': 'completed'})
+
+
+def test_parent_refreshes_evidence_after_children_reverified(tmp_path, monkeypatch):
+    ledger = repo(tmp_path)
+    parent = ledger.create('Parent')
+    children = [ledger.create(str(i), parent['id']) for i in range(3)]
+    for child in children:
+        ledger.finish(finished(child['id']))
+    ledger.update(parent['id'], {'status': 'completed'})
+    (tmp_path / 'new.py').write_text('changed = True')
+    for child in children:
+        ledger.finish(finished(child['id']))
+    revision = ledger.revision
+    calls = []
+    def counted():
+        calls.append(True)
+        return revision()
+    monkeypatch.setattr(ledger, 'revision', counted)
+    ledger.update(parent['id'], {'status': 'completed'})
+    assert len(calls) == 1
+    assert not ledger.get(parent['id'])['evidence_stale']
+
+
+@pytest.mark.parametrize('error', [FileNotFoundError('git'), subprocess.TimeoutExpired('git', 5)])
+def test_revision_subprocess_failure_preserves_goal(tmp_path, monkeypatch, error):
+    ledger = repo(tmp_path)
+    goal = ledger.create('Verify')
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(subprocess, 'run', fail)
+    with pytest.raises(ValueError, match='fingerprint'):
+        ledger.revision()
+    ledger.finish(finished(goal['id']))
+    assert ledger.get(goal['id'])['status'] == 'verifying'
+    assert ledger.get(goal['id'])['evidence'] is None
+
+
+def test_finish_uses_revision_of_checks_and_retains_blocker(tmp_path):
+    ledger = repo(tmp_path)
+    goal = ledger.create('Verify')
+    revision = ledger.revision()
+    (tmp_path / 'changed.py').write_text('changed = True')
+    ledger.finish(finished(goal['id']), verification_revision=revision)
+    row = ledger.get(goal['id'])
+    assert row['status'] == 'verifying'
+    assert row['evidence_stale']
+    assert 'current workspace' in row['blocker']
+    ledger.finish(finished(goal['id']), verification_revision=None)
+    assert ledger.get(goal['id'])['evidence'] is None
+
+
+def test_finish_with_unfinished_children_keeps_verifying(tmp_path):
+    ledger = repo(tmp_path)
+    parent = ledger.create('Parent')
+    ledger.create('Child', parent['id'])
+    ledger.finish(finished(parent['id']))
+    row = ledger.get(parent['id'])
+    assert row['status'] == 'verifying'
+    assert 'child tasks' in row['blocker']
+
+
+def test_revision_file_read_failure_preserves_goal(tmp_path, monkeypatch):
+    from pathlib import Path
+    ledger = repo(tmp_path)
+    goal = ledger.create('Verify')
+    (tmp_path / 'source.py').write_text('changed = True')
+    original = Path.read_bytes
+    def fail_source(path):
+        if path.name == 'source.py':
+            raise PermissionError('unreadable')
+        return original(path)
+    monkeypatch.setattr(Path, 'read_bytes', fail_source)
+    ledger.finish(finished(goal['id']))
+    assert ledger.get(goal['id'])['status'] == 'verifying'
+    assert ledger.get(goal['id'])['evidence'] is None
