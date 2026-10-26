@@ -1,6 +1,7 @@
 """Real archive/HTTP transport regressions; no downloads or executable probes."""
 import hashlib
 import io
+import os
 from pathlib import Path
 import tarfile
 import zipfile
@@ -14,12 +15,13 @@ from local_coder.inference import EmbeddedInferenceManager
 def archive_bytes(kind):
     buffer = io.BytesIO()
     binary = b'\x7fELF' + bytes(100)
+    executable = 'bin/llama-server.exe' if os.name == 'nt' else 'bin/llama-server'
     if kind == 'zip':
         with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr('bin/llama-server', binary)
+            archive.writestr(executable, binary)
     else:
         with tarfile.open(fileobj=buffer, mode='w:gz') as archive:
-            item = tarfile.TarInfo('bin/llama-server')
+            item = tarfile.TarInfo(executable)
             item.size = len(binary)
             archive.addfile(item, io.BytesIO(binary))
     return buffer.getvalue()
