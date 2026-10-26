@@ -10,7 +10,8 @@ from local_coder.types import (
     AgentRole, AgentTask, AgentResponse, AgentState, AgentPhase, TaskStatus,
     Message, ToolResult, ModelResponse, AgentMetrics, AgentEvent, TestResult,
 )
-from local_coder.context.compression import compress_messages
+from local_coder.context.compression import compress_messages, message_size
+from local_coder.core.runtime import AgentRun
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class BaseAgent:
         self._files_changed: set[str] = set()
         self._tests_run: list[str] = []
         self._tests_passed = True
+        self._test_outcomes = {}
         self.state: AgentState | None = None
         self.context_window_chars = context_window_chars
         self.compact_context_chars = compact_context_chars
@@ -64,6 +66,9 @@ class BaseAgent:
         self._repeated_failure_count: int = 0
         self._stagnation_warned: bool = False
         self.drafter = drafter
+        # Registries without a runtime remain usable by embedders and unit tests.
+        self.runtime = getattr(tool_registry, "runtime", None)
+        self._run: AgentRun | None = None
 
     async def execute(self, task: AgentTask) -> AgentResponse:
         """Execute a task through the tool-calling loop, optionally primed
@@ -72,11 +77,76 @@ class BaseAgent:
         if self.drafter is not None and task.files:
             draft_prediction = await self._maybe_draft(task)
 
-        response = await self._execute_loop(task, draft_prediction)
+        try:
+            response = await self._execute_loop(task, draft_prediction)
+            if draft_prediction is not None:
+                self._settle_draft(draft_prediction, response)
+            await self._finish_run(response)
+            return response
+        except BaseException:
+            await self._release_interrupted_run()
+            raise
 
-        if draft_prediction is not None:
-            self._settle_draft(draft_prediction, response)
-        return response
+    async def resume(self, run: AgentRun) -> AgentResponse:
+        """Continue a recovered complete round without rerunning preparation/tools."""
+        if run.task.role != self.role:
+            raise ValueError("Checkpoint agent role does not match")
+        run.validate_resume()
+        await run.validate_pending_batch()
+        self._run = run
+        self.runtime = run._runtime
+        self.state = run.state
+        self._metrics = run.metrics.model_copy(deep=True)
+        self._files_changed = set(run.files_changed)
+        self._tests_run = [result.test_name for result in self.state.test_results]
+        self._test_outcomes = {result.test_name: result.passed for result in self.state.test_results}
+        self._tests_passed = all(self._test_outcomes.values())
+        self.max_iterations = self.state.max_iterations
+        self.max_tool_calls = self.state.max_tool_calls
+        self.max_test_runs = self.state.max_test_runs
+        self.context_window_chars = run.notes.get("context_window_chars", self.context_window_chars)
+        self.compact_context_chars = run.notes.get("compact_context_chars", self.compact_context_chars)
+        self._last_failing_call_signature = run.notes.get("last_failing_call_signature")
+        self._repeated_failure_count = run.notes.get("repeated_failure_count", 0)
+        self._stagnation_warned = run.notes.get("stagnation_warned", False)
+        try:
+            response = await self._execute_loop(run.task, None, resumed=True)
+            await self._finish_run(response)
+            return response
+        except BaseException:
+            await self._release_interrupted_run()
+            raise
+
+    async def _release_interrupted_run(self) -> None:
+        if self._run is not None:
+            await self.runtime.release_run(self._run.run_id)
+            self._run = None
+
+    async def _checkpoint_boundary(self) -> None:
+        if self._run is None:
+            return
+        notes = {
+            "boundary_complete": True,
+            "context_window_chars": self.context_window_chars,
+            "compact_context_chars": self.compact_context_chars,
+            "last_failing_call_signature": self._last_failing_call_signature,
+            "repeated_failure_count": self._repeated_failure_count,
+            "stagnation_warned": self._stagnation_warned,
+        }
+        permissions = getattr(self.tool_registry, "_permissions", {}).get(self.role)
+        if permissions is not None:
+            notes["allowed_tools"] = sorted(name.value for name in permissions)
+        path = await self._run.checkpoint_boundary(self.state, self._metrics, notes)
+        self._emit_event("checkpoint_saved", "Saved complete agent round", task_id=self.state.task_id,
+                         data={"path": path})
+
+    async def _finish_run(self, response: AgentResponse) -> None:
+        self.state.phase = AgentPhase.DONE if response.status == TaskStatus.COMPLETED else AgentPhase.FAILED
+        self.state.finished_at = datetime.now()
+        if self._run is not None:
+            await self.runtime.end_run(self._run.run_id, self.state,
+                                       success=response.status == TaskStatus.COMPLETED, result=response)
+            self._run = None
 
     async def _maybe_draft(self, task: AgentTask):
         """Best-effort speculative draft of the first listed file's edit,
@@ -104,9 +174,9 @@ class BaseAgent:
         else:
             self.drafter.reject_prediction(draft_prediction.prediction_id)
 
-    async def _execute_loop(self, task: AgentTask, draft_prediction) -> AgentResponse:
+    async def _execute_loop(self, task: AgentTask, draft_prediction, resumed=False) -> AgentResponse:
         # Build initial messages
-        messages = self._build_messages(task)
+        messages = list(self.state.messages) if resumed else self._build_messages(task)
         if draft_prediction is not None:
             messages.append(Message(
                 role="system",
@@ -117,28 +187,43 @@ class BaseAgent:
                     f"on it, don't apply it blindly:\n{draft_prediction.content}"
                 ),
             ))
-        self._files_changed.clear()
-        self._metrics = AgentMetrics()
-        self._tests_run = []
-        self._tests_passed = True
-        self._last_failing_call_signature = None
-        self._repeated_failure_count = 0
-        self._stagnation_warned = False
-        self.state = AgentState(
-            task_id=task.task_id,
-            objective=task.objective,
-            max_iterations=self.max_iterations,
-            max_tool_calls=self.max_tool_calls,
-            max_test_runs=self.max_test_runs,
-            started_at=datetime.now(),
-        )
-        self.state.phase = AgentPhase.EXECUTING
-        self.state.messages = list(messages)
+        if not resumed:
+            self._files_changed.clear()
+            self._metrics = AgentMetrics()
+            self._tests_run = []
+            self._tests_passed = True
+            self._test_outcomes = {}
+            self._last_failing_call_signature = None
+            self._repeated_failure_count = 0
+            self._stagnation_warned = False
+            self._run = None
+            self.state = AgentState(
+                task_id=task.task_id,
+                objective=task.objective,
+                max_iterations=self.max_iterations,
+                max_tool_calls=self.max_tool_calls,
+                max_test_runs=self.max_test_runs,
+                started_at=datetime.now(),
+            )
+            self.state.phase = AgentPhase.EXECUTING
+            self.state.messages = list(messages)
+            if self.runtime is not None:
+                # Store the configured model key, so changed role routing cannot
+                # silently select another model on restart.
+                selector = getattr(self.runtime, "model_name_for", None)
+                if task.model_name is None and selector is not None:
+                    task = task.model_copy(update={"model_name": selector(self.model)})
+                self._run = await self.runtime.start_run(task, self.state)
+                await self._checkpoint_boundary()
         
-        for iteration in range(self.max_iterations):
-            if sum(len(message.content) for message in messages) > self.context_window_chars:
+        for iteration in range(self.state.iteration, self.max_iterations):
+            if sum(message_size(message) for message in messages) > self.context_window_chars:
                 messages = compress_messages(messages, self.compact_context_chars)
                 self.state.messages = list(messages)
+            if sum(message_size(message) for message in messages) > self.context_window_chars:
+                self.state.phase = AgentPhase.FAILED
+                return self._build_response(task, ModelResponse(content="Context budget exceeded. Narrow the investigation scope or increase the configured context limit."),
+                                            TaskStatus.FAILED, issues=["Context budget exceeded"])
             self.state.iteration = iteration + 1
             self._emit_event(
                 "iteration_started",
@@ -160,7 +245,7 @@ class BaseAgent:
                     # the same bad draw, capped so it doesn't get incoherent.
                     retry_temperature = min(base_temperature + 0.15 * attempt, 1.0)
                     response = await self.model.generate(
-                        messages,
+                        list(messages),
                         temperature=retry_temperature,
                         max_tokens=self.model.config.max_tokens if hasattr(self.model, "config") else 4096,
                         tools=self.tool_registry.get_schemas_for_role(self.role),
@@ -200,6 +285,13 @@ class BaseAgent:
             
             # If no tool calls, we're done
             if not response.tool_calls:
+                messages.append(Message(role="assistant", content=response.content,
+                                        reasoning_content=response.reasoning_content))
+                self.state.messages = list(messages)
+                if response.finish_reason in {"length", "max_tokens"}:
+                    self.state.phase = AgentPhase.FAILED
+                    return self._build_response(task, response, TaskStatus.FAILED,
+                                                issues=["Model output was truncated; increase the output budget"])
                 self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
                 self.state.finished_at = datetime.now()
                 return self._build_response(
@@ -209,37 +301,31 @@ class BaseAgent:
                     issues=[] if self._tests_passed else ["Verification tests failed"],
                 )
             
+            # Admit a complete batch before executing any of it. Otherwise a
+            # two-tool response could leave a half-executed, unresumable batch.
+            if self.state.tool_calls_used + len(response.tool_calls) > self.max_tool_calls:
+                self.state.errors.append("Exceeded maximum tool-call limit")
+                return self._build_response(task, ModelResponse(content="Tool-call limit reached."),
+                                            TaskStatus.FAILED, issues=["Exceeded maximum tool-call limit"])
+            requested_tests = sum(tc.name == "run_tests" for tc in response.tool_calls)
+            if self.state.test_runs + requested_tests > self.max_test_runs:
+                self.state.errors.append("Exceeded maximum test-run limit")
+                return self._build_response(task, ModelResponse(content="Test-run limit reached."),
+                                            TaskStatus.FAILED, issues=["Exceeded maximum test-run limit"])
             # Add assistant message with tool calls
             messages.append(Message(
                 role="assistant",
                 content=response.content,
                 tool_calls=response.tool_calls,
+                reasoning_content=response.reasoning_content,
             ))
             self.state.messages = list(messages)
             self.state.tool_calls.extend(response.tool_calls)
+            if self._run is not None:
+                await self._run.begin_tool_batch(response.tool_calls)
             
             # Execute tool calls
             for tc in response.tool_calls:
-                if self.state.tool_calls_used >= self.max_tool_calls:
-                    self.state.phase = AgentPhase.FAILED
-                    self.state.errors.append("Exceeded maximum tool-call limit")
-                    self.state.finished_at = datetime.now()
-                    return self._build_response(
-                        task,
-                        ModelResponse(content="Tool-call limit reached."),
-                        TaskStatus.FAILED,
-                        issues=["Exceeded maximum tool-call limit"],
-                    )
-                if tc.name == "run_tests" and self.state.test_runs >= self.max_test_runs:
-                    self.state.phase = AgentPhase.FAILED
-                    self.state.errors.append("Exceeded maximum test-run limit")
-                    self.state.finished_at = datetime.now()
-                    return self._build_response(
-                        task,
-                        ModelResponse(content="Test-run limit reached."),
-                        TaskStatus.FAILED,
-                        issues=["Exceeded maximum test-run limit"],
-                    )
                 self._emit_event(
                     "tool_call",
                     f"Calling {tc.name}({json.dumps(tc.arguments)[:100]})",
@@ -263,6 +349,7 @@ class BaseAgent:
                     path = tc.arguments.get("path")
                     if path:
                         self.state.files_read.add(path)
+                        self._metrics.files_read = len(self.state.files_read)
                 if result.files_changed:
                     self._metrics.files_written += len(result.files_changed)
                     self._files_changed.update(result.files_changed)
@@ -271,7 +358,8 @@ class BaseAgent:
                     self.state.phase = AgentPhase.VERIFYING
                     self.state.test_runs += 1
                     self._tests_run.append(tc.arguments.get("test_path") or "project tests")
-                    self._tests_passed = self._tests_passed and result.success
+                    self._test_outcomes[tc.arguments.get("test_path") or "project tests"] = result.success
+                    self._tests_passed = all(self._test_outcomes.values())
                     if not result.success:
                         self.state.phase = AgentPhase.REFLECTING
                     self.state.test_results.append(TestResult(
@@ -355,6 +443,8 @@ class BaseAgent:
                         f"Nudged the model after {self._repeated_failure_count} identical failing calls to {tc.name}",
                         task_id=task.task_id,
                     )
+            # Never save between tool results in the same assistant response.
+            await self._checkpoint_boundary()
         
         # Max iterations reached
         self.state.phase = AgentPhase.FAILED

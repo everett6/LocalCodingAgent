@@ -16,7 +16,7 @@ run without an installed script with `python -m local_coder`.
 ## Requirements
 
 - Python 3.12+
-- A local OpenAI-compatible, Ollama, or llama.cpp model server
+- A local OpenAI-compatible/Ollama server, or a user-supplied cloud provider key
 - `pip install -e ".[dev]"` for development dependencies
 
 ## Run
@@ -249,30 +249,39 @@ hundreds of thousands of characters, and materializing that as one string
 just to hash it and throw it away was wasted allocation on every drafter
 call.
 
-## Browser UI
+## Main app, desktop and IDE
 
-`local-coder serve` starts the same HTTP control plane used for remote
-terminal sessions, and now also serves a single-page browser UI
-(`src/local_coder/webui/index.html`) at `/`. It's a Claude-Code-style chat
-view -- session list, a live color-coded event stream per agent role, and
-Run/Plan-only/Review-changes actions -- talking to the existing JSON API
-(`/status`, `/events`, `/plan`, `/run`, `/review`) via `fetch()`. The page is
-also an installable PWA, so it can live as an app with an icon in the
-desktop/taskbar/dock on all three operating systems without separate native
-builds.
+The main app is a conversation manager with projects, task history, a centered
+composer, live activity, workspace diffs and provider settings. It is served by
+`local-coder serve` and is also available as an Electron desktop shell.
 
-```bash
-local-coder serve --project . --port 8787   # add --yolo to auto-approve risky actions
+```sh
+cd src/local_coder/webui
+npm ci
+npm run build
+cd ../../..
+local-coder --project . serve --port 8787
 ```
 
-Then open `http://localhost:8787` (or `http://<host>:8787` for a
-non-loopback bind, which requires `--token` -- paste the same token into the
-page's token field; it's sent as an `Authorization: Bearer` header on every
-API call and kept in `localStorage`). Click **Install app** in the header when
-your browser offers the native PWA prompt. On Windows and Linux this adds a
-launcher/taskbar app; on macOS Chromium browsers add it to Applications/Dock,
-while Safari uses **Share > Add to Dock**. The app shell, manifest, service
-worker, and icon are served from the same local server.
+Open `http://localhost:8787`. If the engine requires a token, enter it in the
+connection field. Tokens and provider keys are kept in memory rather than browser
+storage. PWA shell assets are served alongside compiled JavaScript; API responses
+are not cached by the service worker.
+
+**Settings** supports Anthropic Messages, authenticated OpenAI-compatible APIs,
+GLM 5.3 and Qwen 3.8 profiles, and local servers. Supply a key or an environment
+variable name, the endpoint and the model ID available on your account.
+
+Use **Security** or **Bug hunting** for evidence-based investigations. Read-only
+review is the default; opt into fixes and test execution explicitly. `/hunt`,
+`/audit`, `/plan`, `/review` and file mentions such as `@src/app.py` also work.
+See [harness details](docs/harness.md).
+
+The IDE is a **separate Code OSS source fork**, with Local Coder bundled as a
+first-party integration. It shares the Python harness and model providers.
+See [desktop setup](desktop/README.md) and [IDE source/build instructions](ide/README.md).
+Windows and macOS installers are built on their matching OS; release signing
+requires the publisher's credentials.
 
 ## Generation retries
 

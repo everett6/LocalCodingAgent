@@ -10,23 +10,21 @@ from pathlib import Path
 from typing import Iterator
 from typing import Any
 
-import fcntl
+from local_coder.file_lock import exclusive_lock
+from local_coder.workspace import Workspace
 
 
 class SessionStore:
     def __init__(self, project_root: str, state_dir: str = ".local-coder"):
-        self.path = Path(project_root) / state_dir / "sessions.json"
+        self.path = Workspace(project_root).resolve(Path(state_dir) / "sessions.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock_path = self.path.with_suffix(".lock")
+        self.lock_path = Workspace(project_root).resolve(self.path.with_suffix(".lock"))
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
         with self.lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
+            with exclusive_lock(lock_file):
                 yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():

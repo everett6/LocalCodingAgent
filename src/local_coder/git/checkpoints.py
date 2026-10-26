@@ -31,7 +31,16 @@ class CheckpointManager:
 
     def create(self) -> Checkpoint:
         """Save tracked changes and untracked files without changing Git state."""
-        self._git(["rev-parse", "HEAD"])
+        try:
+            head_commit = self._git(["rev-parse", "HEAD"])
+        except Exception:
+            # Handle new repositories with no commits yet
+            self._run(["git", "-c", "user.name=local-coder", "-c", "user.email=agent@local.internal", "commit", "--allow-empty", "-m", "Initial commit"], check=False)
+            try:
+                head_commit = self._git(["rev-parse", "HEAD"])
+            except Exception:
+                head_commit = "0" * 40
+
         checkpoint_id = f"cp_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
         checkpoint_dir = self.storage / checkpoint_id
         untracked_dir = checkpoint_dir / "untracked"
@@ -57,7 +66,7 @@ class CheckpointManager:
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             created_at=datetime.now(timezone.utc).isoformat(),
-            head=self._git(["rev-parse", "HEAD"]),
+            head=head_commit,
             patch_file=str(patch_file.relative_to(self.root)),
             untracked_dir=str(untracked_dir.relative_to(self.root)),
         )
@@ -101,6 +110,42 @@ class CheckpointManager:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
         return checkpoint
+
+    def undo(self) -> Checkpoint:
+        """Aider-style instant rollback to the most recent checkpoint."""
+        checkpoints = self.list()
+        if not checkpoints:
+            raise ValueError("No checkpoints found to undo.")
+        return self.rollback(checkpoints[0].checkpoint_id)
+
+    @classmethod
+    def is_git_repository(cls, project_root: str) -> bool:
+        """Check if project_root is inside an existing git work tree."""
+        try:
+            res = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+            )
+            return res.returncode == 0 and res.stdout.strip() == "true"
+        except Exception:
+            return False
+
+    @classmethod
+    def ensure_git_repository(cls, project_root: str, auto_init: bool = True) -> bool:
+        """Aider architectural guard: Enforce workspace is a Git repo; auto-init if allowed."""
+        if cls.is_git_repository(project_root):
+            return True
+        if auto_init:
+            try:
+                subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.name", "local-coder"], cwd=project_root, check=False, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "agent@local.internal"], cwd=project_root, check=False, capture_output=True)
+                return True
+            except Exception:
+                return False
+        return False
 
     def _git(self, args: list[str]) -> str:
         return self._run(["git", *args], check=True).stdout.decode().strip()

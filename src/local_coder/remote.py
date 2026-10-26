@@ -10,6 +10,8 @@ import hmac
 import ipaddress
 import json
 import subprocess
+import mimetypes
+from urllib.parse import urlsplit, unquote
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,17 +19,21 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from local_coder.workbench import WorkbenchAPI
+from local_coder.file_lock import exclusive_lock
+from local_coder.workspace import Workspace
 from local_coder import local_server
 from local_coder.orchestrator.config_loader import load_config
 from local_coder.orchestrator.coordinator import Coordinator
 from local_coder.orchestrator.sessions import SessionStore
 from local_coder.types import AgentEvent, AgentRole
 
-_WEBUI_INDEX = Path(__file__).parent / "webui" / "index.html"
+_WEBUI_ROOT = Path(__file__).parent / "webui" / "dist"
+_WEBUI_INDEX = _WEBUI_ROOT / "index.html"
 _WEBUI_ASSETS = {
-    "/manifest.webmanifest": (Path(__file__).parent / "webui" / "manifest.webmanifest", "application/manifest+json"),
-    "/sw.js": (Path(__file__).parent / "webui" / "sw.js", "application/javascript"),
-    "/icon.svg": (Path(__file__).parent / "webui" / "icon.svg", "image/svg+xml"),
+    "/manifest.webmanifest": (Path(__file__).parent / "webui" / "public" / "manifest.webmanifest", "application/manifest+json"),
+    "/sw.js": (Path(__file__).parent / "webui" / "public" / "sw.js", "application/javascript"),
+    "/icon.svg": (Path(__file__).parent / "webui" / "public" / "icon.svg", "image/svg+xml"),
 }
 
 
@@ -53,7 +59,7 @@ def workspace_status(project_root: str) -> dict:
     # they're listed separately and reported with a 0/0 stat.
     numstat = _git(project_root, "diff", "--numstat", "HEAD")
     untracked = [
-        line for line in _git(project_root, "ls-files", "--others", "--exclude-standard").splitlines() if line
+        line for line in _git(project_root, "ls-files", "--others", "--exclude-standard").splitlines() if line and not line.startswith(".local-coder/")
     ]
 
     files = []
@@ -76,11 +82,11 @@ def workspace_status(project_root: str) -> dict:
         "files": files,
         "total_additions": total_additions,
         "total_deletions": total_deletions,
-        "status": _git(project_root, "status", "-s").strip(),
+        "status": _git(project_root, "status", "-s", "--", ".", ":(exclude).local-coder").strip(),
     }
 
 
-class RemoteControlServer:
+class RemoteControlServer(WorkbenchAPI):
     """Serve read-only status plus explicit plan/run/review actions."""
 
     def __init__(
@@ -104,6 +110,9 @@ class RemoteControlServer:
         self._event_seq = 0
         self.lock = Lock()
         self.sessions = SessionStore(project_root)
+        self._init_workbench()
+        self._lease_file = None
+        self._lease = None
 
     def _event(self, event: AgentEvent) -> None:
         with self.lock:
@@ -115,11 +124,28 @@ class RemoteControlServer:
             # arrive. A client polling for "events after N" needs an id
             # that survives that eviction; a raw list index does not.
             payload["seq"] = self._event_seq
+            payload["session_id"] = getattr(self._context, "session_id", None)
+            job = self._jobs.get(payload["session_id"])
+            if job is not None and (event.event_type in {"task_failed", "model_error", "plan_error"} or
+                                    (event.event_type == "task_status" and event.data.get("status") == "failed")):
+                job["failed"] = True
+            payload = self._redact(payload)
+            if job is not None:
+                job.setdefault("events", []).append(payload)
+                job["events"] = job["events"][-600:]
+                if event.event_type == "checkpoint_saved":
+                    job["checkpoint"] = event.data.get("path")
             self.events.append(payload)
+        if job is not None and event.event_type == "checkpoint_saved":
+            # Make Resume available even when the process dies before the job finalizer.
+            self.sessions.save(payload["session_id"], checkpoint=job["checkpoint"], events=list(job["events"]))
 
     def _coordinator(self) -> Coordinator:
         config = load_config(self.config_path, project_root=self.project_root)
-        if self.model_name:
+        if self._provider is not None:
+            config.models = {"workbench": self._provider.model_copy(deep=True)}
+            config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
+        elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
         if self.yolo:
             config.approval.require_approval_for_commands = False
@@ -129,6 +155,11 @@ class RemoteControlServer:
         return coordinator
 
     def handle(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        if body is not None and not isinstance(body, dict):
+            return 400, {"error": "JSON body must be an object"}
+        workbench = self.workbench_handle(method, path, body)
+        if workbench is not None:
+            return workbench
         if method == "GET" and path == "/status":
             return 200, {"project_root": self.project_root, "sessions": self.sessions.list()}
         if method == "GET" and path == "/events":
@@ -186,18 +217,27 @@ class RemoteControlServer:
             if path != "/review" and not request:
                 return 400, {"error": "request is required"}
             session_id = body.get("session_id") or f"session-{uuid4().hex[:12]}"
-            coordinator = self._coordinator()
-            if path == "/plan":
-                result = asyncio.run(coordinator.plan_only(request))
-            elif path == "/review":
-                result = asyncio.run(coordinator.review_changes())
-            else:
-                result = asyncio.run(coordinator.run(request))
+            if not self._job_lock.acquire(blocking=False):
+                return 409, {"error": "A task is already running in this workspace"}
+            try:
+                coordinator = self._coordinator()
+                async def execute():
+                    try:
+                        if path == "/plan":
+                            return await coordinator.plan_only(request)
+                        if path == "/review":
+                            return await coordinator.review_changes()
+                        return await coordinator.run(request)
+                    finally:
+                        await coordinator.model_manager.close_all()
+                result = asyncio.run(execute())
+            finally:
+                self._job_lock.release()
             record = self.sessions.save(session_id, request=request, phase=path[1:], result=result)
             return 200, record
         return 404, {"error": "not found"}
 
-    def serve(self, host: str = "127.0.0.1", port: int = 8787) -> None:
+    def make_http_server(self, host: str = "127.0.0.1", port: int = 8787):
         try:
             is_loopback = ipaddress.ip_address(host).is_loopback
         except ValueError:
@@ -207,6 +247,13 @@ class RemoteControlServer:
         control = self
 
         class Handler(BaseHTTPRequestHandler):
+            def end_headers(self):
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+                super().end_headers()
+
             def _respond(self, status: int, payload: dict[str, Any]) -> None:
                 data = json.dumps(payload, default=str).encode()
                 self.send_response(status)
@@ -235,48 +282,113 @@ class RemoteControlServer:
                 self.wfile.write(data)
 
             def do_GET(self) -> None:
-                if self.path in ("/", "/index.html"):
-                    # Static markup only, no data -- served without the
-                    # token gate so the page itself always loads; every
-                    # fetch() it makes still goes through the JSON API
-                    # below, which is authorized normally.
+                path = urlsplit(self.path).path
+                if path in {"/", "/index.html"}:
                     try:
                         self._respond_html(200, _WEBUI_INDEX.read_bytes())
                     except OSError:
-                        self._respond(404, {"error": "ui assets not found"})
+                        self._respond(503, {"error": "Build the web UI before starting the server: npm run build in src/local_coder/webui"})
                     return
-                if self.path in _WEBUI_ASSETS:
-                    asset, content_type = _WEBUI_ASSETS[self.path]
+                if path in _WEBUI_ASSETS:
+                    asset, content_type = _WEBUI_ASSETS[path]
                     self._respond_asset(200, asset, content_type)
+                    return
+                if path.startswith("/assets/") or path in {"/favicon.svg", "/icons.svg"}:
+                    asset = (_WEBUI_ROOT / unquote(path).lstrip("/")).resolve()
+                    if not asset.is_relative_to(_WEBUI_ROOT.resolve()) or not asset.is_file():
+                        self._respond(404, {"error": "Asset not found"})
+                        return
+                    self._respond_asset(200, asset, mimetypes.guess_type(asset.name)[0] or "application/octet-stream")
                     return
                 if not self._authorized():
                     self._respond(401, {"error": "authentication required"})
                     return
-                status, payload = control.handle("GET", self.path)
-                self._respond(status, payload)
+                try:
+                    status, payload = control.handle("GET", self.path)
+                    self._respond(status, payload)
+                except Exception:
+                    self._respond(500, {"error": "Request failed; check the server configuration"})
 
             def do_POST(self) -> None:
                 if not self._authorized():
                     self._respond(401, {"error": "authentication required"})
                     return
-                length = int(self.headers.get("Content-Length", "0"))
+                origin = self.headers.get("Origin")
+                if origin and origin not in {f"http://{self.headers.get('Host')}", f"https://{self.headers.get('Host')}"}:
+                    self._respond(403, {"error": "Cross-origin requests are not allowed"})
+                    return
+                if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+                    self._respond(415, {"error": "Use application/json"})
+                    return
                 try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 0 or length > 100000:
+                        self._respond(413, {"error": "Request body exceeds 100 KB"})
+                        return
                     body = json.loads(self.rfile.read(length) or b"{}")
-                except json.JSONDecodeError:
+                except (ValueError, UnicodeError):
                     self._respond(400, {"error": "invalid JSON"})
                     return
-                status, payload = control.handle("POST", self.path, body)
-                self._respond(status, payload)
+                try:
+                    status, payload = control.handle("POST", self.path, body)
+                    self._respond(status, payload)
+                    if self.path == "/shutdown" and status == 200:
+                        from threading import Thread
+                        Thread(target=self.server.shutdown, daemon=True).start()
+                except Exception:
+                    self._respond(500, {"error": "Request failed; check the server configuration"})
 
             def _authorized(self) -> bool:
+                if is_loopback and self.headers.get("Host") not in {
+                    f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}",
+                    f"[::1]:{self.server.server_port}",
+                }:
+                    return False
                 if control.token is None:
                     return True
                 presented = self.headers.get("Authorization", "")
                 if presented.startswith("Bearer "):
                     presented = presented[7:]
-                return hmac.compare_digest(presented, control.token)
+                return hmac.compare_digest(presented.encode("utf-8"), control.token.encode("utf-8"))
 
             def log_message(self, *_args: Any) -> None:
                 return
 
-        ThreadingHTTPServer((host, port), Handler).serve_forever()
+        class WorkspaceHTTPServer(ThreadingHTTPServer):
+            def server_close(server):
+                super().server_close()
+                control.release_workspace()
+        if self._lease is not None:
+            raise ValueError("Workspace already has an engine on this server")
+        lease_path = Workspace(self.project_root).resolve(".local-coder/engine.lock")
+        self._lease_file = lease_path.open("a+")
+        self._lease = exclusive_lock(self._lease_file, blocking=False)
+        try:
+            self._lease.__enter__()
+        except OSError:
+            self._lease_file.close()
+            self._lease_file = self._lease = None
+            raise ValueError("Workspace already has an engine. Share its connection or close the other app first") from None
+        try:
+            server = WorkspaceHTTPServer((host, port), Handler)
+            self.reconcile_sessions()
+            return server
+        except BaseException:
+            self.release_workspace()
+            raise
+
+    def release_workspace(self):
+        if self._lease is not None:
+            self._lease.__exit__(None, None, None)
+            self._lease = None
+        if self._lease_file is not None:
+            self._lease_file.close()
+            self._lease_file = None
+
+    def serve(self, host: str = "127.0.0.1", port: int = 8787) -> None:
+        server = self.make_http_server(host, port)
+        try:
+            server.serve_forever()
+        finally:
+            self.drain_jobs()
+            server.server_close()

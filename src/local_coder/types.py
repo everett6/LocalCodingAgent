@@ -3,8 +3,8 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+from pydantic import BaseModel, Field, SecretStr
 
 
 # === Enums ===
@@ -17,6 +17,24 @@ class AgentRole(str, enum.Enum):
     DEBUGGER = "debugger"
     TESTER = "tester"
     REVIEWER = "reviewer"
+    SECURITY = "security"
+    BUG_HUNTER = "bug_hunter"
+
+
+class SafetyTier(str, enum.Enum):
+    """5 selectable safety tiers for the execution harness."""
+    TIER_1_PARANOIA = "tier_1_paranoia"      # Read-only / Zero side-effects allowed
+    TIER_2_STRICT = "tier_2_strict"          # Human approval required on all edits and commands
+    TIER_3_BALANCED = "tier_3_balanced"      # Aider standard: Output AST syntax filter + checkpoints + approval on risky commands
+    TIER_4_AUTO_VALID = "tier_4_auto_valid"  # Auto-apply if AST valid + auto-checkpoint + non-destructive commands
+    TIER_5_YOLO = "tier_5_yolo"              # Autonomous unrestricted execution
+
+
+class AgentMode(str, enum.Enum):
+    """3 operating modes for the agent harness."""
+    CODING = "coding"                    # Feature development, refactoring, implementation
+    CYBERSECURITY = "cybersecurity"      # AppSec auditing, taint tracking, secret & config scanning
+    BUG_HUNTING = "bug_hunting"          # Edge cases, race conditions, logic flaws, regression testing
 
 
 class TaskStatus(str, enum.Enum):
@@ -42,6 +60,7 @@ class AgentPhase(str, enum.Enum):
 
 
 class ModelBackend(str, enum.Enum):
+    ANTHROPIC = "anthropic"
     OLLAMA = "ollama"
     LLAMACPP = "llama.cpp"
     OPENAI_COMPAT = "openai_compatible"  # vLLM, LMStudio, etc.
@@ -64,6 +83,10 @@ class ToolName(str, enum.Enum):
     BUILD = "build"
     LINT = "lint"
     FORMAT_CODE = "format_code"
+    RUN_SAST = "run_sast"
+    AUDIT_DEPENDENCIES = "audit_dependencies"
+    AUDIT_CONFIG = "audit_config"
+    RUN_BUG_SCAN = "run_bug_scan"
 
 
 # === Messages ===
@@ -75,6 +98,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    reasoning_content: str | None = Field(default=None, repr=False)
 
 
 class ToolCall(BaseModel):
@@ -93,6 +117,7 @@ class ToolResult(BaseModel):
     exit_code: int | None = None
     duration_ms: float | None = None
     files_changed: list[str] = Field(default_factory=list)
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 # === Model Interface ===
@@ -107,6 +132,7 @@ class ModelResponse(BaseModel):
     total_tokens: int = 0
     latency_ms: float = 0.0
     model: str = ""
+    reasoning_content: str | None = Field(default=None, repr=False)
 
 
 class ModelConfig(BaseModel):
@@ -121,6 +147,18 @@ class ModelConfig(BaseModel):
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    api_key_env: str | None = None
+    profile: Literal["generic", "glm53", "qwen38"] = "generic"
+
+    def resolve_api_key(self) -> str | None:
+        import os
+        if self.api_key and self.api_key.get_secret_value():
+            return self.api_key.get_secret_value()
+        env = self.api_key_env
+        if env is None and self.backend == ModelBackend.ANTHROPIC:
+            env = "ANTHROPIC_API_KEY"
+        return os.environ.get(env) if env else None
 
 
 # === Agent Protocol ===
@@ -311,6 +349,8 @@ class ProjectConfig(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     agentic: AgenticConfig = Field(default_factory=AgenticConfig)
+    safety_tier: SafetyTier = SafetyTier.TIER_3_BALANCED
+    mode: AgentMode = AgentMode.CODING
     project_root: str = "."
     log_level: str = "INFO"
     log_dir: str = ".local-coder/logs"

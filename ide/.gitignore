@@ -1,0 +1,6 @@
+/upstream/
+/.build/
+/out/
+/node_modules/
+/extension/bin/
+/VSCode-*/

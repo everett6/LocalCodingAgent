@@ -57,6 +57,9 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
             quantization=model_data.get("quantization"),
             gpu_layers=model_data.get("gpu_layers"),
             estimated_vram_mb=model_data.get("estimated_vram_mb"),
+            api_key=model_data.get("api_key"),
+            api_key_env=model_data.get("api_key_env"),
+            profile=model_data.get("profile", "generic"),
         )
         
     resources_data = data.get("resources", {})
@@ -96,4 +99,5 @@ def load_config(config_path: Optional[str] = None, project_root: str = ".") -> P
         approval=approval,
         agentic=agentic,
         state_dir=data.get("state_dir", ".local-coder")
+        , mode=data.get("mode", "coding"), safety_tier=data.get("safety_tier", "tier_3_balanced")
     )

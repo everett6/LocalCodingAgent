@@ -2,12 +2,16 @@ import asyncio
 import hashlib
 import os
 import json
+import re
+from pathlib import Path
 from typing import Callable
 
 from local_coder.approval import ApprovalCallback
+from local_coder.git.checkpoints import CheckpointManager
+from local_coder.safety import SafetyHarness
 from local_coder.types import (
     ProjectConfig, AgentEvent, AgentRole, AgentTask, TaskContext, TaskPlan, AgentResponse,
-    TaskStatus,
+    TaskStatus, AgentMode, SafetyTier,
 )
 from local_coder.agents import create_agent
 from local_coder.tools import create_tool_registry
@@ -15,6 +19,7 @@ from local_coder.models.cache import PromptCache
 from local_coder.models.manager import ModelManager
 from local_coder.memory.store import MemoryStore
 from local_coder.context.repository import RepositoryContext
+from local_coder.core.runtime import AgentRuntime
 from local_coder.scheduler.dag import TaskDAG
 from local_coder.scheduler.resources import ResourceManager
 from local_coder.speculative.drafter import SpeculativeDrafter
@@ -34,21 +39,102 @@ class Coordinator:
         self.project_root = project_root
         self.repo_context = RepositoryContext(project_root)
 
+        # Safety Harness (Tiers 1-5 & Tree-sitter OutputFilter)
+        tier = getattr(config, "safety_tier", SafetyTier.TIER_3_BALANCED)
+        self.safety_harness = SafetyHarness(tier)
+
         # Ensure state dir exists
-        state_dir_path = os.path.join(project_root, config.state_dir)
-        os.makedirs(state_dir_path, exist_ok=True)
+        self.runtime = AgentRuntime(project_root, checkpoint_interval=1, state_dir=config.state_dir)
+        state_dir_path = str(self.runtime.state_dir)
 
         self.memory = MemoryStore(os.path.join(state_dir_path, "memory.db"))
+        self.checkpoints = CheckpointManager(project_root)
+        CheckpointManager.ensure_git_repository(project_root)
+
         self.tool_registry = create_tool_registry(
-            project_root, approval=config.approval, approval_callback=approval_callback,
+            project_root,
+            approval=config.approval,
+            approval_callback=approval_callback,
+            safety_harness=self.safety_harness,
         )
         self.model_manager = ModelManager(config)
+        self.tool_registry.runtime = self.runtime
+        self.runtime.model_name_for = self._model_name_for
         self.resource_manager = ResourceManager(config.resources)
         self._event_handlers: list[Callable] = []
         # Shared across every drafter this Coordinator creates, so a repeated
         # draft prompt (e.g. the same file across a fix-loop retry) can hit
         # the cache instead of paying for another small-model round trip.
         self._prompt_cache = PromptCache()
+
+    def _model_name_for(self, model) -> str | None:
+        """Capture the resolved config key instead of rerouting roles on restart."""
+        return next((name for name, loaded in self.model_manager._models.items() if loaded is model), None)
+
+    async def resume_checkpoint(self, path: str) -> AgentResponse:
+        """Resume the latest complete round for a workspace-local checkpoint's run.
+
+        Paths are absolute or relative to the project root. Invalid/legacy files
+        raise ValueError before model selection. Finished runs return their saved
+        result, making a repeated Resume request safe.
+        """
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = Path(self.project_root) / candidate
+        candidate = candidate.resolve()
+        match = re.fullmatch(r"checkpoint_([a-f0-9]{12})_([0-9]+)\.json", candidate.name)
+        if candidate.parent != self.runtime.state_dir or match is None or not candidate.is_file():
+            raise ValueError("Checkpoint must be inside the workspace's configured state directory")
+        run_id = match.group(1)
+        if await self.runtime.get_run(run_id) is not None:
+            raise ValueError("Run is already active")
+        # Selecting an older UI entry must never replay a newer completed batch.
+        candidates = []
+        for saved in self.runtime.state_dir.glob(f"checkpoint_{run_id}_*.json"):
+            saved_match = re.fullmatch(rf"checkpoint_{run_id}_([0-9]+)\.json", saved.name)
+            if saved_match and saved.resolve().parent == self.runtime.state_dir:
+                candidates.append((int(saved_match.group(1)), saved))
+        latest = max(candidates, key=lambda item: item[0])[1]
+        recovered = await self.runtime.recover_from_checkpoint(run_id, str(latest))
+        if recovered is None:
+            raise ValueError("Checkpoint is invalid or lacks the full task required for recovery")
+        try:
+            if not recovered.notes.get("boundary_complete"):
+                raise ValueError("Checkpoint is not a complete agent round")
+            final_path = self.runtime.state_dir / f"run_{run_id}_final.json"
+            if final_path.exists():
+                if final_path.resolve().parent != self.runtime.state_dir:
+                    raise ValueError("Final result must be inside the configured state directory")
+                final = json.loads(await asyncio.to_thread(final_path.read_text, encoding="utf-8"))
+                result = AgentResponse.model_validate(final["result"])
+                if result.task_id != recovered.task.task_id:
+                    raise ValueError("Final result task identity mismatch")
+                return result
+            recovered.validate_resume()
+            await recovered.validate_pending_batch()
+            from local_coder.types import ToolName
+            allowed = recovered.notes.get("allowed_tools")
+            if allowed is not None:
+                self.tool_registry._permissions[recovered.task.role] = {ToolName(name) for name in allowed}
+            task = recovered.task
+            agent = create_agent(
+                task.role, await self.model_manager.get_model(task.role, task.model_name),
+                self.tool_registry, self._dispatch,
+                context_window_chars=self.config.agentic.context_window_chars,
+                compact_context_chars=self.config.agentic.compact_context_chars,
+            )
+            self._emit_task_status(task.task_id, "running", "Resuming saved checkpoint")
+            response = await asyncio.wait_for(agent.resume(recovered), timeout=task.timeout_seconds)
+            completed = response.status == TaskStatus.COMPLETED
+            self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
+            self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed",
+                       "Resumed task complete" if completed else "Resumed task failed")
+            return response
+        except (KeyError, OSError, TypeError) as exc:
+            raise ValueError(f"Cannot resume checkpoint: {exc}") from exc
+        finally:
+            # A cancelled/failed resume may be retried from the last boundary.
+            await self.runtime.release_run(run_id)
 
     def on_event(self, handler: Callable[[AgentEvent], None]) -> None:
         """Register event handler."""
@@ -91,10 +177,47 @@ class Coordinator:
         for handler in self._event_handlers:
             handler(event)
 
-    async def run(self, request: str) -> str:
+    async def run(self, request: str, *, target_path: str = ".", fix: bool = False) -> str:
         """Execute a user request end-to-end."""
         self._emit("ORCHESTRATOR", "task_started", f"Processing: {request}")
-        
+
+        # Aider structural guard: Pre-run Git checkpoint for instant /undo
+        if self.safety_harness.should_checkpoint_before_request():
+            try:
+                cp = self.checkpoints.create()
+                self._emit("ORCHESTRATOR", "checkpoint_created", f"Created pre-run checkpoint: {cp.checkpoint_id}")
+            except Exception as e:
+                self._emit("ORCHESTRATOR", "checkpoint_warning", f"Could not create pre-run checkpoint: {e}")
+
+        # Operating Mode Routing
+        mode = getattr(self.config, "mode", AgentMode.CODING)
+
+        if mode in (AgentMode.CYBERSECURITY, AgentMode.BUG_HUNTING):
+            from local_coder.workspace import Workspace
+            from local_coder.types import ToolName
+            Workspace(self.project_root).resolve(target_path)
+            role = AgentRole.SECURITY if mode == AgentMode.CYBERSECURITY else AgentRole.BUG_HUNTER
+            # Investigations are read-only unless the caller explicitly requests remediation.
+            if fix:
+                self.tool_registry._permissions[role].update({ToolName.WRITE_FILE, ToolName.APPLY_PATCH})
+            else:
+                self.tool_registry._permissions[role].difference_update({ToolName.WRITE_FILE, ToolName.APPLY_PATCH,
+                                                                        ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD})
+            self._emit("ORCHESTRATOR", "mode", f"Running {mode.value} investigation")
+            agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch)
+            task = AgentTask(role=role, objective=request, files=[target_path],
+                             constraints=["Apply minimal fixes and run local regression tests" if fix else
+                                          "Read-only review: propose reproduction tests and patches; do not execute project code"])
+            self._emit("ORCHESTRATOR", "plan_created", "Investigation started", data={"tasks": [
+                {"task_id": task.task_id, "role": role.value, "objective": request}]})
+            self._emit_task_status(task.task_id, "running")
+            response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+            completed = response.status == TaskStatus.COMPLETED
+            self._emit_task_status(task.task_id, "completed" if completed else "failed", response.summary[:200])
+            self._emit("ORCHESTRATOR", "task_completed" if completed else "task_failed",
+                       "Investigation complete" if completed else "Investigation failed")
+            return response.summary
+
         # Step 1: Explore repository
         self._emit("ORCHESTRATOR", "phase", "Exploring repository...")
         exploration = await self._explore(request)
@@ -145,7 +268,7 @@ class Coordinator:
 
         # Step 7: Final report
         report = await self._generate_report(result, review, test_result, last_fix_result)
-        if test_result is None or test_result.tests_passed:
+        if result.status == TaskStatus.COMPLETED and (test_result is None or test_result.tests_passed):
             self._emit("ORCHESTRATOR", "task_completed", "Done")
         else:
             self._emit("ORCHESTRATOR", "task_failed", "Verification did not pass within the retry limit")
@@ -517,3 +640,9 @@ class Coordinator:
     async def get_status(self) -> str:
         """Get current system status."""
         return "System status: Idle and ready."
+
+    def undo(self) -> str:
+        """Aider-style instant rollback to the most recent checkpoint."""
+        checkpoint = self.checkpoints.undo()
+        self._emit("ORCHESTRATOR", "rollback", f"Restored checkpoint {checkpoint.checkpoint_id}")
+        return f"Rolled back to checkpoint {checkpoint.checkpoint_id}."

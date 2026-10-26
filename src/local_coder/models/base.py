@@ -1,6 +1,7 @@
 """Abstract base for local model backends."""
 from __future__ import annotations
 import abc
+import json
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 from local_coder.types import Message, ModelResponse, ModelConfig
@@ -94,12 +95,14 @@ class BaseModelBackend(abc.ABC):
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": str(tc.arguments),
+                            "arguments": json.dumps(tc.arguments),
                         }
                     }
                     for tc in msg.tool_calls
                 ]
             if msg.tool_call_id:
                 d["tool_call_id"] = msg.tool_call_id
+            if msg.role == "assistant" and msg.reasoning_content is not None:
+                d["reasoning_content"] = msg.reasoning_content
             result.append(d)
         return result

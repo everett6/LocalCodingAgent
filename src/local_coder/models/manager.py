@@ -7,6 +7,7 @@ from local_coder.types import ProjectConfig, ModelConfig, AgentRole, ModelBacken
 from local_coder.models.base import LocalModel
 from local_coder.models.ollama import OllamaBackend
 from local_coder.models.openai_compat import OpenAICompatibleBackend
+from local_coder.models.anthropic import AnthropicBackend
 
 
 class ModelManager:
@@ -30,6 +31,8 @@ class ModelManager:
 
     def _create_backend(self, config: ModelConfig) -> LocalModel:
         """Factory for creating backend instances."""
+        if config.backend == ModelBackend.ANTHROPIC:
+            return AnthropicBackend(config)
         if config.backend == ModelBackend.OLLAMA:
             return OllamaBackend(config)
         elif config.backend == ModelBackend.OPENAI_COMPAT:

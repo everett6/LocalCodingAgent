@@ -70,6 +70,21 @@ class ToolRegistry:
                 ToolName.SEARCH_FILES, ToolName.GREP,
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
                 ToolName.RUN_TESTS,
+                ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
+            },
+            AgentRole.SECURITY: {
+                ToolName.READ_FILE, ToolName.LIST_FILES,
+                ToolName.SEARCH_FILES, ToolName.GREP,
+                ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
+                ToolName.RUN_COMMAND, ToolName.RUN_TESTS,
+                ToolName.RUN_SAST, ToolName.AUDIT_DEPENDENCIES, ToolName.AUDIT_CONFIG,
+            },
+            AgentRole.BUG_HUNTER: {
+                ToolName.RUN_BUG_SCAN,
+                ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.APPLY_PATCH,
+                ToolName.LIST_FILES, ToolName.SEARCH_FILES, ToolName.GREP,
+                ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
+                ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
             },
             AgentRole.ORCHESTRATOR: set(ToolName),  # Full access
         }

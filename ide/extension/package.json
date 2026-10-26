@@ -1,0 +1,154 @@
+{
+  "name": "local-coder",
+  "displayName": "Local Coder",
+  "description": "Local agent harness, bring-your-own-provider, coding and evidence-led investigations.",
+  "version": "0.1.0",
+  "publisher": "local-coder",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "main": "./extension.cjs",
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onView:localCoder.tasks"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "localCoder.run",
+        "title": "Local Coder: Run Coding Task"
+      },
+      {
+        "command": "localCoder.plan",
+        "title": "Local Coder: Plan Coding Task"
+      },
+      {
+        "command": "localCoder.review",
+        "title": "Local Coder: Review Changes"
+      },
+      {
+        "command": "localCoder.security",
+        "title": "Local Coder: Investigate Security"
+      },
+      {
+        "command": "localCoder.bugs",
+        "title": "Local Coder: Hunt Bugs"
+      },
+      {
+        "command": "localCoder.configureProvider",
+        "title": "Local Coder: Configure Provider and Harness"
+      },
+      {
+        "command": "localCoder.forgetProviderKey",
+        "title": "Local Coder: Forget Saved Provider Key"
+      },
+      {
+        "command": "localCoder.cancel",
+        "title": "Local Coder: Cancel Task"
+      },
+      {
+        "command": "localCoder.refresh",
+        "title": "Local Coder: Refresh Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "localCoder.openResult",
+        "title": "Local Coder: Open Task Result"
+      },
+      {
+        "command": "localCoder.diff",
+        "title": "Local Coder: Show Workspace Diff"
+      },
+      {
+        "command": "localCoder.activity",
+        "title": "Local Coder: Show Agent Activity"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localCoder",
+          "title": "Local Coder",
+          "icon": "media/agent.svg"
+        }
+      ]
+    },
+    "views": {
+      "localCoder": [
+        {
+          "id": "localCoder.tasks",
+          "name": "Tasks and Investigations"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "localCoder.tasks",
+        "contents": "Open a trusted local folder, then [connect your provider](command:localCoder.configureProvider).\n[Run a task](command:localCoder.run) \u00b7 [Plan](command:localCoder.plan)\n[Security](command:localCoder.security) \u00b7 [Bug hunt](command:localCoder.bugs)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "localCoder.refresh",
+          "when": "view == localCoder.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "localCoder.configureProvider",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.run",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.security",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.bugs",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.cancel",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.diff",
+          "when": "view == localCoder.tasks"
+        },
+        {
+          "command": "localCoder.activity",
+          "when": "view == localCoder.tasks"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Local Coder",
+      "properties": {
+        "localCoder.engineExecutable": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Absolute path to the trusted local-coder-engine executable. Set in user settings only."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "workbench.startupEditor": "none",
+      "chat.disableAIFeatures": true
+    }
+  }
+}

@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 import time
+from local_coder.processes import communicate, process_options
 
 from local_coder.approval import ApprovalCallback
 from local_coder.tools.base import Tool
@@ -58,11 +59,12 @@ class RunCommandTool(Tool):
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd
+                cwd=cwd,
+                **process_options()
             )
             
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout, stderr = await communicate(proc, timeout=timeout)
                 success = proc.returncode == 0
                 out_str = stdout.decode()
                 err_str = stderr.decode()
@@ -79,7 +81,6 @@ class RunCommandTool(Tool):
                     
                 return ToolResult(success=success, output=output.strip() or "Command completed with no output.", duration_ms=int((time.time()-start_t)*1000))
             except asyncio.TimeoutError:
-                proc.kill()
                 return ToolResult(success=False, output=f"Command timed out after {timeout} seconds.", duration_ms=int((time.time()-start_t)*1000))
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))

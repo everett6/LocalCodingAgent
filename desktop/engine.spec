@@ -1,0 +1,10 @@
+# Run with python -m PyInstaller desktop/engine.spec from the repository root.
+from pathlib import Path
+root = Path(SPECPATH).parent
+analysis = Analysis([str(root / 'desktop' / 'engine.py')], pathex=[str(root / 'src')],
+    binaries=[], datas=[(str(root / 'src' / 'local_coder' / 'webui' / 'dist'), 'local_coder/webui/dist'),
+                        (str(root / 'src' / 'local_coder' / 'webui' / 'public'), 'local_coder/webui/public')],
+    hiddenimports=[], hookspath=[], runtime_hooks=[], excludes=['pytest'])
+pyz = PYZ(analysis.pure)
+exe = EXE(pyz, analysis.scripts, analysis.binaries, analysis.datas, [], name='local-coder-engine',
+          debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=True)

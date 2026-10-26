@@ -3,6 +3,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 import time
+import sys
+from local_coder.processes import communicate, process_options, split_command
 
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
@@ -40,7 +42,7 @@ class RunTestsTool(Tool):
                     framework = "pytest" # Default fallback
                     
             if framework == "pytest":
-                cmd = ["pytest"]
+                cmd = [sys.executable, "-m", "pytest"]
                 if verbose:
                     cmd.append("-v")
                 if test_path:
@@ -52,15 +54,16 @@ class RunTestsTool(Tool):
             elif framework == "make test":
                 cmd = ["make", "test"]
             else:
-                cmd = framework.split()
+                cmd = split_command(framework)
                 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=self.project_root
+                cwd=self.project_root,
+                **process_options()
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await communicate(proc)
             success = proc.returncode == 0
             
             output = stdout.decode()
@@ -92,7 +95,7 @@ class BuildTool(Tool):
             cmd = []
             
             if command:
-                cmd = command.split()
+                cmd = split_command(command)
             else:
                 if (root / "Makefile").exists():
                     cmd = ["make"]
@@ -109,9 +112,10 @@ class BuildTool(Tool):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=self.project_root
+                cwd=self.project_root,
+                **process_options()
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await communicate(proc)
             success = proc.returncode == 0
             
             output = stdout.decode()
