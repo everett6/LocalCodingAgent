@@ -231,7 +231,9 @@ def test_redteam_job_runs_the_bound_engagement_and_persists_identity(tmp_path,mo
         async def close(self):pass
     monkeypatch.setattr(ModelManager,'_create_backend',lambda *args:Model())
     server=RemoteControlServer(str(tmp_path))
-    server.handle('POST','/settings',{'model_id':'test','backend':'openai_compatible','base_url':'http://localhost:1234/v1'})
+    # This routing test consumes complete JSON tool results. Tiny-window
+    # compaction is exercised separately by the loop tests.
+    server.handle('POST','/settings',{'model_id':'test','backend':'openai_compatible','base_url':'http://localhost:1234/v1','context_length':131072})
     status,job=server.handle('POST','/jobs',{'request':'Review boundaries','mode':'red_team','engagement_id':record['id']})
     assert status==202
     for _ in range(300):

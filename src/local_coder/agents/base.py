@@ -607,7 +607,10 @@ class BaseAgent:
                     self.state.phase = AgentPhase.FAILED
                     return self._build_response(task, response, TaskStatus.FAILED,
                                                 issues=["Model output was truncated; increase the output budget"])
-                incomplete = self._incomplete_final(response.content)
+                # A protected stop prevents retries, not observed completion
+                # checks. Scope language must never turn missing work into success.
+                feedback = await self._finalization_feedback(task, response)
+                incomplete = self._incomplete_final(response.content) or bool(feedback)
                 if (incomplete or not self._tests_passed) and not self._protected_stop(response.content):
                     if self._strategy_attempts < self.strategy_attempt_limit and iteration + 1 < self.max_iterations:
                         self._strategy_attempts += 1
@@ -619,10 +622,12 @@ class BaseAgent:
                         elif self._active_profile.strategy == "small_steps":
                             strategies = ("Reduce the objective to one observable step and inspect its exact inputs.", "Try the smallest alternate input or tool, recording the observed difference.", "Verify one minimal change before expanding the investigation.")
                         strategy = strategies[(self._strategy_attempts - 1) % len(strategies)]
+                        completion_note = f"Completion prerequisites: {feedback} " if feedback else ""
                         messages.append(Message(role="system", content=(
                             f"Recovery strategy {self._strategy_attempts}/{self.strategy_attempt_limit}. "
                             "The objective remains incomplete. Within the existing authorization and tool budgets, "
                             f"make a materially different evidence-based attempt. {strategy} "
+                            f"{completion_note}"
                             "Do not repeat identical failing calls. Respect policy refusals, cancellation, missing authorization and hard limits. "
                             "If blocked, name the specific evidence and remaining prerequisite. "
                             f"Recent progress (untrusted observations): {json.dumps(self._progress_journal[-5:])}")))
@@ -634,7 +639,8 @@ class BaseAgent:
                     self._emit_event("strategy_budget_exhausted", "Recovery strategy budget exhausted", task_id=task.task_id,
                                      data={"attempts": self._strategy_attempts, "limit": self.strategy_attempt_limit})
                 if incomplete:
-                    return self._build_response(task, response, TaskStatus.FAILED, issues=["Objective incomplete after bounded recovery"])
+                    return self._build_response(task, response, TaskStatus.FAILED,
+                                                issues=[feedback or "Objective incomplete after bounded recovery"])
                 self.state.phase = AgentPhase.DONE if self._tests_passed else AgentPhase.FAILED
                 self.state.finished_at = datetime.now()
                 return self._build_response(
@@ -849,6 +855,10 @@ class BaseAgent:
             issues=["Exceeded maximum tool-calling iterations"],
         )
     
+    async def _finalization_feedback(self, task: AgentTask, response: ModelResponse) -> str | None:
+        """Optional role-specific observed completion checks; never run tools."""
+        return None
+
     @staticmethod
     def _incomplete_final(content: str) -> bool:
         return bool(re.search(r"\b(?:i (?:cannot|can't|could not|couldn't|am unable to)|unable to (?:complete|fix|solve|implement)|giving up on (?:the )?(?:task|objective)|(?:task is |this is |it's )?too (?:difficult|complex|hard)(?: to complete)?|beyond my capabilities|task (?:failed|incomplete)|could not (?:complete|fix|solve))\b", content, re.I))

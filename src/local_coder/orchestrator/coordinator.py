@@ -357,7 +357,9 @@ class Coordinator:
             self._emit("ORCHESTRATOR", "plan_created", "Red team engagement started", data={"tasks": [
                 {"task_id": task.task_id, "role": role.value, "objective": request}], "engagement_id": engagement_id})
             self._emit_task_status(task.task_id, "running")
-            agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch)
+            agent = create_agent(role, await self.model_manager.get_model(role), self.tool_registry, self._dispatch,
+                                 context_window_chars=self.config.agentic.context_window_chars,
+                                 compact_context_chars=self.config.agentic.compact_context_chars)
             response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
             self._raise_if_blocked(response)
             completed = response.status == TaskStatus.COMPLETED
