@@ -19,7 +19,7 @@ views remain reachable in a collapsible workbench section and command palette.
 - [x] Add run inspector with observed plans, activity, report artifacts and context.
 - [x] Add explicit plan-to-implementation draft action and useful starter prompts.
 - [x] Verify frontend tests/build/lint, local browser keyboard flows and screenshots.
-- [ ] Package, push and update installed apps with rollback.
+- [x] Package, push and update installed apps with rollback.
 
 Constraints: no new dependencies, paid model calls or fabricated background work;
 no approval/scope/budget changes. Persist pinned IDs and display preferences only,
@@ -30,3 +30,20 @@ Workflow references:
 - https://code.claude.com/docs/en/common-workflows
 - https://antigravity.google/docs/artifacts
 - https://openai.com/index/introducing-the-codex-app/
+
+Delivery: Clin implementation commit d24d3e4 pushed to PR #22. Installed the
+Linux manager and IDE engine/extension, matching icons and display metadata;
+retained rollback at updates/d24d3e4. Existing profile, application identities
+and root-owned mode 4755 Chromium helpers remain compatible.
+
+Validation: 1,464 Python tests passed (3 optional skips), 74 native Node tests,
+26 frontend tests, frontend build/lint, PyInstaller, offline Linux Electron
+packaging, packaged authenticated engine smoke and actual installed IDE
+extension-host smoke passed. Live manager window_ready and authenticated
+engine routes verified after launching both apps. Browser fixture exercised
+keyboard palette/file attachments, inbox search/filter/pins/reload, code copy,
+plan handoff with actual plan content, inspector tab keyboard controls,
+compact sidebar and existing Doctor access. Preview uses synthetic tasks.
+
+Follow-up limits: brand availability is unverified; Windows/macOS native
+packaging was not run locally. No paid inference or external targets tested.
