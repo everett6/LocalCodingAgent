@@ -67,3 +67,14 @@ speed. No paid inference, model downloads or external target activity ran.
 The search tool requires an enabled search MCP connection selected by the user.
 No connection, credential or paid service was enabled automatically. Local
 exploit validation and delegated leaf tasks retain their existing restrictions.
+
+## Delivery
+
+Implementation commit `4d7fca0` pushed to PR #22 and installed for both Linux
+apps. Rebuilt PyInstaller engine and offline Electron package matched installed
+engine hashes. Packaged authenticated API smoke and actual installed IDE
+extension-host smoke passed. Both apps launched; the live engine served status,
+goals, memory retrieval history and context accounting successfully. The manager
+reported `window_ready`. Sandbox helpers remain root-owned mode 4755; rollback
+is retained under `updates/4d7fca0`. User configuration and unfinished primary
+checkout edits were preserved. Windows/macOS native builds were not run locally.
