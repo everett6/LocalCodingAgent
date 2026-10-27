@@ -10,6 +10,10 @@ from local_coder.orchestrator.blocked import AgentBlocked
 from local_coder.types import AgentPhase, AgentRole, Message, ModelResponse, TaskStatus, ToolName
 
 
+class _InvestigationStalled(AgentBlocked):
+    """A complete-round stop that must pass through normal run finalization."""
+
+
 class RedTeamAgent(BaseAgent):
     role = AgentRole.RED_TEAM
     max_stalled_rounds = 8
@@ -54,6 +58,14 @@ Recommend separate reviewed sandbox validation for supported local findings.'''
         self._stalled_rounds, self._snapshot = count, {}
         return await super().resume(run, allow_model_change=allow_model_change)
 
+    async def _execute_loop(self, task, draft_prediction, resumed=False):
+        try:
+            return await super()._execute_loop(task, draft_prediction, resumed=resumed)
+        except _InvestigationStalled as stop:
+            # Finish the goal and save the final handoff. Unknown-completion
+            # mutation blocks remain exceptional and keep their replay guards.
+            return stop.response
+
     async def _engagement_snapshot(self, task):
         tool = self.tool_registry.get_tool(ToolName.REDTEAM_WORKFLOW)
         if tool is None or not task.engagement_id or tool.engagement_id != task.engagement_id:
@@ -80,7 +92,7 @@ Recommend separate reviewed sandbox validation for supported local findings.'''
                 TaskStatus.BLOCKED, issues=['no_progress: bounded investigation attempts exhausted'])
             self._emit_event('investigation_blocked', 'No new investigation progress', task_id=task.task_id,
                              data={'stalled_rounds': self._stalled_rounds})
-            raise AgentBlocked(response)
+            raise _InvestigationStalled(response)
         if self._stalled_rounds == 3:
             self._emit_event('investigation_strategy_review', 'Revisit the evidence question or inspect another scoped source',
                              task_id=task.task_id)

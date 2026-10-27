@@ -88,12 +88,11 @@ def test_pending_checklist_requires_reconciliation_not_success_claim(tmp_path):
 def test_repeated_successful_reads_do_not_count_as_new_progress(tmp_path):
     async def scenario():
         _, _, coordinator, model, agent, task = setup(tmp_path, lambda _: read())
-        with pytest.raises(AgentBlocked) as error:
-            await agent.execute(task)
+        result = await agent.execute(task)
         assert 3 <= len(model.calls) <= 12
-        assert 'no_progress' in error.value.response.summary
-        assert 'app.py' in error.value.response.summary
-        assert error.value.response.status == TaskStatus.BLOCKED
+        assert 'no_progress' in result.summary
+        assert 'app.py' in result.summary
+        assert result.status == TaskStatus.BLOCKED
         await coordinator.model_manager.close_all()
     asyncio.run(scenario())
 
@@ -135,8 +134,7 @@ def test_stall_state_survives_checkpoint_restart(tmp_path):
         run = await coordinator.runtime.recover_from_checkpoint(agent.state.run_id, str(latest))
         resumed_model = Model(lambda _: read())
         resumed = RedTeamAgent(resumed_model, coordinator.tool_registry)
-        with pytest.raises(AgentBlocked):
-            await resumed.resume(run)
+        assert (await resumed.resume(run)).status == TaskStatus.BLOCKED
         assert len(model.calls) - 1 + len(resumed_model.calls) <= 10
         await coordinator.model_manager.close_all()
     asyncio.run(scenario())
@@ -203,3 +201,19 @@ def test_large_handoff_stays_valid_bounded_json_with_omission_counts():
     assert report['omitted_details'] is True
     assert report['unfinished_count'] == 30
     assert report['execution_verification'] == 'not_executed_in_this_mode'
+
+
+def test_stalled_loop_finishes_goal_and_persists_the_handoff(tmp_path):
+    async def scenario():
+        _, _, coordinator, model, agent, task = setup(tmp_path, lambda _: read())
+        try:
+            result = await agent.execute(task)
+        except AgentBlocked as error:
+            result = error.response
+        assert result.status == TaskStatus.BLOCKED
+        assert coordinator.tool_registry.goal_ledger.get(task.task_id)['status'] == 'blocked'
+        final = json.loads((coordinator.runtime.state_dir / f'run_{agent.state.run_id}_final.json').read_text())
+        assert 'Investigation handoff' in final['result']['summary']
+        assert final['result']['status'] == 'blocked'
+        await coordinator.model_manager.close_all()
+    asyncio.run(scenario())
