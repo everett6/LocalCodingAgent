@@ -39,5 +39,13 @@ The built frontend served through the real local HTTP engine loads the context a
 - Frontend: **31 tests passed**, TypeScript/Vite production build and oxlint passed.
 - Native protocol/unit suites: **29 desktop + 47 IDE tests passed** on Linux; these do not constitute Windows/macOS execution.
 - Real Python HTTP engine through manager/IDE clients: startup ordering/race and owner-exit explicit reconnect passed.
-- PyInstaller engine build passed. Final Electron pack and packaged-engine/install smoke recorded in the delivery follow-up.
+- PyInstaller engine build passed. Electron pack passed. Packaged-engine/install results are recorded below.
 - Python compileall and `git diff --check` passed. Ruff and the optional Hatchling wheel backend were unavailable; no installation or wheel-success claim.
+
+## Installed delivery verification
+
+Implementation commit `19720a2996a7d5664188954376cab54c0630d66d` is pushed to the existing PR #22 and installed in both manager and IDE. The engine specification explicitly bundles the immutable release specification JSON; packaged smoke exercises the readiness endpoint rather than assuming source-only tests prove packaging.
+
+The packaged engine passed authentication rejection/acceptance, summary status, all fifty readiness entries, context debugger, search doctor, held-out catalog, real local tokenizer asset loading, evidence/report routes and existing offline evaluation smoke. The actual installed Code OSS extension-host smoke passed native activation, command registration, workspace verification and authenticated shared-engine refresh.
+
+Both installed apps were reopened. The authenticated workspace engine answers the new routes, both engine digests match installation metadata, and both Chromium helpers retain administrator ownership and mode 4755. A rollback snapshot exists at the installation's `updates/19720a2`. No environment files, credentials or unrelated primary-checkout source edits were changed. This is local Linux verification, not a Windows/macOS result or commercial release approval.
