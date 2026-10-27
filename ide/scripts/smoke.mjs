@@ -40,5 +40,5 @@ try{
   assert.equal(code,0,'Actual IDE extension host smoke failed; see ide/.build/vscode-smoke.log');
   assert.ok(seen.filter(value=>value.route==='/status').length>=2,'The real extension host must check workspace and refresh status');
   assert.ok(seen.every(value=>value.authenticated),'Every real extension-host request must authenticate');
-  console.log('Actual Local Coder IDE extension-host smoke passed: native activation, command registration, workspace verification, authenticated shared-engine refresh.');
+  console.log('Actual Clin IDE extension-host smoke passed: native activation, command registration, workspace verification, authenticated shared-engine refresh.');
 }finally{await log.close();await new Promise(resolve=>server.close(resolve));}

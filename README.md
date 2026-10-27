@@ -1,6 +1,14 @@
-# Local Coding Agent
+# Clin
 
-Local Coding Agent is a Python coding agent for local model backends. It combines repository context, role-specific tools, and a bounded model/tool loop that can inspect files, apply edits, run tests, and feed results back into the model.
+Clin is an agent workspace for planning, building, and reviewing software with your own cloud provider or on-device model. The desktop manager pairs a focused task composer with a Code OSS IDE, repository context, role-specific tools, and a bounded execution loop.
+
+The workspace includes keyboard command search (Ctrl/⌘ K), file navigation (Ctrl/⌘ P), source-context attachments, a searchable task inbox with project-specific pins, readable Markdown reports, and an inspector for actual plans, activity, artifacts, and context budgets. Planning actions prepare a draft for review before a run starts.
+
+Existing `local-coder` commands, saved workspace directories, provider settings, and IDE extension IDs remain compatible. Clin is the product display name; commercial name and trademark availability have not been verified.
+
+![Clin workspace](docs/images/clin-workspace.png)
+
+*Workspace preview with synthetic tasks; no model is connected in this fixture.*
 
 ## Install
 
@@ -563,7 +571,7 @@ review is the default; opt into fixes and test execution explicitly. `/hunt`,
 `/audit`, `/plan`, `/review` and file mentions such as `@src/app.py` also work.
 See [harness details](docs/harness.md).
 
-The IDE is a **separate Code OSS source fork**, with Local Coder bundled as a
+The IDE is a **separate Code OSS source fork**, with Clin bundled as a
 first-party integration. It shares the Python harness and model providers.
 See [desktop setup](desktop/README.md) and [IDE source/build instructions](ide/README.md).
 Windows and macOS installers are built on their matching OS; release signing
@@ -686,7 +694,7 @@ The desktop sidebar now includes **Project memory**, **Harness controls**, and
 **Connections & skills**. Context is retrieved within a fixed budget before each
 agent step; file snapshots, shared model-call/token/cost caps, declarative model
 profiles and bounded leaf delegation keep long tasks reviewable. The IDE adds
-**Local Coder: Language Context**, **Compare Agent Snapshot**, and **Inspect Project Memory** commands.
+**Clin: Inspect Language Context**, **Compare Agent Snapshot**, and **Inspect Project Memory** commands.
 
 See [context memory](docs/context-memory.md), [adaptive scaffolding](docs/adaptive-harness.md),
 [language context](docs/language-context.md), [MCP and skills](docs/mcp-and-skills.md),

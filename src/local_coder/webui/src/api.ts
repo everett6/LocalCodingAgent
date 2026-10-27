@@ -9,7 +9,7 @@ export interface ContextPolicy { model_limit?: number; mode?: string; prompt_tok
 export interface ProviderQuota { blocked: boolean; model_id?: string; reason?: string; reset_at?: string | number | null }
 export interface SavedProviderProfile { id: string; name: string; provider: Provider }
 export interface Workspace { branch: string; files: { path: string; additions: number; deletions: number }[]; total_additions: number; total_deletions: number }
-declare global { interface Window { localCoder?: { request: (path: string, method: string, body?: unknown) => Promise<{ status: number; data: unknown }>; chooseInferenceFile?: (purpose: 'runtime' | 'model' | 'draft') => Promise<string | null>; chooseProject: () => Promise<void>; openIDE: () => Promise<void> } } }
+declare global { interface Window { localCoder?: { request: (path: string, method: string, body?: unknown) => Promise<{ status: number; data: unknown }>; saveReport?: (text: string, suggestedName?: string) => Promise<{ saved: boolean }>; loadTaskPins?: () => Promise<string[]>; saveTaskPins?: (ids: string[]) => Promise<void>; chooseInferenceFile?: (purpose: 'runtime' | 'model' | 'draft') => Promise<string | null>; chooseProject: () => Promise<void>; openIDE: () => Promise<void> } } }
 let token = ''
 export function setToken(value: string) { token = value }
 export async function api<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {

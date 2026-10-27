@@ -1,5 +1,5 @@
 'use strict';
-// Our release channel contains rebuilt Local Coder forks; Microsoft's branded binaries are never installed.
+// Our release channel contains rebuilt Clin forks; Microsoft's branded binaries are never installed.
 const fs = require('node:fs/promises');
 const { constants } = require('node:fs');
 const path = require('node:path');
@@ -71,7 +71,7 @@ async function install(release, executable = process.execPath) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw new Error('Automatic native installation currently supports Linux x64');
   const destination = path.dirname(await fs.realpath(executable));
   const product = JSON.parse(await fs.readFile(path.join(destination, 'resources/app/product.json'), 'utf8'));
-  if (product.applicationName !== 'local-coder-ide') throw new Error('Updates can only replace a Local Coder IDE installation');
+  if (product.applicationName !== 'local-coder-ide') throw new Error('Updates can only replace a Clin IDE installation');
   const lock = `${destination}.update-lock`;
   await fs.mkdir(lock); // Atomic lock: a second editor cannot update the same installation concurrently.
   let temporary, retainTemporary = false;

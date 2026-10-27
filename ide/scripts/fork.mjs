@@ -1,6 +1,6 @@
 export function productPatch(source){
   const product={...source,
-    nameShort:'Local Coder IDE',nameLong:'Local Coder IDE',applicationName:'local-coder-ide',
+    nameShort:'Clin IDE',nameLong:'Clin IDE',applicationName:'local-coder-ide',
     dataFolderName:'.local-coder-ide',sharedDataFolderName:'.local-coder-ide-shared',
     win32MutexName:'localcoderide',win32DirName:'Local Coder IDE',win32NameVersion:'Local Coder IDE',
     win32RegValueName:'LocalCoderIDE',win32AppUserModelId:'LocalCoder.IDE',win32ShellNameShort:'Local Coder IDE',
@@ -32,7 +32,7 @@ export function patchBuild(source){
     .replace('\t\t\tcompileCopilotExtensionBuildTask,','')
     .replace('\t\t\tprepareCopilotRipgrepShimTask(platform, arch, destinationFolderName)','');
 }
-export const logo='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><rect width="256" height="256" rx="48" fill="#1c293d"/><path fill="none" stroke="#7397ff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" d="M88 64H56v128h32m80-128h32v128h-32M112 96l-24 32 24 32m32-64 24 32-24 32"/></svg>\n';
+export const logo='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="28" fill="#25272a"/><path d="M84 38a36 36 0 1 0 0 52M75 64h20" fill="none" stroke="#b5b9ed" stroke-width="10" stroke-linecap="round"/></svg>\n';
 // Stored DEFLATE blocks make generated icons byte-identical across Node/zlib versions.
 function deflateStored(data){
   const blocks=[Buffer.from([0x78,0x01])];
@@ -48,13 +48,27 @@ function deflateStored(data){
 function crc32(buffer){let crc=0xffffffff;for(const byte of buffer){crc^=byte;for(let n=0;n<8;n++)crc=(crc>>>1)^((crc&1)?0xedb88320:0);}return(crc^0xffffffff)>>>0;}
 function chunk(type,data){const name=Buffer.from(type);const result=Buffer.alloc(data.length+12);result.writeUInt32BE(data.length,0);name.copy(result,4);data.copy(result,8);result.writeUInt32BE(crc32(Buffer.concat([name,data])),result.length-4);return result;}
 function segmentDistance(x,y,a,b,c,d){const dx=c-a,dy=d-b,t=Math.max(0,Math.min(1,((x-a)*dx+(y-b)*dy)/(dx*dx+dy*dy)));return Math.hypot(x-a-t*dx,y-b-t*dy);}
+function markSegments(){
+  // Same 36-unit SVG arc, approximated by short round-capped segments.
+  const cx=84-Math.sqrt(36*36-26*26),start=Math.atan2(-26,84-cx),end=-start-2*Math.PI;
+  const points=Array.from({length:65},(_,index)=>{const angle=start+(end-start)*index/64;return[cx+36*Math.cos(angle),64+36*Math.sin(angle)];});
+  return [...points.slice(1).map((point,index)=>[...points[index],...point]),[75,64,95,64]]
+    .map(line=>({line,left:Math.min(line[0],line[2])-5,right:Math.max(line[0],line[2])+5,top:Math.min(line[1],line[3])-5,bottom:Math.max(line[1],line[3])+5}));
+}
 export function png(size){
   const data=Buffer.alloc((size*4+1)*size);
-  const lines=[[88,64,56,64],[56,64,56,192],[56,192,88,192],[168,64,200,64],[200,64,200,192],[200,192,168,192],[112,96,88,128],[88,128,112,160],[144,96,168,128],[168,128,144,160]];
+  const segments=markSegments(),background=[37,39,42],foreground=[181,185,237];
   for(let y=0;y<size;y++)for(let x=0;x<size;x++){
-    const px=x/size*256,py=y/size*256,corner=Math.hypot(Math.max(48-px,px-208,0),Math.max(48-py,py-208,0));
-    const ink=lines.some(line=>segmentDistance(px,py,...line)<9),i=y*(size*4+1)+1+x*4;
-    data[i]=ink?115:28;data[i+1]=ink?151:41;data[i+2]=ink?255:61;data[i+3]=corner>48?0:255;
+    let inside=0,ink=0;
+    for(const sy of [.25,.75])for(const sx of [.25,.75]){
+      const px=(x+sx)/size*128,py=(y+sy)/size*128;
+      if(Math.hypot(Math.max(28-px,px-100,0),Math.max(28-py,py-100,0))>28)continue;
+      inside++;
+      if(segments.some(segment=>px>=segment.left&&px<=segment.right&&py>=segment.top&&py<=segment.bottom&&segmentDistance(px,py,...segment.line)<=5))ink++;
+    }
+    const i=y*(size*4+1)+1+x*4;
+    for(let channel=0;channel<3;channel++)data[i+channel]=inside?Math.round((background[channel]*(inside-ink)+foreground[channel]*ink)/inside):0;
+    data[i+3]=Math.round(inside/4*255);
   }
   const header=Buffer.alloc(13);header.writeUInt32BE(size,0);header.writeUInt32BE(size,4);header[8]=8;header[9]=6;
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk('IHDR',header),chunk('IDAT',deflateStored(data)),chunk('IEND',Buffer.alloc(0))]);
@@ -65,7 +79,7 @@ export function patchAccounts(source){
   const replacements=[
     ['private readonly defaultAccountConfig: IDefaultAccountConfig;', 'private readonly defaultAccountConfig: IDefaultAccountConfig | undefined;'],
     ['this.defaultAccountConfig = toDefaultAccountConfig(productService.defaultChatAgent);', 'this.defaultAccountConfig = productService.defaultChatAgent ? toDefaultAccountConfig(productService.defaultChatAgent) : undefined;\n\t\tif (!this.defaultAccountConfig) { this.initBarrier.open(); }'],
-    ['...this.defaultAccountConfig.authenticationProvider.default,', "...(this.defaultAccountConfig?.authenticationProvider.default ?? { id: '', name: 'Local Coder' }),"],
+    ['...this.defaultAccountConfig.authenticationProvider.default,', "...(this.defaultAccountConfig?.authenticationProvider.default ?? { id: '', name: 'Clin' }),"],
     ["\t\tconst defaultAccountProvider = this._register(instantiationService.createInstance(DefaultAccountProvider, toDefaultAccountConfig(productService.defaultChatAgent)));", "\t\tif (!productService.defaultChatAgent) { return; }\n\t\tconst defaultAccountProvider = this._register(instantiationService.createInstance(DefaultAccountProvider, toDefaultAccountConfig(productService.defaultChatAgent)));"]
   ];
   for(const [before,after] of replacements){if(!source.includes(before))throw new Error('Upstream default account service changed; review the vendor-account exclusion patch');source=source.replace(before,after);}

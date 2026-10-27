@@ -6,7 +6,13 @@ const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { spawn } = require('node:child_process');
 const { Sidecar, isAllowedApiRequest } = require('./sidecar.cjs');
+const nativeStorage = require('./native-storage.cjs');
+// The display name must not relocate existing workspace and provider settings.
+const legacyUserData = app.getPath('userData');
+app.setPath('userData', legacyUserData);
+app.setName('Clin');
 let window, sidecar, token, origin, project, quitting = false, switching = false;
+let pinWrites = Promise.resolve();
 const root = path.resolve(__dirname, '..');
 function trusted(event) { return window && event.sender === window.webContents && event.senderFrame === window.webContents.mainFrame && event.senderFrame.url.startsWith(origin + '/'); }
 async function request(pathname, method = 'GET', body) {
@@ -27,7 +33,7 @@ async function startEngine(folder) {
   const command = app.isPackaged ? path.join(process.resourcesPath, 'backend', process.platform === 'win32' ? 'local-coder-engine.exe' : 'local-coder-engine') : (process.env.LOCAL_CODER_PYTHON || 'python');
   sidecar = new Sidecar({ command, token, args: app.isPackaged ? [] : ['-m', 'local_coder.desktop_engine'], cwd: folder,
     env: { ...process.env, PYTHONPATH: app.isPackaged ? '' : path.join(root, 'src'), LOCAL_CODER_DESKTOP_PROJECT: folder, LOCAL_CODER_REMOTE_TOKEN: token },
-    onExit: () => { if (!quitting && !switching) { origin = null; dialog.showErrorBox('Local engine stopped', 'The engine exited unexpectedly. Close and reopen Local Coder. Saved task reports remain in your workspace.'); } } });
+    onExit: () => { if (!quitting && !switching) { origin = null; dialog.showErrorBox('Local engine stopped', 'The engine exited unexpectedly. Close and reopen Clin. Saved task reports remain in your workspace.'); } } });
   origin = await sidecar.start(); token = sidecar.token; project = folder;
   startupStatus(sidecar.child ? 'engine_ready owned' : 'engine_ready shared');
 }
@@ -56,8 +62,8 @@ async function spawnIDE(executable, args, { cwd, env, logPath, spawnProcess = sp
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => { cleanup(); resolve(); }, startupMs);
     const cleanup = () => { clearTimeout(timer); child.removeListener('error', failed); child.removeListener('exit', exited); };
-    const failed = error => { cleanup(); reject(new Error(`Cannot start Local Coder IDE: ${error.message}. Startup diagnostics: ${logPath}`)); };
-    const exited = (code, signal) => { cleanup(); code === 0 ? resolve() : reject(new Error(`Local Coder IDE stopped during startup (${signal || `exit ${code}`}). Startup diagnostics: ${logPath}`)); };
+    const failed = error => { cleanup(); reject(new Error(`Cannot start Clin IDE: ${error.message}. Startup diagnostics: ${logPath}`)); };
+    const exited = (code, signal) => { cleanup(); code === 0 ? resolve() : reject(new Error(`Clin IDE stopped during startup (${signal || `exit ${code}`}). Startup diagnostics: ${logPath}`)); };
     child.once('error', failed); child.once('exit', exited);
   });
   child.unref();
@@ -79,7 +85,7 @@ async function openIDE() {
     if (!executable) try { executable = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).executable; } catch {}
     if (!executable || !fs.existsSync(executable)) executable = installedIDE();
     if (!executable || !fs.existsSync(executable)) {
-      const result = await dialog.showOpenDialog(window, { title: 'Select your built Local Coder IDE application', properties: ['openFile'],
+      const result = await dialog.showOpenDialog(window, { title: 'Select your built Clin IDE application', properties: ['openFile'],
         ...(process.platform === 'win32' ? { filters: [{ name: 'Application', extensions: ['exe'] }] } : {}) });
       if (result.canceled) return;
       executable = result.filePaths[0];
@@ -102,13 +108,37 @@ app.whenReady().then(async () => {
     if (!folder) try { folder = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'workspace.json'), 'utf8')).project; } catch {}
     if (!folder || !fs.existsSync(folder)) { const result = await dialog.showOpenDialog({ title: 'Choose your project workspace', properties: ['openDirectory'] }); if (result.canceled) { app.quit(); return; } folder = result.filePaths[0]; }
     await startEngine(folder);
-    window = new BrowserWindow({ width: 1440, height: 940, minWidth: 760, minHeight: 550, backgroundColor: '#171717', title: 'Local Coder', show: false,
+    window = new BrowserWindow({ width: 1440, height: 940, minWidth: 760, minHeight: 550, backgroundColor: '#171717', title: 'Clin', show: false,
+      icon: app.isPackaged ? path.join(process.resourcesPath, 'icons', 'icon.png') : path.join(__dirname, 'build', 'icon.png'),
       webPreferences: { preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', (event, url) => { if (!url.startsWith(origin + '/')) event.preventDefault(); });
     window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
     window.webContents.session.on('will-download', event => event.preventDefault());
     ipcMain.handle('engine:request', (event, pathname, method, body) => { if (!trusted(event)) throw new Error('Untrusted sender'); return request(pathname, method, body); });
+    ipcMain.handle('report:save', async (event, text, suggestedName) => {
+      if (!trusted(event)) throw new Error('Untrusted sender');
+      const filename = nativeStorage.validateReport(text, suggestedName);
+      const result = await dialog.showSaveDialog(window, { title: 'Save Clin report', defaultPath: filename,
+        filters: [{ name: 'Markdown', extensions: ['md'] }], properties: ['showOverwriteConfirmation', 'createDirectory'] });
+      if (result.canceled || !result.filePath) return { saved: false };
+      if (!trusted(event)) throw new Error('Untrusted sender');
+      await nativeStorage.writeReport(result.filePath, text);
+      return { saved: true };
+    });
+    ipcMain.handle('task-pins:load', async event => {
+      if (!trusted(event)) throw new Error('Untrusted sender');
+      const workspace = fs.realpathSync(project);
+      await pinWrites;
+      return nativeStorage.loadTaskPins(app.getPath('userData'), workspace);
+    });
+    ipcMain.handle('task-pins:save', async (event, ids) => {
+      if (!trusted(event)) throw new Error('Untrusted sender');
+      const pins = nativeStorage.validateTaskPins(ids), workspace = fs.realpathSync(project);
+      const operation = pinWrites.then(() => nativeStorage.saveTaskPins(app.getPath('userData'), workspace, pins));
+      pinWrites = operation.catch(() => {});
+      await operation;
+    });
     ipcMain.handle('inference:choose-file', async (event, purpose) => {
       if (!trusted(event)) throw new Error('Untrusted sender');
       if (!['runtime', 'model', 'draft'].includes(purpose)) throw new Error('Unsupported inference file purpose');
@@ -123,7 +153,7 @@ app.whenReady().then(async () => {
     ipcMain.handle('workspace:choose', event => { if (!trusted(event)) throw new Error('Untrusted sender'); return chooseProject(); });
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       ...(process.platform === 'darwin' ? [{ label: app.name, submenu: [{ role: 'about' }, { role: 'quit' }] }] : []),
-      { label: 'File', submenu: [{ label: 'Open IDE', accelerator: 'CmdOrCtrl+Shift+I', click: () => { void openIDE().catch(error => dialog.showErrorBox('Cannot open IDE', error.message)); } }, { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: () => { void chooseProject().catch(error => dialog.showErrorBox('Cannot open workspace', error.message)); } }, { role: 'close' }] },
+      { label: 'File', submenu: [{ label: 'Open Clin IDE', accelerator: 'CmdOrCtrl+Shift+I', click: () => { void openIDE().catch(error => dialog.showErrorBox('Cannot open IDE', error.message)); } }, { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: () => { void chooseProject().catch(error => dialog.showErrorBox('Cannot open workspace', error.message)); } }, { role: 'close' }] },
       { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
       { label: 'View', submenu: [{ role: 'reload' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     ]));
@@ -131,7 +161,7 @@ app.whenReady().then(async () => {
     window.webContents.on('render-process-gone', (_event, details) => startupStatus(`renderer_stopped ${details.reason} ${details.exitCode}`));
     window.once('ready-to-show', () => { window.show(); startupStatus('window_ready'); });
     await window.loadURL(origin);
-  } catch (error) { startupStatus('startup_failed: ' + error.message); dialog.showErrorBox('Cannot start Local Coder', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
+  } catch (error) { startupStatus('startup_failed: ' + error.message); dialog.showErrorBox('Cannot start Clin', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
 });
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', event => { startupStatus('quit_requested'); if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });

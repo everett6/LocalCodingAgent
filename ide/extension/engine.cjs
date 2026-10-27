@@ -86,7 +86,7 @@ class EngineConnection {
       return;
     }
     if(await this._attachDiscovered())return;
-    if(!this.options.executable)throw new Error('Build the Local Coder engine or configure its executable in user settings');
+    if(!this.options.executable)throw new Error('Build the Clin engine or configure its executable in user settings');
     this.token=randomBytes(32).toString('hex');
     const child=spawn(this.options.executable,this.options.args||[],{
       cwd:this.options.cwd||this.options.workspace,
@@ -100,8 +100,8 @@ class EngineConnection {
       await new Promise((resolve,reject)=>{
         let buffer='';
         const timer=setTimeout(()=>finish(new Error('Engine startup timed out')),this.options.startupTimeout||30000);
-        const onError=()=>finish(new Error('Cannot start Local Coder engine executable'));
-        const onExit=()=>finish(new Error('Local Coder engine exited before becoming ready'));
+        const onError=()=>finish(new Error('Cannot start Clin engine executable'));
+        const onExit=()=>finish(new Error('Clin engine exited before becoming ready'));
         const onData=chunk=>{
           buffer+=chunk.toString();
           if(buffer.length>65536){finish(new Error('Invalid engine readiness response'));return;}
@@ -156,7 +156,7 @@ class EngineConnection {
         res.on('error',()=>reject(new Error('Engine response interrupted')));
       });
       req.on('timeout',()=>req.destroy(new Error('Engine request timed out')));
-      req.on('error',()=>reject(new Error('Cannot reach Local Coder engine')));
+      req.on('error',()=>reject(new Error('Cannot reach Clin engine')));
       if(payload)req.write(payload);
       req.end();
     });

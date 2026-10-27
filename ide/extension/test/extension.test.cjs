@@ -28,13 +28,13 @@ test('native commands keep credentials in SecretStorage and submit real provider
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const folder={name:'workspace',uri:{scheme:'file',fsPath:process.cwd()}};
   const noop=()=>({dispose(){}});
-  const outputs=[];
+  const outputs=[],outputNames=[];
   const fake={
     EventEmitter:class{constructor(){this.event=()=>({dispose(){}});}fire(){}dispose(){}},
     TreeItem:class{constructor(label,state){this.label=label;this.collapsibleState=state;}},TreeItemCollapsibleState:{Expanded:2},ThemeIcon:class{},
     workspace:{isTrusted:true,workspaceFolders:[folder],registerTextDocumentContentProvider:noop,onDidCloseTextDocument:noop,onDidChangeWorkspaceFolders:noop,getConfiguration:()=>({inspect:()=>({})})},
     window:{
-      createOutputChannel:()=>({appendLine:value=>outputs.push(value),show(){},dispose(){}}),registerTreeDataProvider:noop,
+      createOutputChannel:name=>{outputNames.push(name);return{appendLine:value=>outputs.push(value),show(){},dispose(){}};},registerTreeDataProvider:noop,
       showQuickPick:async items=>{const selected=picks.shift();return typeof selected==='function'?selected(items):items[selected??0];},
       showInputBox:async options=>{inputs.push(options);return answers.shift();},
       showErrorMessage:value=>messages.push(value),showInformationMessage:value=>messages.push(value)
@@ -51,6 +51,9 @@ test('native commands keep credentials in SecretStorage and submit real provider
   try{
     sandbox.module.exports.activate(context);
     const manifest=require('../package.json');
+    assert.equal(manifest.displayName,'Clin');assert.equal(manifest.name,'local-coder');assert.equal(manifest.publisher,'local-coder');
+    assert.ok(manifest.contributes.commands.every(item=>item.title.startsWith('Clin:')));
+    assert.deepEqual(outputNames,['Clin Activity']);
     for(const command of ['localCoder.languageContext','localCoder.snapshotDiff','localCoder.memoryInspector']){
       assert.equal(typeof commands.get(command),'function');
       assert.ok(manifest.contributes.commands.some(item=>item.command===command));
@@ -92,10 +95,11 @@ test('native commands keep credentials in SecretStorage and submit real provider
     assert.equal(redteam.mode,'red_team');assert.equal(redteam.engagement_id,'eng-0123456789ab');assert.equal(redteam.fix,false);
     assert.ok(requests.every(item=>item.auth==='Bearer engine-secret'));
     assert.ok(!outputs.join('\n').includes('secret'));
-    assert.ok(!messages.some(message=>message.startsWith('Local Coder:')));
+    assert.ok(!messages.some(message=>message.startsWith('Clin:')));
     fake.workspace.isTrusted=false;
     const before=requests.length;await commands.get('localCoder.run')();
     assert.equal(requests.length,before);assert.ok(messages.at(-1).includes('Trust this workspace'));
+    assert.ok(messages.at(-1).startsWith('Clin:'));
   }finally{
     await sandbox.module.exports.deactivate();
     for(const item of subscriptions)item.dispose();
