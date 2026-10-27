@@ -1,4 +1,5 @@
 import type { Mode, Session } from './api'
+import { stateLabel } from './workspaceUI.ts'
 
 export type InboxFilter = 'all' | 'active' | 'attention' | 'completed'
 export type InboxCounts = Record<InboxFilter, number>
@@ -13,6 +14,7 @@ const statusNames: Record<string, string> = {
 const modeNames: Record<Mode, string> = { coding: 'Build', cybersecurity: 'Cybersecurity', bug_hunting: 'Bug hunting', red_team: 'Red team' }
 
 export function taskStatusLabel(session: Session): string {
+  if (session.observed_state) return stateLabel(session)
   const status = session.status || ''
   return statusNames[status] || (status ? status.replaceAll('_', ' ') : 'Saved')
 }

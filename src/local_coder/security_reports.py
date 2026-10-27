@@ -340,6 +340,17 @@ def _findings(findings):
         row["status"] = row["status"] or "suspected"
         row["cwe"], row["cwe_source"] = _cwe(raw)
         row.update(_source_metadata(raw, evidence))
+        row["suppression"] = _text(raw.get("suppression"), 2000)
+        package = raw.get("package", {})
+        if not isinstance(package, dict):
+            raise ValueError("Finding package must be an object")
+        package = dict(package)
+        defaults = {"revision": None, "prerequisites": "unknown", "evidence": evidence,
+                    "reproduction": None, "impact": "unverified candidate",
+                    "remediation": row["fix"] or "not recorded", "verification_disposition": "unverified"}
+        for key, value in defaults.items():
+            package.setdefault(key, value)
+        row["package"] = _bounded(package, MAX_RECORD_BYTES)
         result.append(row)
     return result
 
@@ -639,9 +650,14 @@ def export_sarif(findings: list[dict]) -> dict:
                     "audit_recorded_at",
                     "source_status",
                     "source_qualification",
+                    "suppression",
+                    "package",
                 )
             },
         }
+        if row["status"] in {"false_positive", "suppressed"} or row["suppression"]:
+            result["suppressions"] = [{"kind": "external", "status": "accepted",
+                                       "justification": row["suppression"] or "Recorded false-positive decision"}]
         if row["path"]:
             physical = {"artifactLocation": {"uri": quote(row["path"], safe="/")}}
             if row["line"]:
@@ -740,6 +756,7 @@ def import_sarif(data) -> list[dict]:
             }:
                 raise ValueError("Invalid SARIF result level")
             row = {
+                "id": properties.get("id", ""),
                 "title": properties.get("title", message["text"][:500]),
                 "description": message["text"],
                 "rule": rule_id,
@@ -754,6 +771,17 @@ def import_sarif(data) -> list[dict]:
                 "exploit_path": properties.get("exploit_path", ""),
                 "fix": properties.get("fix", ""),
             }
+            suppressions = result.get("suppressions", [])
+            if not isinstance(suppressions, list) or len(suppressions) > 100:
+                raise ValueError("SARIF suppressions must be a bounded list")
+            accepted = [item for item in suppressions if isinstance(item, dict) and item.get("status") == "accepted"]
+            if properties.get("status") in {"false_positive", "suppressed"} or accepted:
+                row["status"] = "false_positive"
+                row["suppression"] = properties.get("suppression") or (
+                    accepted[0].get("justification", "Imported accepted suppression") if accepted else
+                    "Imported false-positive decision")
+            if "package" in properties:
+                row["package"] = properties["package"]
             if properties.get("source_sha256") is not None:
                 row["source_sha256"] = properties["source_sha256"]
                 row["source_status"] = "unavailable"
@@ -822,7 +850,7 @@ def _markdown(value):
     return re.sub(r"([\\`*_{}\[\]()#+.!|>~:/-])", r"\\\1", value)
 
 
-def findings_report(findings: list[dict]) -> str:
+def findings_report(findings: list[dict], coverage: dict | None = None) -> str:
     rows = _findings(findings)
     lines = [
         "# Security findings",
@@ -832,6 +860,13 @@ def findings_report(findings: list[dict]) -> str:
         "Verification labels describe recorded observations; they do not certify exploitability.",
         "",
     ]
+    if coverage is None:
+        lines += ["Coverage: unknown. Empty output does not prove safety.", ""]
+    else:
+        _bounded(coverage, MAX_RECORD_BYTES)
+        lines += ["## Coverage", "", "Empty output does not prove safety.", ""]
+        for key in ("reviewed", "skipped", "failed", "unknown", "entry_points", "vulnerability_classes", "gaps"):
+            lines += [f"{key}: {_markdown(_canonical(coverage.get(key, 'unknown')).decode())}", ""]
     for number, row in enumerate(rows, 1):
         lines += [
             f"## {number}. {_markdown(row['title'])}",
@@ -847,6 +882,10 @@ def findings_report(findings: list[dict]) -> str:
         if row["cwe"]:
             lines += [f"Classification: {row['cwe']} ({row['cwe_source']}).", ""]
         lines += [_markdown(row["source_qualification"]), ""]
+        if row["suppression"]:
+            lines += [f"Suppression: {_markdown(row['suppression'])}", ""]
+        lines += ["### Finding package (recorded claims)", "",
+                  _markdown(_canonical(row["package"]).decode()), ""]
         for label, key in (
             ("Recorded source SHA-256", "source_sha256"),
             ("Audit ledger record SHA-256", "audit_record_hash"),

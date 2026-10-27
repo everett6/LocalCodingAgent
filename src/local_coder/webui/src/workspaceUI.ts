@@ -1,4 +1,4 @@
-import type { Mode } from './api'
+import type { Mode, Session } from './api'
 
 export function isContextPath(path: string): boolean {
   if (!path || !/^[\p{L}\p{N}_./\\-]+$/u.test(path) || /^[\\/]/.test(path)) return false
@@ -33,4 +33,14 @@ export type PlanTask = { task_id: string; objective: string; status?: string }
 export function validPlanTasks(value: unknown): PlanTask[] {
   if (!Array.isArray(value)) return []
   return value.filter((task): task is PlanTask => !!task && typeof task === 'object' && typeof task.task_id === 'string' && typeof task.objective === 'string' && (task.status === undefined || typeof task.status === 'string')).slice(0, 200)
+}
+
+/** File walks and diff generation are requested only by an open workspace view. */
+export function workspaceNeeds(view: string, palette: string | null, sourceOpen = false): { files: boolean; diff: boolean } {
+  return { files: view === 'workspace' || palette === 'files' || palette === 'context', diff: view === 'workspace' && !sourceOpen }
+}
+
+export function stateLabel(session: Session): string {
+  const labels: Record<string, string> = { executing: 'Executing', waiting: 'Waiting for approval', stalled: 'No recent activity', blocked: 'Blocked', incomplete: 'Incomplete', verified: 'Verified', completed_unverified: 'Completed · verification unrecorded' }
+  return labels[session.observed_state || ''] || session.status?.replaceAll('_', ' ') || 'Saved'
 }

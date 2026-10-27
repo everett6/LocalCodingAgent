@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
 import { ContextAccountingPanel } from './ContextAccountingPanel'
+import { ReadinessPanel } from './ReadinessPanel'
+import type { Readiness } from './ReadinessPanel'
 
 type Settings = {
   memory_enabled: boolean
@@ -33,6 +35,7 @@ type Budget = {
   limits?: { max_requests?: number; max_tokens?: number; max_cost_usd?: number | null }
 }
 type HarnessStatus = {
+  readiness?: Readiness
   settings: Settings
   safety_tier: string
   budget: Budget | null
@@ -208,6 +211,7 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
     {message && <p role="status">{message}</p>}
     {loading && <p role="status">Loading harness state…</p>}
     {tab === 'controls' && <>
+      <ReadinessPanel readiness={status?.readiness} />
       {status && <details open>
         <summary>Current runtime</summary>
         <p>{budget ? `${budget.requests.toLocaleString()}${budget.limits?.max_requests !== undefined ? ` / ${budget.limits.max_requests.toLocaleString()}` : ''} model calls · ${budget.tokens.toLocaleString()}${budget.limits?.max_tokens !== undefined ? ` / ${budget.limits.max_tokens.toLocaleString()}` : ''} reported or reserved tokens` : 'No active task budget is available.'}</p>

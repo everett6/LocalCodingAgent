@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from local_coder.agents.base import BaseAgent, PINNED_PREFIX
+from tests.test_agents import fake_schemas
 from local_coder.agents.frame_guard import detect_refusal
 from local_coder.context.compression import prune_tool_outputs, sliding_tool_output_budget
 from local_coder.types import AgentRole, AgentTask, Message, ModelResponse, TaskStatus, ToolCall, ToolResult
@@ -27,7 +28,7 @@ class Registry:
         self.calls = []
 
     def get_schemas_for_role(self, role):
-        return []
+        return fake_schemas("read_file")
 
     async def execute_tool(self, role, name, arguments):
         self.calls.append(name)
@@ -172,6 +173,9 @@ def test_delegated_blocked_signal_propagates_without_parent_recovery():
     async def scenario():
         blocked = AgentResponse(task_id="child", status=TaskStatus.BLOCKED, summary="I cannot fulfill this request.")
         class ChildRegistry(Registry):
+            def get_schemas_for_role(self, role):
+                return fake_schemas("delegate_task")
+
             async def execute_tool(self, role, name, arguments):
                 raise AgentBlocked(blocked)
         model = Model([ModelResponse(tool_calls=[ToolCall(id="delegate", name="delegate_task")])])

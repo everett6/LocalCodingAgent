@@ -8,11 +8,12 @@ Identifiers are split on snake_case and camelCase so a query like
 chunk's symbol name or file path rank higher than matches in its body.
 
 The index lives in ``.local-coder/index/code_index.json`` and is refreshed
-incrementally: only files whose size or mtime changed are re-read.
+incrementally: unchanged content reuses chunks; hashes detect same-stat rewrites.
 """
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import math
@@ -326,9 +327,11 @@ class CodeIndex:
         for rel in files:
             rel = rel.replace(os.sep, "/")
             parts = rel.split("/")
-            if any(p in SKIP_DIRS or p.endswith(".egg-info") for p in parts[:-1]):
+            if any(p in SKIP_DIRS or p.endswith(".egg-info") or p.startswith('.env') for p in parts[:-1]):
                 continue
-            if os.path.splitext(rel)[1].lower() in SKIP_EXTENSIONS:
+            if parts[-1].lower().startswith(('.env', 'secrets.', 'credentials.')) or parts[-1].lower() in {'.netrc', '.npmrc', '.pypirc', 'credentials', 'id_rsa', 'id_ed25519'}:
+                continue
+            if os.path.splitext(rel)[1].lower() in SKIP_EXTENSIONS | {'.pem', '.key', '.p12', '.pfx', '.keystore'}:
                 continue
             out.append(rel)
             if len(out) >= MAX_FILES:
@@ -400,16 +403,20 @@ class CodeIndex:
                 st = full.stat()
             except OSError:
                 continue
-            if not full.is_file() or st.st_size > MAX_FILE_BYTES or not self._inside(full):
-                continue
-            seen.add(rel)
-            entry = self._files.get(rel)
-            if entry and entry.get("mtime_ns") == st.st_mtime_ns and entry.get("size") == st.st_size:
-                stats["unchanged"] += 1
+            if full.is_symlink() or not full.is_file() or st.st_size > MAX_FILE_BYTES or not self._inside(full):
                 continue
             text = self._read_text(full)
-            chunks = chunk_file(rel, text) if text is not None else []
+            if text is None:
+                continue
+            seen.add(rel)
+            digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            entry = self._files.get(rel)
+            if entry and entry.get("content_hash") == digest:
+                stats["unchanged"] += 1
+                continue
+            chunks = chunk_file(rel, text)
             self._files[rel] = {
+                "content_hash": digest,
                 "mtime_ns": st.st_mtime_ns,
                 "size": st.st_size,
                 "chunks": [c.to_json() for c in chunks],

@@ -41,6 +41,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
         self._job_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._jobs = {}
+        from local_coder.workspace_status import SessionSummaryCache
+        self._session_summaries = SessionSummaryCache()
         self._context = threading.local()
         self.instance_id = uuid4().hex
         self._stopping = False
@@ -312,6 +314,7 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                                        message=self._redact(event_message), data=notice or {}))
                 final = self._redact({"status": status, "result": result, "error": error,
                                       "quota_notice": notice, "checkpoint": job.get("checkpoint"),
+                                      "verification": job.get("verification"),
                                       "events": job.get("events", [])})
                 self.sessions.save(session_id, **final)
         try:
@@ -326,6 +329,20 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            if method == "GET" and path == "/status" and query:
+                if query != {"summary": ["1"]}:
+                    raise ValueError("Use summary=1 for lightweight task status")
+                from local_coder.workspace_status import observed_state, recovery_explanation
+                summaries = self._session_summaries.list(self.sessions)
+                waiting = any(item["status"] == "pending" for item in self.approvals.list())
+                with self.lock:
+                    for item in summaries:
+                        job = self._jobs.get(item["session_id"])
+                        if job and job.get("events"):
+                            item["last_activity_at"] = job["events"][-1].get("timestamp")
+                        item.update(observed_state(item, live=job is not None, waiting=waiting))
+                        item["recovery"] = recovery_explanation(item)
+                return 200, {"project_root": self.project_root, "sessions": summaries, "truncated": self._session_summaries.truncated}
             if path == '/findings' or path.startswith('/findings/'):
                 if query:
                     raise ValueError('Findings routes accept no query parameters')
@@ -451,6 +468,9 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 session_id = parts[1]
                 if method == "GET" and len(parts) == 2:
                     record = self.sessions.get(session_id)
+                    if record:
+                        from local_coder.workspace_status import observed_state, selected_recovery
+                        record = {**record, **observed_state(record, live=session_id in self._jobs), "recovery": selected_recovery(record, self.project_root)}
                     return (200, record) if record else (404, {"error": "Task not found"})
                 if method == "POST" and len(parts) == 3 and parts[2] == "cancel":
                     with self.lock:

@@ -8,7 +8,7 @@ const args=process.argv.includes('--python')?['-m','local_coder.desktop_engine']
 for(const order of ['manager-first','ide-first','simultaneous']){
  const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'actual-engine-sharing-'));
  const manager=new Sidecar({command:executable,args,cwd:workspace,env:{...process.env,LOCAL_CODER_DESKTOP_PROJECT:workspace,LOCAL_CODER_REMOTE_TOKEN:'manager-test-token'},token:'manager-test-token'});
- const ide=new EngineConnection({workspace,executable,args});
+ let ide=new EngineConnection({workspace,executable,args});
  try{
   if(order==='manager-first'){await manager.start();await ide.start();}
   else if(order==='ide-first'){await ide.start();await manager.start();}
@@ -16,6 +16,14 @@ for(const order of ['manager-first','ide-first','simultaneous']){
   assert.equal(manager.origin,ide.url);assert.equal(manager.token,ide.token);
   assert.equal(Number(!!manager.child)+Number(!!ide.child),1);
   assert.equal((await ide.request('/status')).project_root,workspace);
+  if(order==='manager-first'){
+   await manager.stop();
+   await assert.rejects(()=>ide.request('/status'));
+   await ide.stop();ide=new EngineConnection({workspace,executable,args});await ide.start();
+   assert.ok(ide.child,'explicit reconnect takes authenticated engine ownership');
+   assert.equal((await ide.request('/status')).project_root,workspace);
+   console.log('owner-exit: explicit reconnect recovered one authenticated engine');
+  }
   if(manager.child){await ide.stop();assert.equal((await fetch(manager.origin+'/status',{headers:{Authorization:'Bearer '+manager.token}})).status,200);await manager.stop();}
   else{await manager.stop();assert.equal((await ide.request('/status')).project_root,workspace);await ide.stop();}
   console.log(order+': one authenticated engine; both clients connected; borrower shutdown preserved owner');

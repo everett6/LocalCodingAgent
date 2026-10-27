@@ -231,7 +231,31 @@ def compress_messages(messages: list[Message], max_chars: int,
             group = compacted
         selected.append(group)
         remaining -= sum(message_size(m) for m in group)
-    return preserved + [summary] + [m for group in reversed(selected) for m in group]
+    compacted = preserved + [summary] + [m for group in reversed(selected) for m in group]
+    if compaction_fidelity(messages, "\n".join(m.content for m in compacted))["passed"]:
+        return compacted
+    # A deterministic fallback must preserve the same explicit facts that gate
+    # model summaries. A budget too small for those facts cannot be compacted
+    # honestly: retain originals so admission/CompactionGuard can stop safely.
+    facts = []
+    for message in messages:
+        for line in message.content.splitlines():
+            if _DURABLE_LINE.match(line):
+                facts.append(line)
+        facts.extend(match.group() for match in _SOURCE_REFERENCE.finditer(message.content))
+    pin = Message(role="user", content="Preserved untrusted history facts; verify sources:\n" + "\n".join(dict.fromkeys(facts)))
+    fixed = preserved + [summary, pin]
+    remaining = max_chars - sum(message_size(m) for m in fixed)
+    if remaining < 0:
+        return messages
+    retained = []
+    for group in selected:
+        size = sum(message_size(m) for m in group)
+        if size > remaining:
+            break
+        retained.append(group)
+        remaining -= size
+    return fixed + [m for group in reversed(retained) for m in group]
 
 
 def _tool_call_signatures(messages: list[Message]) -> dict[str, str]:
@@ -372,6 +396,48 @@ async def summarize_history(
         max_tokens=max_summary_tokens,
     )
     summary = _strip_think(response.content or "")
-    if not summary:
+    if not summary or not compaction_fidelity(middle, summary)["passed"]:
         return None
     return head + [Message(role="user", content=SUMMARY_PREFIX + summary)] + messages[tail_start:], response
+
+
+class CompactionGuard:
+    """Stop repeated lossy/no-progress compaction; never relax admission bounds."""
+
+    def __init__(self, *, minimum_yield: float = .10):
+        self.minimum_yield = max(.01, min(float(minimum_yield), .5))
+        self.low_yield_count = 0
+
+    def observe(self, before: int, after: int) -> dict:
+        before, after = max(0, int(before)), max(0, int(after))
+        saved = max(0, before - after)
+        fraction = saved / before if before else 0.0
+        self.low_yield_count = self.low_yield_count + 1 if fraction < self.minimum_yield else 0
+        action = 'stop' if self.low_yield_count >= 3 else 'contract' if self.low_yield_count >= 2 else 'continue'
+        return {'action': action, 'saved_characters': saved, 'yield_fraction': fraction,
+                'low_yield_count': self.low_yield_count,
+                'working_set_factor': .5 if action == 'contract' else 1.,
+                'reason': 'Repeated low-yield compaction; narrow task/context or use a larger admitted window' if action == 'stop' else None}
+
+
+_DURABLE_LINE = re.compile(r'^\s*(?:[-*]\s*)?(constraint|decision|failure|next|source)\s*:\s*(.+)', re.I)
+_SOURCE_REFERENCE = re.compile(r'\b[\w./-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|md|json|toml|yaml|yml):\d+(?:-\d+)?\b')
+
+
+def compaction_fidelity(original: list[Message], summary: str) -> dict:
+    """Deterministic fidelity gate for explicit durable records and source anchors.
+
+    This checks literal facts, not an unverifiable semantic-equivalence claim.
+    Free prose should use task-state pins; explicit records get a strict gate.
+    """
+    required = []
+    for message in original:
+        for line in message.content.splitlines():
+            match = _DURABLE_LINE.match(line)
+            if match:
+                required.append((match.group(1).lower(), match.group(2).strip()))
+        required.extend(('source', match.group()) for match in _SOURCE_REFERENCE.finditer(message.content))
+    required = list(dict.fromkeys(required))
+    missing = [{'category': category, 'reason': 'explicit durable fact omitted'} for category, fact in required if fact not in summary]
+    return {'passed': not missing, 'required_facts': len(required), 'missing': missing[:64],
+            'omitted_diagnostics': max(0, len(missing) - 64), 'method': 'explicit-facts-and-source-anchors'}

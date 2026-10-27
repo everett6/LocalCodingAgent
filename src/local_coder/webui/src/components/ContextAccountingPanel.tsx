@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
+import { ContextDebugger } from './ContextDebugger'
 
 type Accounting = {
   availability: { installed: boolean }
@@ -50,6 +51,7 @@ export function ContextAccountingPanel({ disabled = false }: { disabled?: boolea
         </form>
       </details>
     </>}
+    <ContextDebugger />
     {error && <p role="alert" className="error-text">{error}</p>}
   </section>
 }

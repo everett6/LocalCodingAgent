@@ -9,6 +9,7 @@ Provides:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -102,6 +103,7 @@ class CodeIndexer:
         self.parsers: Dict[str, Parser] = {}
         self.index: Dict[str, Dict[str, Any]] = {}  # file_path -> indexed data
         self._file_timestamps: Dict[str, float] = {}
+        self._file_hashes: Dict[str, str] = {}
         
         # Initialize parsers and languages
         for lang_id in self.languages:
@@ -126,18 +128,22 @@ class CodeIndexer:
         Returns dict with symbols, imports, and language info.
         """
         path = Path(file_path)
-        if not path.is_file():
-            return {"error": f"File not found: {file_path}"}
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1048576:
+            self.index.pop(file_path, None)
+            self._file_hashes.pop(file_path, None)
+            self._file_timestamps.pop(file_path, None)
+            return {"error": f"File unavailable or exceeds local index size limit: {file_path}"}
         
         # Check if re-indexing is needed
         mtime = path.stat().st_mtime
-        if file_path in self._file_timestamps and self._file_timestamps[file_path] >= mtime:
-            # Already indexed and file hasn't changed
-            return self.index.get(file_path, {"error": "Not indexed"})
+        # Timestamps alone cannot detect same-stat edits or branch rewrites.
         
         # Read file content
         try:
             content = path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            if self._file_hashes.get(file_path) == digest and file_path in self.index:
+                return self.index[file_path]
         except Exception as e:
             return {"error": f"Failed to read file: {e}"}
         
@@ -150,6 +156,7 @@ class CodeIndexer:
             result = await asyncio.to_thread(self._parse_file, content, language_id, path)
             self.index[file_path] = result
             self._file_timestamps[file_path] = mtime
+            self._file_hashes[file_path] = digest
             return result
         except Exception as e:
             logger.error(f"Error indexing {file_path}: {e}")
@@ -458,8 +465,19 @@ class CodeIndexer:
         if not path.is_dir():
             return {"error": f"Directory not found: {directory}"}
         
-        # Find matching files
-        files = list(path.rglob(pattern))
+        # Remove deleted sources only within this requested directory/pattern.
+        for indexed in list(self.index):
+            candidate = Path(indexed)
+            if candidate.resolve().is_relative_to(path.resolve()) and candidate.match(pattern) and not candidate.is_file():
+                self.index.pop(indexed, None)
+                self._file_hashes.pop(indexed, None)
+                self._file_timestamps.pop(indexed, None)
+        # Bound discovery independently of parser work.
+        files = []
+        for candidate in path.rglob(pattern):
+            files.append(candidate)
+            if len(files) >= 5000:
+                break
         
         # Filter out excluded directories
         exclude_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", "dist", "build"}
@@ -469,7 +487,7 @@ class CodeIndexer:
             # Check if any parent dir is excluded
             excluded = False
             for part in f.parts:
-                if part in exclude_dirs:
+                if part in exclude_dirs or part.startswith('.env') or f.is_symlink():
                     excluded = True
                     break
             if not excluded:

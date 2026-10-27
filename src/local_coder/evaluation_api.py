@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from local_coder.core.budgets import BudgetedModel, BudgetExceeded
-from local_coder.harness.evaluation import EvaluationStore, _limits, catalog, make_model_evaluator, suite_hash, spending_admission as _spending_admission
+from local_coder.harness.evaluation import EvaluationStore, HeldoutEvaluationStore, _limits, catalog, heldout_catalog, make_heldout_evaluator, make_model_evaluator, suite_hash, spending_admission as _spending_admission
 from local_coder.models.router import resolve_model_name
 from local_coder.providers.quota import ProviderQuotaExhausted
 from local_coder.types import AgentEvent, AgentMode, AgentRole
@@ -55,7 +55,8 @@ class EvaluationAPI:
             raise ValueError('Evaluation routes accept no query parameters')
         if path == '/evaluations':
             settings = self.harness_settings() if hasattr(self, 'harness_settings') else None
-            return True, {'catalog': catalog(), 'history': list(reversed(self._evaluation_store().history())),
+            return True, {'catalog': catalog(), 'release_holdout': heldout_catalog(),
+                          'release_holdout_history': list(reversed(HeldoutEvaluationStore(self._evaluation_store().root).history())), 'history': list(reversed(self._evaluation_store().history())),
                           'project_remediation': self._remediation_measurements(),
                           'model_evaluation': {'max_cost_usd': getattr(settings, 'max_cost_usd', None),
                            'spending_rule': 'Cloud, metered and unknown-cost models require a positive harness dollar cap; no automatic provider fallback.'}}
@@ -91,17 +92,24 @@ class EvaluationAPI:
                     if loop and task and not loop.is_closed():
                         loop.call_soon_threadsafe(task.cancel)
                 return True, copy.deepcopy(row)
-        if path not in {'/evaluations/run', '/evaluations/model/run'}:
+        if path not in {'/evaluations/run', '/evaluations/model/run', '/evaluations/heldout/run'}:
             return False, None
-        allowed = {'suite_hash', 'max_cases', 'timeout_seconds'} | ({'confirm_model_calls'} if path == '/evaluations/model/run' else set())
+        allowed = {'suite_hash', 'max_cases', 'timeout_seconds'} | ({'confirm_model_calls'} if path != '/evaluations/run' else set())
         if not isinstance(body, dict) or set(body) - allowed:
             raise ValueError('Only fixed-suite limits and explicit model confirmation are accepted')
         if path == '/evaluations/run':
             return True, self._evaluation_store().run(expected_suite_hash=body.get('suite_hash'), max_cases=body.get('max_cases', 20), timeout_seconds=body.get('timeout_seconds', 10))
-        if body.get('suite_hash') != suite_hash() or body.get('confirm_model_calls') is not True:
+        holdout = path == '/evaluations/heldout/run'
+        expected = heldout_catalog()['suite_hash'] if holdout else suite_hash()
+        if body.get('suite_hash') != expected or body.get('confirm_model_calls') is not True:
             raise ValueError('Confirm model calls and supply the displayed suite hash')
-        _limits(body.get('max_cases', 20), body.get('timeout_seconds', 60))
-        return True, self._start_evaluation_job(dict(body))
+        if holdout:
+            count, timeout = body.get('max_cases', 20), body.get('timeout_seconds', 60)
+            if type(count) is not int or not len(heldout_catalog()['cases']) <= count <= 100 or type(timeout) is not int or not 1 <= timeout <= 60:
+                raise ValueError('Held-out evaluation requires bounded case and timeout limits')
+        else:
+            _limits(body.get('max_cases', 20), body.get('timeout_seconds', 60))
+        return True, self._start_evaluation_job({**body, 'heldout': holdout})
 
     def _start_evaluation_job(self, options):
         if not self._job_lock.acquire(blocking=False):
@@ -119,7 +127,7 @@ class EvaluationAPI:
                     del rows[expired]
                 rows[job_id] = row
                 self._jobs[job_id] = job
-            self.sessions.save(job_id, request='Evaluate configured security model against fixed suite', mode=AgentMode.CYBERSECURITY.value, phase='model_evaluation', status='queued')
+            self.sessions.save(job_id, request=('Evaluate configured model against held-out local coding/security/bug suite' if options.get('heldout') else 'Evaluate configured security model against fixed suite'), mode=AgentMode.CYBERSECURITY.value, phase='model_evaluation', status='queued')
             thread = threading.Thread(target=self._evaluation_job_thread, args=(job_id, job, options), daemon=True)
             with self.lock:
                 if self._stopping:
@@ -160,15 +168,22 @@ class EvaluationAPI:
                 model = await manager.get_model(AgentRole.SECURITY, selected)
                 while isinstance(model, BudgetedModel):
                     model = model.model
-                evaluator = make_model_evaluator(lambda overlay: model, ledger=coordinator.budget,
-                    quota_guard=getattr(manager, 'quota_guard', None), expected_suite_hash=options['suite_hash'],
-                    max_cases=options.get('max_cases', 20), timeout_seconds=options.get('timeout_seconds', 60), require_usage=False)
-                measured = await evaluator({})
+                if options.get('heldout'):
+                    evaluator = make_heldout_evaluator(lambda overlay: model, ledger=coordinator.budget,
+                        quota_guard=getattr(manager, 'quota_guard', None), expected_suite_hash=options['suite_hash'],
+                        timeout_seconds=options.get('timeout_seconds', 60))
+                    measured = {'report': await evaluator({})}
+                else:
+                    evaluator = make_model_evaluator(lambda overlay: model, ledger=coordinator.budget,
+                        quota_guard=getattr(manager, 'quota_guard', None), expected_suite_hash=options['suite_hash'],
+                        max_cases=options.get('max_cases', 20), timeout_seconds=options.get('timeout_seconds', 60), require_usage=False)
+                    measured = await evaluator({})
                 if job['cancel'].is_set():
                     raise asyncio.CancelledError()
                 measured['report']['model'] = {'name': selected, 'model_id': str(config.model_id),
                                                 'backend': str(getattr(config.backend, 'value', config.backend))}
-                result = self._evaluation_store().record_model(measured['report'])
+                store = HeldoutEvaluationStore(self._evaluation_store().root) if options.get('heldout') else self._evaluation_store()
+                result = store.record_model(measured['report'])
                 status = 'completed'
             except asyncio.CancelledError:
                 status, error = 'cancelled', 'Model evaluation cancelled; no completed report was recorded'

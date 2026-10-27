@@ -142,6 +142,12 @@ class RemoteControlServer(WorkbenchAPI):
                 job["events"] = job["events"][-600:]
                 if event.event_type == "checkpoint_saved":
                     job["checkpoint"] = event.data.get("path")
+                if event.event_type == "verification_result" and event.source == "ORCHESTRATOR":
+                    data = event.data
+                    if (type(data.get("passed")) is bool and isinstance(data.get("command"), str)
+                            and 0 < len(data["command"]) <= 1000):
+                        job["verification"] = {"passed": data["passed"], "command": self._redact(data["command"]),
+                                               "recorded_at": event.timestamp.isoformat()}
             self.events.append(payload)
         if job is not None and event.event_type == "checkpoint_saved":
             # Make Resume available even when the process dies before the job finalizer.

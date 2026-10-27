@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -74,6 +75,10 @@ def _search_evidence(payload: dict, limit: int) -> dict:
                         if len(url) <= 2048:
                             bounded = {key: text[:cap] for (key, text), cap in zip(fields.items(), (160, 2048, 500))}
                             truncated |= bounded != fields
+                            version = value.get("document_version", value.get("version"))
+                            if isinstance(version, str) and version:
+                                bounded["document_version"] = version[:100]
+                                truncated |= len(version) > 100
                             results.append(bounded)
                         else:
                             truncated = True
@@ -107,6 +112,74 @@ def _search_evidence(payload: dict, limit: int) -> dict:
         data["text"] = "\n".join(texts)[:5000]
         data["truncated"] |= len("\n".join(texts)) > 5000
     return data
+
+
+def _search_contract(catalog: list[dict], query: str, max_results: int) -> tuple[str, dict]:
+    choice = None
+    for tool_name in SEARCH_TOOLS:
+        item = next((item for item in catalog if item.get("name") == tool_name), None)
+        if item is None:
+            continue
+        schema = item.get("inputSchema", {})
+        if not isinstance(schema, dict) or not _bounded_schema(schema):
+            continue
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            continue
+        key = next((key for key in ("query", "q", "searchQuery") if key in properties), None)
+        if key is None:
+            continue
+        arguments = {key: query.strip()}
+        count = next((key for key in ("max_results", "limit", "count") if key in properties), None)
+        if count:
+            arguments[count] = max_results
+        # Unknown required fields are never fabricated or populated with files.
+        try:
+            Draft202012Validator.check_schema(schema)
+            valid = Draft202012Validator(schema, registry=Registry()).is_valid(arguments)
+        except (SchemaError, Unresolvable):
+            continue
+        if not valid:
+            continue
+        choice = tool_name, arguments
+        break
+    if choice is None:
+        raise ValueError("Server has no supported web-search contract; expected brave_web_search, tavily_search, firecrawl_search or web_search with query/q/searchQuery")
+    return choice
+
+
+async def search_connection_doctor(manager: MCPManager, *, server: str | None = None,
+                                   probe: bool = False) -> dict:
+    """Local configuration checks; only an explicit probe lists remote tools."""
+    configured = manager.status()["servers"]
+    if server is not None and server not in configured:
+        raise ValueError("Choose an exact configured MCP server name")
+    if probe and server is None:
+        raise ValueError("Choose one server for an explicit connection check")
+    reports = {}
+    for name, config in configured.items():
+        if server is not None and name != server:
+            continue
+        report = {"state": "unverified", "message": "Configuration enabled. Select Check search connection to discover a supported tool; no search query will be sent."}
+        if config.get("enabled") is not True:
+            report = {"state": "disabled", "message": "Enable this connection in Connections after reviewing its configuration."}
+        elif config.get("credentials_available") is False:
+            report = {"state": "missing_credentials", "message": "Set the configured credential environment variables, then restart the engine. Do not paste secrets into search queries."}
+        elif probe:
+            try:
+                catalog = await manager.list_tools(name)
+                tool, _ = _search_contract(catalog, "public documentation reference", 3)
+                metadata = next(item for item in catalog if item.get("name") == tool)
+                report = {"state": "ready", "tool": tool,
+                          "requires_approval": metadata.get("requires_approval", tool not in config.get("read_only_tools", [])),
+                          "message": "Connection and search contract checked. Search execution and results remain unverified; existing MCP approvals apply."}
+            except MCPError as exc:
+                report = {"state": "connection_failed", "message": str(exc) + ". Review the connection URL/command, environment and access permissions, then retry."}
+            except ValueError:
+                report = {"state": "unsupported", "message": "No supported search contract. Configure a server exposing brave_web_search, tavily_search, firecrawl_search or web_search with query/q/searchQuery and satisfiable required fields."}
+        reports[name] = report
+    return {"servers": reports, "external_query_sent": False,
+            "message": "Configure an MCP search server in Connections." if not reports else "Checks do not execute a search or enable services."}
 
 
 class WebSearchTool(Tool):
@@ -150,49 +223,40 @@ class WebSearchTool(Tool):
                     raise ValueError("Configure and enable an MCP search server; pass server explicitly when multiple servers are available")
                 server = candidates[0]
             catalog = await self.manager.list_tools(server)
-            choice = None
-            for tool_name in SEARCH_TOOLS:
-                item = next((item for item in catalog if item.get("name") == tool_name), None)
-                if item is None:
-                    continue
-                schema = item.get("inputSchema", {})
-                if not isinstance(schema, dict) or not _bounded_schema(schema):
-                    continue
-                properties = schema.get("properties", {})
-                if not isinstance(properties, dict):
-                    continue
-                key = next((key for key in ("query", "q", "searchQuery") if key in properties), None)
-                if key is None:
-                    continue
-                arguments = {key: query.strip()}
-                count = next((key for key in ("max_results", "limit", "count") if key in properties), None)
-                if count:
-                    arguments[count] = max_results
-                # Unknown required fields are never fabricated or populated with files.
-                try:
-                    Draft202012Validator.check_schema(schema)
-                    valid = Draft202012Validator(schema, registry=Registry()).is_valid(arguments)
-                except (SchemaError, Unresolvable):
-                    continue
-                if not valid:
-                    continue
-                choice = tool_name, arguments
-                break
-            if choice is None:
-                raise ValueError("Server has no supported web-search contract; expected brave_web_search, tavily_search, firecrawl_search or web_search with query/q/searchQuery")
-            tool_name, arguments = choice
+            tool_name, arguments = _search_contract(catalog, query, max_results)
             payload = await self.manager.call_tool(server, tool_name, arguments)
             if not isinstance(payload, dict) or payload.get("isError"):
                 raise ValueError("MCP search failed; no search results were verified")
             data = {**_search_evidence(payload, max_results), "server": server, "tool": tool_name}
-            while len(json.dumps(data, ensure_ascii=False)) > MAX_OUTPUT:
+            metadata = next(item for item in catalog if item.get("name") == tool_name)
+            version = metadata.get("version")
+            provenance = {"retrieved_at": datetime.now(UTC).isoformat(), "provider": server,
+                          "tool": tool_name, "tool_version": version[:100] if isinstance(version, str) else None,
+                          "document_version": None, "citation_urls": [item["url"] for item in data["results"]],
+                          "document_versions": [item.get("document_version") for item in data["results"]]}
+            data["provenance"] = provenance
+            while len(json.dumps(data, ensure_ascii=False)) > MAX_OUTPUT - 256:
                 data["truncated"] = True
                 if "text" in data:
                     data["text"] = data["text"][:len(data["text"]) // 2]
                 elif len(data["results"]) > 1:
                     data["results"].pop()
+                    provenance["citation_urls"] = [item["url"] for item in data["results"]]
+                    provenance["document_versions"] = [item.get("document_version") for item in data["results"]]
                 else:
                     raise ValueError("Search evidence exceeds the response budget")
+            # A citation that was trimmed from the output must not remain an attributed result.
+            provenance["citation_urls"] = [item["url"] for item in data["results"]]
+            root = getattr(self.manager, "project_root", None)
+            if root is not None:
+                from local_coder.security_reports import EvidenceStore
+                try:
+                    EvidenceStore(root).append("research_search", {"provenance": provenance,
+                                                                  "status": data["status"], "untrusted": True})
+                    data["provenance_recorded"] = True
+                except (OSError, ValueError):
+                    data["provenance_recorded"] = False
+                    data["provenance_error"] = "Search completed, but citation history could not be saved locally."
             return ToolResult(success=True, output=json.dumps(data, ensure_ascii=False), data=data)
         except (MCPError, ValueError, TypeError, KeyError, RecursionError) as exc:
             # MCPError strings are authored locally; provider bodies stay out of diagnostics.

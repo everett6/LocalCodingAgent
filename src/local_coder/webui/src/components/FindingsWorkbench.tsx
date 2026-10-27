@@ -22,6 +22,7 @@ export function FindingsWorkbench() {
   const [busy, setBusy] = useState(false)
   const [reason, setReason] = useState('')
   const [phase, setPhase] = useState('before')
+  const [controls, setControls] = useState(''), [requireControls, setRequireControls] = useState(true)
   const [testPath, setTestPath] = useState('tests/security_poc/')
   const [image, setImage] = useState('')
   const [backend, setBackend] = useState('docker')
@@ -65,7 +66,7 @@ export function FindingsWorkbench() {
   }
   async function verify(event: FormEvent) {
     event.preventDefault()
-    await act('verify', { phase, test_path: testPath, image, backend, timeout })
+    await act('verify', { phase, test_path: testPath, image, backend, timeout, negative_control_ids: controls.split('\n').map(value => value.trim()).filter(Boolean), require_negative_controls: requireControls })
   }
   async function cancelJob() {
     if (!job) return
@@ -99,6 +100,9 @@ export function FindingsWorkbench() {
       <form onSubmit={event => void verify(event)}>
         <label>Phase <select value={phase} onChange={event => setPhase(event.target.value)}><option value="before">Before fix</option><option value="after">After fix</option></select></label>
         <label>Test path <input required value={testPath} onChange={event => setTestPath(event.target.value)} /></label>
+        <label>Negative-control pytest node IDs (one per line)<textarea value={controls} onChange={event => setControls(event.target.value)} placeholder="tests/security_poc/test_case.py::test_safe_neighbor" /></label>
+        <label><input type="checkbox" checked={requireControls} onChange={event => setRequireControls(event.target.checked)} />Require passing negative controls</label>
+        <p className="hint">Negative controls check neighboring safe behavior. Verification remains unproven when required controls are absent or fail.</p>
         <label>Installed trusted image <input required maxLength={512} value={image} onChange={event => setImage(event.target.value)} /></label>
         <label>Container backend <select value={backend} onChange={event => setBackend(event.target.value)}><option>docker</option><option>podman</option></select></label>
         <label>Timeout (seconds) <input type="number" required min={1} max={600} value={timeout} onChange={event => setTimeoutSeconds(Number(event.target.value))} /></label>

@@ -223,6 +223,7 @@ class HarnessAPI:
         return LanguageService(self._harness_root, **self.language_settings())
 
     def _harness_status(self):
+        from local_coder.release_readiness import readiness_report
         settings = self.harness_settings()
         ledger = getattr(self, "current_budget", None)
         budget = ledger.status() if ledger is not None else None
@@ -242,6 +243,7 @@ class HarnessAPI:
             "sandbox": sandbox.status(),
             "evolution": _clean(EvolutionStore(self._harness_root).history()[-100:]),
             "language": self._language_service().status(),
+            "readiness": readiness_report(self._harness_root),
         }
 
     def _harness_get(self, path, query):
@@ -266,6 +268,10 @@ class HarnessAPI:
             }
         if path == "/integrations/mcp":
             return MCPManager(self._harness_root).status()
+        if path == "/integrations/search/doctor":
+            _object(query, set())
+            from local_coder.tools.web_search import search_connection_doctor
+            return asyncio.run(search_connection_doctor(MCPManager(self._harness_root)))
         if path == "/integrations/skills":
             return {"skills": self._skill_library.list()}
         parts = [unquote(part) for part in path.strip("/").split("/")]
@@ -400,6 +406,20 @@ class HarnessAPI:
 
             with self._harness_idle():
                 return asyncio.run(probe())
+        if path == "/integrations/search/doctor":
+            _object(body, {"server"})
+            server = _text(body.get("server"), maximum=100)
+            from local_coder.tools.web_search import search_connection_doctor
+
+            async def doctor():
+                manager = MCPManager(self._harness_root, approval_callback=self.approvals.request)
+                try:
+                    return await search_connection_doctor(manager, server=server, probe=True)
+                finally:
+                    await manager.close()
+
+            with self._harness_idle():
+                return asyncio.run(doctor())
         if path == "/integrations/skills/save":
             _object(body, {"skill", "title", "content", "description"})
             return self._skill_library.save(

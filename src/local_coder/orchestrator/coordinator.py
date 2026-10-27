@@ -4,6 +4,8 @@ import os
 import json
 import re
 import uuid
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -33,6 +35,11 @@ from local_coder.verification.failures import summarize_failures
 from local_coder.verification.test_runner import detect_framework
 from local_coder.providers.quota import ProviderQuotaExhausted
 from local_coder.orchestrator.blocked import AgentBlocked
+
+
+_planned_simple: ContextVar[AgentTask | None] = ContextVar("planned_simple", default=None)
+_parallel_scope: ContextVar[tuple[str, ...] | None] = ContextVar("parallel_scope", default=None)
+_request_owner: ContextVar[str | None] = ContextVar("coordinator_request", default=None)
 
 
 class RunCheckpoint(Protocol):
@@ -116,6 +123,7 @@ class Coordinator:
         # draft prompt (e.g. the same file across a fix-loop retry) can hit
         # the cache instead of paying for another small-model round trip.
         self._prompt_cache = PromptCache()
+        self._owned_children: dict[str, set[asyncio.Task]] = {}
 
     async def _evaluate_harness_profile(self, overlay):
         """Measure the selected security model's instruction profile, not a coding workflow.
@@ -168,7 +176,9 @@ class Coordinator:
         if not self.tool_registry._permissions[child].issubset(self.tool_registry._permissions[parent]):
             raise ValueError("Child capabilities exceed parent capabilities")
         workspace = Workspace(self.project_root)
-        roots = [workspace.resolve(path) for path in current.get("files", [])]
+        inherited_scope = current.get("write_scope")
+        roots = [workspace.resolve(path) for path in
+                 (inherited_scope if inherited_scope is not None else current.get("files", []))]
         files = request.get("files") or list(current.get("files", []))
         for path in files:
             target = workspace.resolve(path)
@@ -178,13 +188,35 @@ class Coordinator:
                              context_window_chars=self.config.agentic.context_window_chars,
                              compact_context_chars=self.config.agentic.compact_context_chars)
         agent.delegation_depth = 1
+        agent.host_write_scope = (() if inherited_scope is not None and not inherited_scope else
+                                  tuple(str(workspace.resolve(path)) for path in files) or (str(workspace.root),))
+        agent.host_parallel_worker = current.get("parallel_worker") is True
+        inherited_constraints = [str(value)[:1000] for value in current.get("constraints", [])[:20]]
+        expected = "Return a concise summary, changed/artifact paths, actual checks and unresolved acceptance criteria. Model assertions are not verification."
         task = AgentTask(role=child, objective=request["objective"], files=files,
-                         constraints=["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate."])
-        self._emit("ORCHESTRATOR", "subagent_started", f"Started scoped {child.value} leaf task", data={"task_id": task.task_id, "parent_task_id": current["task_id"]})
-        response = await asyncio.wait_for(agent.execute(task), timeout=task.timeout_seconds)
+                         constraints=inherited_constraints + ["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate.", expected],
+                         success_criteria=[str(value)[:1000] for value in current.get("success_criteria", [])[:20]])
+        self._emit("ORCHESTRATOR", "subagent_started", f"Started scoped {child.value} leaf task", data={
+            "task_id": task.task_id, "parent_task_id": current["task_id"], "objective": task.objective,
+            "files": files, "timeout_seconds": task.timeout_seconds,
+            "completion_contract": expected, "shared_budget": True, "context_characters": len(task.objective)})
+        owner = _request_owner.get() or current["task_id"]
+        pending = self._owned_children.setdefault(owner, set())
+        execution = asyncio.create_task(agent.execute(task))
+        pending.add(execution)
+        try:
+            response = await asyncio.wait_for(execution, timeout=task.timeout_seconds)
+        finally:
+            pending.discard(execution)
+            if not pending:
+                self._owned_children.pop(owner, None)
         self._raise_if_blocked(response)
-        self._emit("ORCHESTRATOR", "subagent_finished", f"Leaf task {response.status.value}", data={"task_id": task.task_id})
-        return {"success": response.status == TaskStatus.COMPLETED, "output": response.summary}
+        self._emit("ORCHESTRATOR", "subagent_finished", f"Leaf task {response.status.value}", data={
+            "task_id": task.task_id, "parent_task_id": current["task_id"],
+            "usage": response.metrics.model_dump(mode="json"), "artifact_paths": response.files_changed[:100],
+            "observed_checks": response.tests_run[:100], "useful_artifact": None,
+            "duplicated_context_characters": None})
+        return {"success": response.status == TaskStatus.COMPLETED and response.tests_passed, "output": response.summary}
 
     def _model_name_for(self, model) -> str | None:
         """Capture the resolved config key instead of rerouting roles on restart."""
@@ -328,6 +360,23 @@ class Coordinator:
         self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",
         *, target_path: str = ".", fix: bool = False, engagement_id: str | None = None,
     ) -> str:
+        owner = uuid.uuid4().hex
+        token = _request_owner.set(owner)
+        try:
+            return await self._run_request(request, checkpoint, history,
+                target_path=target_path, fix=fix, engagement_id=engagement_id)
+        finally:
+            children = self._owned_children.pop(owner, set())
+            for child in children:
+                child.cancel()
+            if children:
+                await asyncio.gather(*children, return_exceptions=True)
+            _request_owner.reset(token)
+
+    async def _run_request(
+        self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",
+        *, target_path: str = ".", fix: bool = False, engagement_id: str | None = None,
+    ) -> str:
         """Execute a request, reusing saved phases and earlier session history.
 
         Investigation modes use the same runtime and scoped engagement binding;
@@ -447,7 +496,8 @@ class Coordinator:
         if len(plan.tasks) <= 1:
             self._emit("ORCHESTRATOR", "phase", "Executing simple task...")
             result = await self._resumable(
-                checkpoint, "execute", lambda: self._execute_simple(objective, exploration, task_id=plan.tasks[0].task_id if plan.tasks else None), AgentResponse,
+                checkpoint, "execute", lambda: self._execute_planned_simple(plan.tasks[0], objective, exploration)
+                if plan.tasks else self._execute_simple(objective, exploration), AgentResponse,
             )
         else:
             self._emit("ORCHESTRATOR", "phase", "Executing complex task plan...")
@@ -652,15 +702,29 @@ class Coordinator:
         )
         return TaskPlan(plan_id="plan_fallback", objective=request, tasks=[task], notes=[])
 
+    async def _execute_planned_simple(self, task: AgentTask, request: str, exploration: str) -> AgentResponse:
+        """Carry the entire host-selected plan through the compatible entrypoint."""
+        if task.depends_on:
+            return AgentResponse(task_id=task.task_id, status=TaskStatus.FAILED,
+                summary="Single-task plan contains unresolved dependencies", tests_passed=False,
+                issues=list(task.depends_on), follow_up_required=True)
+        token = _planned_simple.set(task.model_copy(deep=True))
+        try:
+            return await self._execute_simple(request, exploration, task_id=task.task_id)
+        finally:
+            _planned_simple.reset(token)
+
     async def _execute_simple(self, request: str, exploration: str, task_id: str | None = None) -> AgentResponse:
+        planned = _planned_simple.get()
+        role = planned.role if planned is not None else AgentRole.CODER
         coder = create_agent(
-            AgentRole.CODER,
-            await self.model_manager.get_model(AgentRole.CODER),
+            role,
+            await self._model_for(role, planned.model_name if planned is not None else None),
             self.tool_registry,
             self._dispatch,
             context_window_chars=self.config.agentic.context_window_chars,
             compact_context_chars=self.config.agentic.compact_context_chars,
-            drafter=await self._get_drafter(),
+            drafter=await self._get_drafter() if role in (AgentRole.CODER, AgentRole.DEBUGGER) else None,
         )
         if coder:
             kwargs = {"task_id": task_id} if task_id else {}
@@ -670,20 +734,25 @@ class Coordinator:
                 context=TaskContext(architecture=await self._repo_map(request)),
                 **kwargs,
             )
+            if planned is not None:
+                task = planned.model_copy(deep=True)
+                task.context.previous_findings.append(exploration)
+                if not task.context.architecture:
+                    task.context.architecture = await self._repo_map(task.objective, task.files)
             self._emit_task_status(task.task_id, "running")
             response = await coder.execute(task)
             self._raise_if_blocked(response)
             self._emit_task_status(task.task_id, "failed" if response.status == TaskStatus.FAILED else "completed", response.summary[:200])
             return response
         return AgentResponse(
-            task_id="simple_task",
-            status=TaskStatus.COMPLETED,
-            summary="Fallback simple execution.",
+            task_id=task_id or "simple_task",
+            status=TaskStatus.FAILED,
+            summary="No agent is available to execute this task.",
             files_changed=[],
             tests_run=[],
-            tests_passed=True,
-            issues=[],
-            follow_up_required=False
+            tests_passed=False,
+            issues=["Task was not executed"],
+            follow_up_required=True
         )
 
     async def _execute_plan(self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None) -> AgentResponse:
@@ -741,8 +810,11 @@ class Coordinator:
             for task in ready_tasks:
                 dag.mark_running(task.task_id)
                 self._emit_task_status(task.task_id, "running")
-            semaphore = asyncio.Semaphore(self._parallelism_for_wave(ready_tasks))
-            running = [asyncio.create_task(self._run_dag_task(dag, task, semaphore, checkpoint)) for task in ready_tasks]
+            parallelism = self._parallelism_for_wave(ready_tasks)
+            semaphore = asyncio.Semaphore(parallelism)
+            running = [asyncio.create_task(self._run_scoped_dag_task(
+                dag, task, semaphore, checkpoint, parallelism > 1 and len(ready_tasks) > 1,
+            )) for task in ready_tasks]
             try:
                 await asyncio.gather(*running)
             except BaseException:
@@ -786,6 +858,15 @@ class Coordinator:
                 return 1
             seen.update(file_scope)
         return configured
+
+    async def _run_scoped_dag_task(self, dag, task, semaphore, checkpoint, parallel: bool):
+        from local_coder.workspace import Workspace
+        scope = tuple(str(Workspace(self.project_root).resolve(path)) for path in task.files) if parallel else None
+        token = _parallel_scope.set(scope)
+        try:
+            return await self._run_dag_task(dag, task, semaphore, checkpoint)
+        finally:
+            _parallel_scope.reset(token)
 
     async def _run_dag_task(
         self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore,
@@ -859,18 +940,20 @@ class Coordinator:
                 drafter=drafter,
             )
             if agent:
+                agent.host_write_scope = _parallel_scope.get()
+                agent.host_parallel_worker = agent.host_write_scope is not None
                 if not task.context.architecture:
                     task.context.architecture = await self._repo_map(task.objective, task.files)
                 return await agent.execute(task)
             return AgentResponse(
                 task_id=task.task_id,
-                status=TaskStatus.COMPLETED,
-                summary=f"Executed {task.task_id}",
+                status=TaskStatus.FAILED,
+                summary=f"No agent is available to execute {task.task_id}",
                 files_changed=[],
                 tests_run=[],
-                tests_passed=True,
-                issues=[],
-                follow_up_required=False
+                tests_passed=False,
+                issues=["Task was not executed"],
+                follow_up_required=True
             )
         except (ProviderQuotaExhausted, AgentBlocked):
             raise
@@ -903,6 +986,10 @@ class Coordinator:
         if detect_framework(self.project_root) is not None:
             self._emit("ORCHESTRATOR", "tool_call", "Running project tests directly")
             result = await self.tool_registry.execute_tool(AgentRole.TESTER, "run_tests", {})
+            self._emit("ORCHESTRATOR", "verification_result", "Project verification finished",
+                task_id="test_run", data={"passed": result.success, "command": "run_tests({})",
+                    "tool": "run_tests", "arguments": {}, "source": "tool_result",
+                    "recorded_at": datetime.now(timezone.utc).isoformat()})
             return AgentResponse(
                 task_id="test_run",
                 status=TaskStatus.COMPLETED if result.success else TaskStatus.FAILED,
@@ -918,16 +1005,20 @@ class Coordinator:
             task = AgentTask(role=AgentRole.TESTER, objective="Run project tests")
             response = await tester.execute(task)
             self._raise_if_blocked(response)
+            if not response.tests_run:
+                return response.model_copy(update={"status": TaskStatus.FAILED, "tests_passed": False,
+                    "summary": response.summary + "\nNo observed verification checks were recorded.",
+                    "follow_up_required": True})
             return response
         return AgentResponse(
             task_id="test_run",
-            status=TaskStatus.COMPLETED,
-            summary="Fallback: tests passed.",
+            status=TaskStatus.FAILED,
+            summary="No test framework or tester is available; verification remains unresolved.",
             files_changed=[],
-            tests_run=["fallback_test"],
-            tests_passed=True,
-            issues=[],
-            follow_up_required=False
+            tests_run=[],
+            tests_passed=False,
+            issues=["No observed verification checks"],
+            follow_up_required=True
         )
         
     async def _fix_failures(self, test_result: AgentResponse, escalate: bool = False) -> AgentResponse:

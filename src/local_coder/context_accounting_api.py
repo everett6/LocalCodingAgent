@@ -31,6 +31,18 @@ class ContextAccountingAPI:
         return self._context_token_counter
 
     def _context_accounting_get(self, path, query):
+        if path == "/context/debugger":
+            from local_coder.context.telemetry import ContextTelemetry
+            from local_coder.memory.context_store import ContextMemory
+            if not isinstance(query, dict) or set(query) - {"task_id", "limit"}:
+                raise ValueError("Unsupported context debugger query")
+            def single(key, default):
+                value = query.get(key, default)
+                return value[0] if isinstance(value, list) and len(value) == 1 else value
+            limit = int(single("limit", 20))
+            result = ContextTelemetry(self._harness_root).inspect(task_id=single("task_id", None), limit=limit)
+            result["retrievals"] = ContextMemory(self._harness_root).retrievals(limit=limit)
+            return result
         if path != "/context/accounting":
             return None
         if not isinstance(query, dict) or query:

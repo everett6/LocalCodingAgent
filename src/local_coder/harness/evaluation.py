@@ -216,6 +216,9 @@ def make_model_evaluator(model_factory, *, ledger, quota_guard=None, expected_su
                   "missing_metrics": ([] if known_usage else ["total_tokens"]) + ([] if known_cost else ["cost_usd"])}
         if render_profile:
             report["benchmark"] = "instruction_profile_fixed_suite"
+            report["purpose"] = "profile_regression"
+            # This adapter exposes no tools: tool failures are observed zero.
+            report["observed"].update(tool_failures=0, response_errors=0)
             report["limitation"] = "Narrow model-family instruction-profile benchmark on fixed Python fixtures; this does not measure complete coding workflows or establish safety."
         if not known_usage and require_usage:
             raise ValueError("Model usage unavailable; paired improvement requires observed tokens")
@@ -325,3 +328,179 @@ class EvaluationStore:
             finally:
                 temporary.unlink(missing_ok=True)
             return report
+
+
+# Release holdout is deliberately outside CASES and the adaptation adapter.
+# Frozen public synthetic fixtures are a regression holdout, not a private test
+# dataset or evidence that a model has never seen these examples during training.
+HOLDOUT_VERSION = 'local-workflow-holdout-v1'
+_HOLDOUT = (
+    {'id': 'coding-normalize', 'domain': 'coding', 'control': False,
+     'source': 'def normalize_name(value):\n    return value\n',
+     'task': 'Implement normalize_name by stripping outer whitespace then lowercasing. Return a JSON object with source.',
+     'expected': 'def normalize_name(value):\n    return value.strip().lower()\n'},
+    {'id': 'coding-normalize-control', 'domain': 'coding', 'control': True,
+     'source': 'def normalize_name(value):\n    return value.strip().lower()\n',
+     'task': 'Keep this already correct normalize_name function unchanged. Return a JSON object with source.',
+     'expected': 'def normalize_name(value):\n    return value.strip().lower()\n'},
+    {'id': 'bug-clamp', 'domain': 'bug', 'control': False,
+     'source': 'def clamp(value, low, high):\n    return max(min(value, low), high)\n',
+     'task': 'Fix clamp so values below low return low, values above high return high, and values in range are preserved (low <= high). Return a JSON object with source.',
+     'expected': 'def clamp(value, low, high):\n    return min(max(value, low), high)\n'},
+    {'id': 'bug-clamp-control', 'domain': 'bug', 'control': True,
+     'source': 'def clamp(value, low, high):\n    return min(max(value, low), high)\n',
+     'task': 'Keep this already correct clamp function unchanged. Return a JSON object with source.',
+     'expected': 'def clamp(value, low, high):\n    return min(max(value, low), high)\n'},
+    {'id': 'security-yaml-loader', 'domain': 'security', 'control': False,
+     'source': 'import yaml\ndef read_settings(user_text):\n    return yaml.load(user_text, Loader=yaml.Loader)\n',
+     'task': 'Inspect untrusted YAML parsing without execution. Return a JSON object with findings: ["unsafe_yaml"] if it uses a loader permitting Python object construction, otherwise [].',
+     'expected': ['unsafe_yaml']},
+    {'id': 'security-yaml-control', 'domain': 'security', 'control': True,
+     'source': 'import yaml\ndef read_settings(user_text):\n    return yaml.safe_load(user_text)\n',
+     'task': 'Inspect untrusted YAML parsing without execution. Return a JSON object with findings: ["unsafe_yaml"] if it uses a loader permitting Python object construction, otherwise [].',
+     'expected': []},
+)
+
+
+def heldout_catalog() -> dict:
+    """Metadata only; adaptation paths never retrieve held-out sources/answers."""
+    payload = json.dumps({'version': HOLDOUT_VERSION, 'cases': _HOLDOUT}, sort_keys=True, separators=(',', ':'))
+    return {'version': HOLDOUT_VERSION, 'suite_hash': hashlib.sha256(payload.encode()).hexdigest(),
+            'purpose': 'release_holdout', 'quality_claim': 'unverified_without_model_runs',
+            'cases': [{key: case[key] for key in ('id', 'domain', 'control')} for case in _HOLDOUT],
+            'limitation': 'Public synthetic local regression holdout, excluded from automatic adaptation; AST-equivalent patch checks only. No private training-contamination guarantee or general coding/security quality claim.'}
+
+
+def make_heldout_evaluator(model_factory, *, ledger, quota_guard=None,
+                           expected_suite_hash: str | None = None, timeout_seconds: int = 30):
+    """Host-only release runner. Never execute or import model-authored patches.
+
+    The host must admit spending before constructing backends. Admission is
+    checked again before requests. The shared ledger and quota guard cover every call; model text cannot supply telemetry.
+    This runner cannot validate EvolutionStore candidates through improvement_cycle.
+    """
+    if not callable(model_factory) or ledger is None or type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 60:
+        raise ValueError('A host factory, shared ledger and bounded timeout are required')
+    expected_hash = expected_suite_hash or heldout_catalog()['suite_hash']
+    if expected_hash != heldout_catalog()['suite_hash']:
+        raise ValueError('Held-out suite hash mismatch')
+
+    async def evaluate(overlay: dict) -> dict:
+        if overlay != {}:
+            raise ValueError('Release held-out evaluations do not accept adaptation candidates')
+        if expected_hash != heldout_catalog()['suite_hash']:
+            raise ValueError('Held-out suite hash mismatch')
+        model = BudgetedModel(model_factory({}), ledger, quota_guard)
+        spending_admission(model.config, ledger)
+        started = time.monotonic()
+        observed = {'model_calls': 0, 'total_tokens': 0, 'cost_usd': 0.0,
+                    'tool_failures': 0, 'response_errors': 0}
+        rows = []
+        async def run():
+            for case in _HOLDOUT:
+                response = await model.generate([
+                    Message(role='system', content='Solve only the local fixture. Return the requested JSON, without Markdown. Never run inspected source.'),
+                    Message(role='user', content=case['task'] + '\n\n' + case['source'])],
+                    max_tokens=256, temperature=0)
+                observed['model_calls'] += 1
+                prompt, completion = getattr(response, 'prompt_tokens', None), getattr(response, 'completion_tokens', None)
+                usage = type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and prompt + completion > 0
+                if not usage or observed['total_tokens'] is None:
+                    observed['total_tokens'] = None
+                else:
+                    observed['total_tokens'] += prompt + completion
+                prices = [getattr(model.config, key, None) for key in ('input_cost_per_million', 'output_cost_per_million', 'request_cost_usd')]
+                if not usage or observed['cost_usd'] is None or not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in prices):
+                    observed['cost_usd'] = None
+                else:
+                    observed['cost_usd'] += (prompt * prices[0] + completion * prices[1]) / 1_000_000 + prices[2]
+                passed, error = False, False
+                try:
+                    content = response.content
+                    if not isinstance(content, str) or len(content) > 4096:
+                        raise ValueError('Invalid response')
+                    answer = json.loads(content)
+                    key = 'findings' if case['domain'] == 'security' else 'source'
+                    if not isinstance(answer, dict) or set(answer) != {key}:
+                        raise ValueError('Invalid answer schema')
+                    if key == 'findings':
+                        if not isinstance(answer[key], list) or len(answer[key]) > 1 or any(v != 'unsafe_yaml' for v in answer[key]):
+                            raise ValueError('Unsupported finding')
+                        passed = answer[key] == case['expected']
+                    else:
+                        if not isinstance(answer[key], str) or len(answer[key]) > 2048:
+                            raise ValueError('Invalid patch')
+                        # Only structural comparison; ast.parse does not execute code.
+                        actual = ast.parse(answer[key])
+                        expected = ast.parse(case['expected'])
+                        passed = ast.dump(actual) == ast.dump(expected)
+                        error = not passed and any(isinstance(n, (ast.Import, ast.ImportFrom)) or
+                            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {'eval', 'exec', '__import__', 'open'} for n in ast.walk(actual))
+                except (ValueError, TypeError, SyntaxError, AttributeError, RecursionError):
+                    error = True
+                observed['response_errors'] += int(error)
+                rows.append({'case_id': case['id'], 'domain': case['domain'], 'control': case['control'], 'passed': passed})
+        await asyncio.wait_for(run(), timeout_seconds)
+        observed['elapsed_seconds'] = time.monotonic() - started
+        return {'id': uuid.uuid4().hex, 'created_at': time.time(), 'mode': 'model', 'purpose': 'release_holdout', 'suite_version': HOLDOUT_VERSION,
+                'suite_hash': expected_hash, 'quality_claim': 'measured_transport_only_unverified_model_identity',
+                'quality': {'cases': len(rows), 'passed': sum(r['passed'] for r in rows),
+                            'false_positives': sum(r['control'] and not r['passed'] for r in rows), 'results': rows},
+                'observed': observed, 'missing_metrics': [k for k, v in observed.items() if v is None],
+                'limitation': heldout_catalog()['limitation']}
+    evaluate.heldout_only = True
+    return evaluate
+
+
+class HeldoutEvaluationStore(EvaluationStore):
+    """Separate bounded release history; never consumed by adaptation."""
+    relative = '.local-coder/evaluations/heldout-history.json'
+
+    def run(self, **kwargs):
+        raise ValueError('Held-out evaluation requires explicitly admitted model calls')
+
+    @staticmethod
+    def _report(item: dict) -> dict:
+        if not isinstance(item, dict) or item.get('purpose') != 'release_holdout' or item.get('mode') != 'model' or item.get('suite_hash') != heldout_catalog()['suite_hash']:
+            raise ValueError('Held-out evaluation history suite mismatch')
+        if not re.fullmatch(r'[0-9a-f]{32}', str(item.get('id', ''))):
+            raise ValueError('Invalid held-out evaluation identity')
+        created = item.get('created_at')
+        if type(created) not in (int, float) or not math.isfinite(created) or created < 0:
+            raise ValueError('Invalid held-out evaluation timestamp')
+        rows = item.get('quality', {}).get('results') if isinstance(item.get('quality'), dict) else None
+        if not isinstance(rows, list) or len(rows) != len(_HOLDOUT):
+            raise ValueError('Incomplete held-out evaluation')
+        fresh_rows = []
+        for case, row in zip(_HOLDOUT, rows):
+            if not isinstance(row, dict) or row.get('case_id') != case['id'] or type(row.get('passed')) is not bool:
+                raise ValueError('Invalid held-out case result')
+            fresh_rows.append({'case_id': case['id'], 'domain': case['domain'], 'control': case['control'], 'passed': row['passed']})
+        observed = item.get('observed')
+        if not isinstance(observed, dict):
+            raise ValueError('Invalid held-out observations')
+        fresh_observed = {}
+        for key in ('model_calls', 'total_tokens', 'cost_usd', 'elapsed_seconds', 'tool_failures', 'response_errors'):
+            value = observed.get(key)
+            if value is None and key in {'total_tokens', 'cost_usd'}:
+                fresh_observed[key] = None
+                continue
+            integer = key in {'model_calls', 'total_tokens', 'tool_failures', 'response_errors'}
+            if type(value) not in ((int,) if integer else (int, float)) or not math.isfinite(value) or not 0 <= value <= 1_000_000_000:
+                raise ValueError('Invalid held-out resource measurement')
+            fresh_observed[key] = value
+        if fresh_observed['model_calls'] != len(_HOLDOUT) or fresh_observed['elapsed_seconds'] > 60 or fresh_observed['tool_failures'] != 0 or fresh_observed['response_errors'] > len(_HOLDOUT):
+            raise ValueError('Invalid held-out execution measurements')
+        fresh = {'id': item['id'], 'created_at': created, 'mode': 'model', 'purpose': 'release_holdout',
+                 'suite_hash': heldout_catalog()['suite_hash'], 'suite_version': HOLDOUT_VERSION,
+                 'quality_claim': 'measured_transport_only_unverified_model_identity',
+                 'quality': {'cases': len(fresh_rows), 'passed': sum(r['passed'] for r in fresh_rows),
+                             'false_positives': sum(r['control'] and not r['passed'] for r in fresh_rows), 'results': fresh_rows},
+                 'observed': fresh_observed, 'missing_metrics': [k for k,v in fresh_observed.items() if v is None],
+                 'limitation': heldout_catalog()['limitation']}
+        if 'model' in item:
+            identity = item['model']
+            if not isinstance(identity, dict) or set(identity) != {'name', 'model_id', 'backend'} or any(not isinstance(v, str) or not 0 < len(v) <= 256 or any(ord(c) < 32 for c in v) for v in identity.values()):
+                raise ValueError('Invalid held-out model identity')
+            fresh['model'] = dict(identity)
+        return fresh

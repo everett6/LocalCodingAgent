@@ -96,7 +96,18 @@ class FindingsAPI:
         if method != "POST" or action is None:
             return 404, {"error": "Unknown findings route"}
         if action == "verify":
-            _body(body, {"phase", "test_path", "image", "backend", "timeout"})
+            optional = {'negative_control_ids', 'require_negative_controls'}
+            if not isinstance(body, dict):
+                raise ValueError('Supply a verification object')
+            _body({key: value for key, value in body.items() if key not in optional},
+                  {"phase", "test_path", "image", "backend", "timeout"})
+            controls = body.get('negative_control_ids', [])
+            strict = body.get('require_negative_controls', False)
+            if type(strict) is not bool or not isinstance(controls, list) or len(controls) > 20 or any(
+                    not isinstance(item, str) or not item.strip() or len(item) > 1024 for item in controls):
+                raise ValueError('Use at most 20 bounded negative-control test IDs and a boolean control requirement')
+            if len(set(controls)) != len(controls) or (strict and not controls):
+                raise ValueError('Strict verification requires distinct negative-control test IDs')
             if body["phase"] not in ("before", "after") or body["backend"] not in ("docker", "podman"):
                 raise ValueError("Select before/after and docker/podman")
             if type(body["timeout"]) is not int or not 1 <= body["timeout"] <= 600:
@@ -177,11 +188,18 @@ class FindingsAPI:
                 self.sessions.save(job_id, status="running")
                 self._event(AgentEvent(source="SERVER", event_type="finding_job_started", message=f"Finding {action} started"))
                 if action == "verify":
-                    result = await EvidenceStore(self.project_root).verify(identity, phase=options["phase"],
-                        test_path=options["test_path"], image=options["image"], backend=options["backend"], timeout_seconds=options["timeout"])
+                    store = EvidenceStore(self.project_root)
+                    operation = store.verify_controlled if options.get('require_negative_controls') else store.verify
+                    control_options = {'negative_control_ids': options.get('negative_control_ids', [])} if (
+                        options.get('require_negative_controls') or options.get('negative_control_ids')) else {}
+                    result = await operation(identity, phase=options["phase"], test_path=options["test_path"],
+                        image=options["image"], backend=options["backend"], timeout_seconds=options["timeout"], **control_options)
                     expected = "failed" if options["phase"] == "before" else "passed"
                     if result["result"]["status"] != expected or (options["phase"] == "before" and result["state"] != "reproduced"):
                         error = "Verification did not establish the requested evidence"
+                    if options.get('require_negative_controls') and not result.get(
+                            'strict_reproduced' if options['phase'] == 'before' else 'strict_verified'):
+                        error = 'Controlled verification did not establish the requested proof stage'
                 else:
                     coordinator = self._coordinator()
                     operation = coordinator.review_security_finding if action == "review" else coordinator.prepare_security_regression

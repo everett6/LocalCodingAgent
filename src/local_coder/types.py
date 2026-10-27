@@ -117,6 +117,7 @@ class ToolName(str, enum.Enum):
     GENERATED_TOOL = "generated_tool"
     MCP_CALL = "mcp_call"
     WEB_SEARCH = "web_search"
+    TOOL_CATALOG = "tool_catalog"
     SKILL_LIBRARY = "skill_library"
 
 

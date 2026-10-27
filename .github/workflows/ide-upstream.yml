@@ -3,6 +3,15 @@ on:
   schedule:
     - cron: '21 9 * * *'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish only after independent release approval and signature verification'
+        type: boolean
+        default: false
+      evidence_run_id:
+        description: 'Trusted workflow run containing release-approval-evidence artifact (required to publish)'
+        type: string
+        default: ''
   push:
     branches: [main, master]
     paths: ['ide/**', 'src/**', 'pyproject.toml', 'desktop/engine.spec', 'desktop/discovery.cjs', '.github/workflows/ide-upstream.yml']
@@ -43,14 +52,14 @@ jobs:
           add-paths: ide/source/upstream.json
           title: 'Update Local Coder IDE to VS Code ${{ steps.pin.outputs.tag }}'
           commit-message: 'Pin Code OSS stable ${{ steps.pin.outputs.tag }}'
-          body: 'Pins the official stable source commit and upstream Node version. Fork patches and dependency-free tests passed. The native build must pass before merge; merging publishes our own compatible fork release. No Microsoft branded binary is installed.'
+          body: 'Pins the official stable source commit and upstream Node version. Fork patches and dependency-free tests passed. The native build must pass before merge; publication requires a separate approved and signed release evidence gate. No Microsoft branded binary is installed.'
   native:
     needs: upstream
     if: always() && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || needs.upstream.outputs.changed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,7 +113,7 @@ jobs:
           JS
           tar -czf local-coder-ide-linux-x64.tar.gz -C ide/VSCode-linux-x64 .
           node - <<'JS'
-          const fs=require('fs'),crypto=require('crypto');const asset='local-coder-ide-linux-x64.tar.gz';fs.writeFileSync('ide-linux-x64.json',JSON.stringify({tag:`ide-vscode-${process.env.VERSION}-${process.env.GITHUB_SHA.slice(0,12)}`,version:process.env.VERSION,platform:'linux',arch:'x64',asset,sha256:crypto.createHash('sha256').update(fs.readFileSync(asset)).digest('hex')},null,2));
+          const fs=require('fs'),crypto=require('crypto');const asset='local-coder-ide-linux-x64.tar.gz';fs.writeFileSync('ide-linux-x64.json',JSON.stringify({tag:`ide-vscode-${process.env.VERSION}-${process.env.GITHUB_SHA.slice(0,12)}`,version:process.env.VERSION,revision:process.env.GITHUB_SHA,platform:'linux',arch:'x64',asset,sha256:crypto.createHash('sha256').update(fs.readFileSync(asset)).digest('hex')},null,2));
           JS
       - uses: actions/upload-artifact@v4
         with:
@@ -112,10 +121,45 @@ jobs:
           path: |
             local-coder-ide-linux-x64.tar.gz
             ide-linux-x64.json
-      - name: Publish validated fork release on default branch
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.upstream.outputs.changed != 'true' && github.ref_name == github.event.repository.default_branch
+  publish:
+    needs: native
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    environment: release-approved
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require an explicit independent evidence run
+        env:
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        run: python -c "import os; assert os.environ['EVIDENCE_RUN_ID'].isdigit(), 'Supply a trusted release-evidence run ID'"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-approval-evidence
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: release-approval
+      - uses: actions/download-artifact@v4
+        with:
+          name: local-coder-ide-linux-x64
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: release-assets
+      - name: Verify approved evidence and detached artifact signature
+        env:
+          PYTHONPATH: src
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY }}
+          RELEASE_SIGNING_FINGERPRINT: ${{ vars.RELEASE_SIGNING_FINGERPRINT }}
+        run: python desktop/verify-release.py release-approval release-assets
+      - name: Publish the verified artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$IDE_RELEASE_TAG" >/dev/null 2>&1 || gh release create "$IDE_RELEASE_TAG" --target "$GITHUB_SHA" --title "Local Coder IDE · VS Code ${{ steps.pin.outputs.version }}" --notes 'Rebuilt MIT Code OSS with Local Coder branding, native agent harness, and matching engine. Linux x64. Unsigned. Includes checksum manifest; optional in-app fork updater retains your previous installation.'
-          gh release upload "$IDE_RELEASE_TAG" local-coder-ide-linux-x64.tar.gz ide-linux-x64.json --clobber
+          python -c "import json,os; m=json.load(open('release-assets/ide-linux-x64.json')); open(os.environ['GITHUB_ENV'],'a').write('IDE_RELEASE_TAG='+m['tag']+'\n')"
+          gh release view "$IDE_RELEASE_TAG" >/dev/null 2>&1 || gh release create "$IDE_RELEASE_TAG" --target "$GITHUB_SHA" --title "Clin IDE $IDE_RELEASE_TAG" --notes 'Independent readiness approval and detached signature verified before publication. See attached release evidence.'
+          gh release upload "$IDE_RELEASE_TAG" release-assets/local-coder-ide-linux-x64.tar.gz release-approval/ide-linux-x64.json release-approval/ide-linux-x64.json.asc --clobber

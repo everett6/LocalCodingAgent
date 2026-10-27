@@ -108,7 +108,9 @@ class RedTeamWorkspaceTool(EngagementTool):
                   'scan_targets': [self.store.resolve_source(record, target).relative_to(root).as_posix() for target in targets],
                   'findings': _clean(findings[:200]), 'coverage': coverage}
         evidence_id = self.store.evidence(self.engagement_id, 'static_scan' if action == 'scan' else 'inventory', result)
-        return ToolResult(success=True, output=json.dumps({**result, 'evidence_id': evidence_id}, ensure_ascii=False), data={**result, 'evidence_id': evidence_id})
+        # Keep the stable recovery handle at the head of bounded prompt output;
+        # large scanner metadata can otherwise crowd its trailing ID out.
+        return ToolResult(success=True, output=json.dumps({'evidence_id': evidence_id, **result}, ensure_ascii=False), data={**result, 'evidence_id': evidence_id})
 
 
 class RedTeamHTTPTool(EngagementTool):
@@ -306,4 +308,4 @@ def bind_engagement(registry, project_root, engagement_id):
     for cls in generated:
         registry.register(cls(project_root, safety_harness=getattr(registry, "safety_harness", None),
                               approval_callback=getattr(registry, "approval_callback", None), engagement_id=engagement_id))
-    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY, ToolName.WEB_SEARCH}
+    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.TOOL_CATALOG, ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY, ToolName.WEB_SEARCH}

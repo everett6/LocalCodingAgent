@@ -90,7 +90,9 @@ def create_tool_registry(
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
     from local_coder.tools.context_archive import RecoverContextTool
+    from local_coder.tools.tool_catalog import ToolCatalogTool
     registry.register(RecoverContextTool(registry))
+    registry.register(ToolCatalogTool(registry))
     for allowed in registry._permissions.values():
         allowed.add(RecoverContextTool.name)
 

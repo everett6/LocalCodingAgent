@@ -47,7 +47,12 @@ class LedgerEntry:
         # The same issue reported twice (by two batches, or once more after a
         # compaction) updates one entry instead of adding a duplicate.
         subject = self.rule or re.sub(r"[^a-z0-9]+", " ", self.title.lower()).strip()
-        return f"{self.path}|{subject}"
+        return f"{self.path}|{subject}|line:{self.line}"
+
+    @property
+    def legacy_key(self) -> str:
+        """Pre-occurrence identity, retained only for evidence migration."""
+        return self.key.rsplit("|line:", 1)[0]
 
     def location(self) -> str:
         return f"{self.path}:{self.line}" if self.line else self.path
@@ -176,6 +181,10 @@ class FindingsLedger:
                     for name, value in asdict(entry).items()
                 })
                 merged.id = existing.id
+                # Repeated scanner imports cannot erase a reviewed dismissal.
+                if existing.status == "false_positive":
+                    merged.status = existing.status
+                    merged.lesson = existing.lesson or merged.lesson
                 self.entries[index] = merged
                 self._save_unlocked()
                 return merged, False

@@ -2,6 +2,8 @@
 from __future__ import annotations
 import asyncio
 import copy
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 import json
 import math
 import os
@@ -12,6 +14,32 @@ import uuid
 from types import SimpleNamespace
 
 from local_coder.context.token_count import request_accounting
+from local_coder.context.telemetry import ContextTelemetry
+
+_REQUEST_TELEMETRY: ContextVar[tuple[ContextTelemetry, str, tuple[str, ...]] | None] = ContextVar('request_telemetry', default=None)
+
+
+def bind_request_telemetry(telemetry: ContextTelemetry, task_id: str, retrieval_ids=()) -> Token:
+    return _REQUEST_TELEMETRY.set((telemetry, task_id, tuple(retrieval_ids)[:16]))
+
+
+def reset_request_telemetry(token: Token) -> None:
+    _REQUEST_TELEMETRY.reset(token)
+
+
+def update_request_retrievals(retrieval_ids=()) -> None:
+    current = _REQUEST_TELEMETRY.get()
+    if current is not None:
+        _REQUEST_TELEMETRY.set((current[0], current[1], tuple(retrieval_ids)[:16]))
+
+
+@contextmanager
+def request_telemetry(telemetry: ContextTelemetry, task_id: str, retrieval_ids=()):
+    token = bind_request_telemetry(telemetry, task_id, retrieval_ids)
+    try:
+        yield
+    finally:
+        reset_request_telemetry(token)
 
 
 class BudgetExceeded(RuntimeError):
@@ -129,17 +157,48 @@ class BudgetedModel:
             if identity is not None:self.ledger.release_unattempted(identity)
             raise
         return identity
+    def _record_request(self, messages, kwargs):
+        current = _REQUEST_TELEMETRY.get()
+        if current is None:
+            return None
+        telemetry, task_id, retrieval_ids = current
+        try:
+            record = telemetry.record_request(messages, kwargs.get('tools'),
+                kwargs.get('max_tokens') or getattr(self.config, 'max_tokens', 4096),
+                task_id=task_id, retrieval_ids=retrieval_ids)
+            return telemetry, record['id']
+        except (OSError, ValueError, TypeError):
+            # Diagnostics are best effort and cannot weaken or bypass admission.
+            return None
+
+    def _record_usage(self, record, response):
+        if record is None:
+            return
+        telemetry, identity = record
+        prompt = getattr(response, 'prompt_tokens', None)
+        completion = getattr(response, 'completion_tokens', None)
+        reported = type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and (prompt + completion > 0 or getattr(response, 'usage_reported', False) is True)
+        usage = {'prompt_tokens': prompt, 'completion_tokens': completion} if reported else None
+        pricing = {key: getattr(self.config, key, None) for key in ('input_cost_per_million', 'output_cost_per_million', 'request_cost_usd')}
+        try:
+            telemetry.record_usage(identity, usage, pricing=pricing)
+        except (OSError, ValueError, TypeError):
+            pass
+
     async def generate(self,messages,**kwargs):
         identity=await self._admit(messages,kwargs)
+        diagnostic = self._record_request(messages, kwargs)
         try:
             result=await self.model.generate(messages,**kwargs)
         except BaseException:
             if identity is not None:self.ledger.settle(identity,error=True,config=self.config)
             raise
         if identity is not None:self.ledger.settle(identity,result,config=self.config)
+        self._record_usage(diagnostic, result)
         return result
     async def stream(self,messages,**kwargs):
         identity=await self._admit(messages,kwargs)
+        self._record_request(messages, kwargs)
         failed=True
         try:
             async for text in self.model.stream(messages,**kwargs):yield text

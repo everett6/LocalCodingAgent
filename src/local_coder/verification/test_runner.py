@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from local_coder.processes import communicate, process_options
+from local_coder.processes import OUTPUT_TRUNCATION_MARKER, communicate, process_options
 
 FRAMEWORKS = ("pytest", "unittest", "jest", "vitest", "mocha", "go", "cargo", "npm", "make")
 
@@ -706,15 +706,18 @@ def build_plan(
 # Running
 # --------------------------------------------------------------------------
 
-def _test_env() -> dict[str, str]:
+def _test_env(pycache_prefix: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env.update({
         "CI": "1", "NO_COLOR": "1", "FORCE_COLOR": "0", "PY_COLORS": "0",
         "RUST_BACKTRACE": "0", "CARGO_TERM_COLOR": "never",
-        # An agent can edit a file twice within one second without changing its
-        # size; a cached .pyc would then hide the second edit.
+        # Avoid modifying project bytecode caches during verification.
         "PYTHONDONTWRITEBYTECODE": "1",
     })
+    if pycache_prefix is not None:
+        # -B only prevents writes: existing timestamp-based bytecode is still
+        # read. A fresh prefix also prevents reads of same-second stale .pyc.
+        env["PYTHONPYCACHEPREFIX"] = str(pycache_prefix)
     return env
 
 
@@ -749,20 +752,25 @@ async def run_tests(
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(root),
-                env=_test_env(),
+                env=_test_env(Path(tmp) / "pycache"),
                 **process_options(),
             )
         except FileNotFoundError:
             report.notes.append(f"{plan.argv[0]} was not found; is {framework} installed?")
             return report
         try:
-            stdout, _ = await communicate(proc, timeout=timeout)
+            stdout, _ = await communicate(
+                proc, timeout=timeout, max_stream_bytes=_MAX_RAW_CHARS,
+                max_total_bytes=_MAX_RAW_CHARS,
+            )
         except asyncio.TimeoutError:
             report.timed_out = True
             report.duration_s = time.monotonic() - started
             report.notes.append(f"Timed out after {int(timeout)}s.")
             return report
         output = _clean(stdout.decode("utf-8", errors="replace"))
+        if stdout.startswith(OUTPUT_TRUNCATION_MARKER):
+            report.notes.append(f"Subprocess output truncated; retaining at most {_MAX_RAW_CHARS} bytes of its tail.")
         report.exit_code = proc.returncode
         report.raw_output = output[-_MAX_RAW_CHARS:]
         plan.parse(report, output, plan.report_path, root)

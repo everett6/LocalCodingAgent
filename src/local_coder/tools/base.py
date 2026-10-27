@@ -136,6 +136,7 @@ class ToolRegistry:
         # grep can use them.
         for role, allowed in self._permissions.items():
             if ToolName.GREP in allowed:
+                allowed.add(ToolName.TOOL_CATALOG)
                 allowed.add(ToolName.CODE_SEARCH)
                 allowed.add(ToolName.REPO_MAP)
                 if role != AgentRole.EXPLOIT_VALIDATOR:
@@ -235,7 +236,10 @@ class ToolRegistry:
             original = {s["function"]["name"] for s in schemas}
             if not {s["function"]["name"] for s in profile.apply_tools(schemas)}.issubset(original):
                 return {"success": False, "measurements": {"checks": 1}}
-            checks = 2
+            from local_coder.harness.improvement import validate_profile_revision
+            tool = self.get_tool(ToolName.HARNESS_EVOLVE)
+            evaluator = getattr(tool, 'improvement_evaluator', None)
+            return await validate_profile_revision(self.evolution, revision, evaluator)
         else:
             text = payload["text"]
             if len(text) > 6000:
@@ -274,6 +278,25 @@ class ToolRegistry:
         target = workspace.resolve(arguments.get("path") or ".")
         if not any(target == root or target.is_relative_to(root) for root in roots):
             raise ValueError("Tool path exceeds the leaf task's inherited scope; supply an in-scope path")
+
+    def _parallel_scope(self, name, arguments, targets):
+        """Enforce host-owned worker boundaries before any mutation or snapshot."""
+        current = self.task_context.get() or {}
+        if not current.get('parallel_worker'):
+            return
+        scope = current.get('write_scope')
+        if scope is None:
+            raise ValueError('Parallel worker requires a host write scope')
+        workspace = Workspace(self.project_root)
+        roots = [workspace.resolve(path) for path in scope]
+        for target in targets:
+            path = workspace.resolve(target)
+            if not any(path == root or path.is_relative_to(root) for root in roots):
+                raise ValueError('File mutation exceeds the parallel worker write scope')
+        # Process tools, dynamic tools and unclassified effects can mutate paths
+        # outside their arguments. They must run at a serialized boundary.
+        if not targets and self.effects_for(name.value).mutating:
+            raise ValueError('Unconfined mutation requires a serialized task scope')
 
     async def _language_before_edit(self, paths):
         """Expose current symbols to the model before allowing an unread edit."""
@@ -359,6 +382,7 @@ class ToolRegistry:
                     raise ValueError("Red team task memory is confined to the current engagement task")
             snapshot = None
             targets = self._write_targets(name_enum, arguments)
+            self._parallel_scope(name_enum, arguments, targets)
             root = getattr(self, "project_root", None)
             if root:
                 for target in targets:
@@ -373,7 +397,7 @@ class ToolRegistry:
                     return ToolResult(success=False, output="Review the current language context before retrying the edit (no files changed):\n" + language)
             if targets and getattr(self, "pre_edit_snapshots", False):
                 snapshot = await asyncio.to_thread(self.snapshots.capture, targets)
-            if name_enum in {ToolName.RECOVER_CONTEXT, ToolName.DELEGATE_TASK, ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL}:
+            if name_enum in {ToolName.TOOL_CATALOG, ToolName.RECOVER_CONTEXT, ToolName.DELEGATE_TASK, ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL}:
                 arguments = {**arguments, "_caller_role": role}
             if name_enum == ToolName.DELEGATE_TASK:
                 current = self.task_context.get() or {}

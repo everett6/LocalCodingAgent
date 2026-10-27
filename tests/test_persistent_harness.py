@@ -42,7 +42,7 @@ def test_failed_verification_recovers_and_observes_a_passing_test():
                        ModelResponse(tool_calls=[ToolCall(name='run_tests')]),
                        ModelResponse(content='Verified.')])
     agent = LoopAgent(model, FakeRegistry([ToolResult(success=False, output='assertion failed'),
-                                          ToolResult(success=True, output='passed')]))
+                                          ToolResult(success=True, output='passed')], tool_names=('run_tests',)))
     result = asyncio.run(agent.execute(AgentTask(role=AgentRole.CODER, objective='Fix')))
     assert result.status == TaskStatus.COMPLETED
     assert agent._strategy_attempts == 1

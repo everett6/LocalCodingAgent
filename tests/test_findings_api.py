@@ -155,6 +155,29 @@ def test_verification_uses_operator_fields_and_canonical_runner(setup, monkeypat
     assert store.get(identity)['before']['image_id'].startswith('sha256:')
 
 
+def test_strict_verification_routes_observed_controls_through_host(setup, monkeypatch):
+    host, store, identity = setup
+    supported(store, identity)
+    calls = []
+
+    async def controlled(self, finding, **options):
+        calls.append((finding, options))
+        return {'state': 'reproduced', 'strict_reproduced': True,
+                'result': {'status': 'failed'}}
+
+    monkeypatch.setattr(EvidenceStore, 'verify_controlled', controlled)
+    body = dict(phase='before', test_path='tests/test_safe.py', image='installed:trusted',
+                backend='podman', timeout=9, require_negative_controls=True,
+                negative_control_ids=['tests/test_safe.py::test_control'])
+    status, job = host._findings_handle('POST', f'/findings/{identity}/verify', body)
+    assert status == 202
+    assert host.wait(job['job_id'])['status'] == 'completed'
+    assert calls[0][1]['negative_control_ids'] == ['tests/test_safe.py::test_control']
+    assert host._findings_handle('POST', f'/findings/{identity}/verify', {
+        **body, 'negative_control_ids': []})[0] == 400
+    assert host.coordinator_calls == 0
+
+
 @pytest.mark.parametrize('change', [dict(timeout=True), dict(timeout=0), dict(backend='shell'),
                                   dict(phase='fixed'), dict(image='-bad'), dict(test_path='../escape.py'), dict(test_path='app.py')])
 def test_invalid_verify_is_rejected_before_start(setup, change):

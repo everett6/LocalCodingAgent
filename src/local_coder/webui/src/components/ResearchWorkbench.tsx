@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { api } from '../api'
 import { ResearchCapabilities } from './ResearchCapabilities'
 import { DependencyReview } from './DependencyReview'
+import { SearchConnectionDoctor } from './SearchConnectionDoctor'
 
 type Finding = { path?: string; rule?: string; title?: string; file?: string; line?: number; rule_id?: string; message?: string; description?: string; severity?: string; cwe?: string; verification?: string }
 type Audit = { findings: Finding[]; coverage?: { status: string; files_scanned: number; parse_errors: number; skipped: string[] }; limitations?: string[]; evidence_hash?: string }
@@ -51,6 +52,7 @@ export function ResearchWorkbench({ disabled = false }: { disabled?: boolean }) 
   }
   return <section className="research-workbench">
     <header><h1>Research workspace</h1><p>Review local code, inspect indexed symbols, and keep traceable findings.</p></header>
+    <SearchConnectionDoctor />
     <nav className="research-tabs" aria-label="Research views"><button aria-pressed={view === 'audit'} onClick={() => setView('audit')}>Source review</button><button aria-pressed={view === 'dependencies'} onClick={() => setView('dependencies')}>Dependencies</button><button aria-pressed={view === 'capabilities'} onClick={() => setView('capabilities')}>Upgrade roadmap</button></nav>
     {view === 'capabilities' ? <ResearchCapabilities /> : view === 'dependencies' ? <DependencyReview disabled={disabled} /> : <>
       <div className="research-controls"><label>Project path<input aria-label="Research project path" value={target} onChange={event => setTarget(event.target.value)} /></label><button disabled={disabled || busy} onClick={() => { void run() }}>{busy ? 'Working…' : 'Review sources'}</button><button disabled={busy} onClick={() => { void inspectStructure() }}>Inspect indexed symbols</button></div>

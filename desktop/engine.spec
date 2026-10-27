@@ -3,7 +3,8 @@ from pathlib import Path
 root = Path(SPECPATH).parent
 analysis = Analysis([str(root / 'desktop' / 'engine.py')], pathex=[str(root / 'src')],
     binaries=[], datas=[(str(root / 'src' / 'local_coder' / 'webui' / 'dist'), 'local_coder/webui/dist'),
-                        (str(root / 'src' / 'local_coder' / 'webui' / 'public'), 'local_coder/webui/public')],
+                        (str(root / 'src' / 'local_coder' / 'webui' / 'public'), 'local_coder/webui/public'),
+                        (str(root / 'src' / 'local_coder' / 'release_spec.json'), 'local_coder')],
     hiddenimports=[], hookspath=[], runtime_hooks=[],
     # GGUF inference uses the selected native runtime. The optional tokenizer
     # needs text assets only; do not bundle unrelated ML execution frameworks.

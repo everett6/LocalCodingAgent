@@ -138,7 +138,7 @@ async def run_regression(
     """
     result = dict(status="error", passed=0, failed=0, errors=0, skipped=0,
                   tests=0, exit_code=None, output="", error="", backend=backend,
-                  isolation="container", test_ids=[], image_id="", failure_kind="",
+                  isolation="container", test_ids=[], passed_test_ids=[], image_id="", failure_kind="",
                   snapshot_exclusions=[])
     if backend not in {"docker", "podman"}:
         result["error"] = "backend must be docker or podman"
@@ -243,6 +243,8 @@ async def run_regression(
                         result["error"] = "invalid, duplicate, or excessive test identifiers"
                         return result
                     result["test_ids"].append(identifier)
+                    if key == "passed":
+                        result["passed_test_ids"].append(identifier)
             result["test_ids"].sort()
             result["failure_kind"] = ("assertion" if failure_kinds and all(k == "assertion" for k in failure_kinds) else "other" if failure_kinds else "")
             if result["errors"] or code not in (0, 1):

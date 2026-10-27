@@ -42,12 +42,15 @@ function validateProvider(provider) {
 function isAllowedEngineRequest(route, method) {
   if (typeof route !== 'string' || route.length > 4096 || /[\\#\r\n]/.test(route) || !['GET','POST'].includes(method)) return false;
   const pathname = route.split('?')[0];
+  if (pathname === '/integrations/search/doctor') return route === pathname && ['GET', 'POST'].includes(method);
+  if (pathname === '/context/debugger') return route === pathname && method === 'GET';
+  if (pathname === '/status' && route.includes('?summary')) return route === '/status?summary=1' && method === 'GET';
   if (!route.startsWith('/') || route.startsWith('//') || /%(2e|2f|5c|00)/i.test(pathname)) return false;
   try { if (new URL(route, 'http://127.0.0.1').pathname !== pathname) return false; } catch { return false; }
 
   if (method === 'GET' && ['/evaluations', '/findings', '/memory/retrievals', '/context/accounting', '/research/advisories/updates', '/inference/tuning/history', '/doctor'].includes(pathname)) return true;
   if (method === 'GET' && (/^\/evaluations\/[a-f0-9]{32}$/.test(pathname) || /^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}$/.test(pathname) || /^\/findings\/[a-f0-9]{24}$/.test(pathname) || /^\/memory\/retrievals\/[a-f0-9]{32}$/.test(pathname))) return true;
-  if (method === 'POST' && ['/evaluations/run', '/evaluations/model/run', '/context/tokenizer', '/research/advisories/update', '/inference/tuning/start', '/inference/tuning/apply', '/doctor/repair'].includes(pathname)) return true;
+  if (method === 'POST' && ['/evaluations/run', '/evaluations/model/run', '/evaluations/heldout/run', '/context/tokenizer', '/research/advisories/update', '/inference/tuning/start', '/inference/tuning/apply', '/doctor/repair'].includes(pathname)) return true;
   if (method === 'POST' && (/^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}\/cancel$/.test(pathname) || /^\/findings\/[a-f0-9]{24}\/(review|prepare|verify|suppress|reopen)$/.test(pathname))) return true;
 
   if(method==='GET'&&['/research/capabilities','/research/evidence','/research/report','/research/dependencies','/research/advisories','/memory/structure'].includes(pathname))return true;

@@ -15,6 +15,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -238,6 +239,9 @@ class CatalogService:
         self.transport, self.client = transport, client
         self.ttl_seconds, self.clock = ttl_seconds, clock
         self._lock = threading.RLock()
+        self._snapshot_identity: tuple[int, ...] | None = None
+        self._snapshot: dict | None = None
+        self._model_index: dict[str, dict] = {}
 
     @contextmanager
     def _client(self):
@@ -305,13 +309,41 @@ class CatalogService:
             raise ValueError("Provider cache must be an ordinary private file")
         return target
 
-    def _read_cache(self, target):
-        if not target.exists():
-            return None
-        if target.stat().st_size > MAX_RESPONSE_BYTES:
-            return None
+    @staticmethod
+    def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_mode, info.st_nlink,
+        )
+
+    def _read_cache(self, target: Path) -> dict | None:
+        """Reuse normalized public metadata only while file identity matches.
+
+        Read through one descriptor with a size bound and compare descriptor
+        and pathname identities before publishing a replacement snapshot.
+        Freshness is recomputed on every lookup, independently of file reuse.
+        """
         try:
-            cached = json.loads(target.read_text(encoding="utf-8"))
+            identity = self._file_identity(target.stat())
+            if identity != self._snapshot_identity:
+                self._snapshot = None
+                self._model_index = {}
+                self._snapshot_identity = None
+                if target.stat().st_size > MAX_RESPONSE_BYTES:
+                    return None
+                with target.open("rb") as stream:
+                    if self._file_identity(os.fstat(stream.fileno())) != identity:
+                        return None
+                    raw = stream.read(MAX_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_RESPONSE_BYTES:
+                        return None
+                    if self._file_identity(os.fstat(stream.fileno())) != identity:
+                        return None
+                if self._file_identity(target.stat()) != identity:
+                    return None
+                cached = json.loads(raw)
+            else:
+                cached = self._snapshot
             if (
                 not isinstance(cached, dict)
                 or cached.get("version") != 1
@@ -321,14 +353,23 @@ class CatalogService:
             stamp = datetime.fromisoformat(cached["fetched_at"])
             if stamp.tzinfo is None or stamp.timestamp() > self.clock() + 60:
                 return None
-            models = _catalog(cached)
+            if self._snapshot_identity != identity:
+                models = _catalog(cached)
+                self._snapshot = {
+                    "version": 1, "fetched_at": cached["fetched_at"], "models": models,
+                }
+                self._model_index = {row["id"]: row for row in models}
+                self._snapshot_identity = identity
             return {
-                "models": models,
+                "models": self._snapshot["models"],
                 "source": "cache",
                 "fetched_at": cached["fetched_at"],
                 "stale": self.clock() - stamp.timestamp() >= self.ttl_seconds,
             }
-        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            self._snapshot_identity = None
+            self._snapshot = None
+            self._model_index = {}
             return None
 
     def openrouter_models(self, refresh=False):
@@ -338,7 +379,7 @@ class CatalogService:
             target = self._cache_path()
             cached = self._read_cache(target)
             if cached is not None and not refresh and not cached["stale"]:
-                return cached
+                return deepcopy(cached)
             try:
                 with self._client() as client:
                     payload = self._json(client, MODELS_URL)
@@ -395,7 +436,7 @@ class CatalogService:
             ):
                 if cached is not None:
                     return {
-                        **cached,
+                        **deepcopy(cached),
                         "stale": True,
                         "error": "OpenRouter catalog unavailable; showing cached metadata.",
                     }
@@ -415,13 +456,11 @@ class CatalogService:
             cached = self._read_cache(self._cache_path())
             if cached is None:
                 return None
-            item = next(
-                (row for row in cached["models"] if row["id"] == model_id), None
-            )
+            item = self._model_index.get(model_id)
             if item is None:
                 return None
             return {
-                **item,
+                **deepcopy(item),
                 **{key: cached[key] for key in ("source", "fetched_at", "stale")},
             }
 
