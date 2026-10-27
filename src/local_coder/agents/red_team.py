@@ -42,8 +42,9 @@ Recommend separate reviewed sandbox validation for supported local findings.'''
         self.max_iterations = min(self.max_iterations, 40)
         self.max_tool_calls = min(self.max_tool_calls, 160)
         config = getattr(self.model, 'config', None)
-        if config is not None and (getattr(config, 'profile', '') in {'glm53', 'qwen38'} or getattr(config, 'profile', '').startswith('openrouter_')):
-            self.context_window_chars = min(self.context_window_chars, config.context_length * 3, 240000)
+        context_length = getattr(config, 'context_length', None)
+        if type(context_length) is int and context_length > 0:
+            self.context_window_chars = min(self.context_window_chars, context_length * 3, 240000)
             self.compact_context_chars = min(self.compact_context_chars, self.context_window_chars // 2)
         return await super().execute(task)
 

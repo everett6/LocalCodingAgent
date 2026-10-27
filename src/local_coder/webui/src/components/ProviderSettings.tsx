@@ -135,9 +135,9 @@ export function ProviderSettings({ provider, close, saved, mode = 'coding', usag
     finally { setProfileBusy(false) }
   }
 
-  return <dialog ref={dialog} className="settings-dialog" onCancel={close} aria-labelledby="settings-title">
+  return <dialog ref={dialog} className={`settings-dialog ${tab === 'local' ? 'model-studio-dialog' : ''}`} onCancel={close} aria-labelledby="settings-title">
     <header><div><KeyRound size={18} /><h2 id="settings-title">Model & connection</h2></div><button type="button" className="icon-button" aria-label="Close settings" onClick={close}><X size={18} /></button></header>
-    <nav className="settings-tabs"><button type="button" className={tab === 'cloud' ? 'selected' : ''} onClick={() => setTab('cloud')}>Cloud or local server</button><button type="button" className={tab === 'local' ? 'selected' : ''} onClick={() => setTab('local')}>On-device model</button></nav>
+    <nav className="settings-tabs"><button type="button" className={tab === 'cloud' ? 'selected' : ''} onClick={() => setTab('cloud')}>Cloud or local server</button><button type="button" className={tab === 'local' ? 'selected' : ''} onClick={() => setTab('local')}>Local models</button></nav>
     {tab === 'local' ? <LocalInferenceSettings saved={saved} /> : <form onSubmit={event => { void save(event) }}>
       <fieldset disabled={saving || profileBusy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
         {profiles.length > 0 && <label>Saved provider profile<select value={activeProfile} onChange={event => { void chooseProfile(event.target.value) }}><option value="">Current connection</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>}

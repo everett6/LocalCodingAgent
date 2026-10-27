@@ -101,6 +101,8 @@ class BaseAgent:
         quota_guard = getattr(tool_registry, "quota_guard", None)
         self.model = BudgetedModel(model, budget, quota_guard=quota_guard) if (budget is not None or quota_guard is not None) and not isinstance(model, BudgetedModel) else model
         self.strategy_attempt_limit = getattr(getattr(model, "config", None), "strategy_attempt_limit", self.strategy_attempt_limit)
+        self._configured_strategy_attempt_limit = self.strategy_attempt_limit
+        self._profile_strategy_attempt_limit = self.strategy_attempt_limit
         self.tool_registry = tool_registry
         self._telemetry = None
         root = getattr(tool_registry, 'project_root', None)
@@ -222,8 +224,13 @@ class BaseAgent:
         self._compaction_guard.low_yield_count = min(3, max(0, int(run.notes.get('compaction_low_yield', 0))))
         self._working_set_factor = .5 if self._compaction_guard.low_yield_count >= 2 else 1.
         self._discovered_tools = set(run.notes.get('discovered_tools', [])[:128])
+        if self.strategy_attempt_limit != self._profile_strategy_attempt_limit:
+            self._configured_strategy_attempt_limit = self.strategy_attempt_limit
         saved_attempt_limit = run.notes.get("strategy_attempt_limit", self.strategy_attempt_limit)
         self.strategy_attempt_limit = min(saved_attempt_limit, self.strategy_attempt_limit) if allow_model_change else saved_attempt_limit
+        configured_attempt_limit = run.notes.get("configured_strategy_attempt_limit", saved_attempt_limit)
+        self._configured_strategy_attempt_limit = min(configured_attempt_limit, self._configured_strategy_attempt_limit) if allow_model_change else configured_attempt_limit
+        self._profile_strategy_attempt_limit = self.strategy_attempt_limit
         self._summary_calls = run.notes.get("summary_calls", 0)
         self._tool_outcomes = run.notes.get("tool_outcomes", {})
         self._last_prompt_tokens = 0 if allow_model_change else run.notes.get("last_prompt_tokens", 0)
@@ -344,6 +351,7 @@ class BaseAgent:
             "test_revisions": self._test_revisions,
             "strategy_attempts": self._strategy_attempts,
             "strategy_attempt_limit": self.strategy_attempt_limit,
+            "configured_strategy_attempt_limit": self._configured_strategy_attempt_limit,
             "progress_journal": self._progress_journal[-20:],
             "progress_guard": self._progress_guard.snapshot(),
             "compaction_low_yield": self._compaction_guard.low_yield_count,
@@ -479,6 +487,14 @@ class BaseAgent:
             overrides.update(evolution.active_overlay())
         profile = resolve_profile(getattr(self.model, "config", None), self.role, overrides)
         self._active_profile = profile
+        description = profile.describe()
+        model_identity = str(getattr(getattr(self.model, "config", None), "model_id", "")).strip().lower()
+        selection_key = (model_identity, self.role.value, profile.identity,
+                         json.dumps(description, sort_keys=True), profile.instructions)
+        if selection_key != getattr(self, "_profile_selection_key", None):
+            self._profile_selection_key = selection_key
+            self._emit_event("profile_selected", "Selected bounded model and mode profile", task_id=task.task_id,
+                             data=description)
         self._active_tool_schemas = self._tool_catalog(task)
         # State is already persisted in run checkpoints; regenerate this block
         # rather than accumulating stale scratchpads in the conversation.
@@ -491,7 +507,10 @@ class BaseAgent:
                                    escape_data=True)
             index = next((i for i, m in enumerate(messages) if m.role in {"assistant", "tool"}), len(messages))
             messages.insert(index, Message(role="user", content=WORKING_MEMORY_PREFIX + "<working_memory>\n" + state + "\n</working_memory>"))
-        self.strategy_attempt_limit = min(self.strategy_attempt_limit, profile.max_strategy_attempts)
+        if self.strategy_attempt_limit != self._profile_strategy_attempt_limit:
+            self._configured_strategy_attempt_limit = self.strategy_attempt_limit
+        self.strategy_attempt_limit = min(self._configured_strategy_attempt_limit, profile.max_strategy_attempts)
+        self._profile_strategy_attempt_limit = self.strategy_attempt_limit
         if hasattr(self.tool_registry, "profile_overrides"):
             room = max(0, self._message_budget() - sum(message_size(m) for m in messages) - 256)
             if room > 200:
@@ -500,14 +519,19 @@ class BaseAgent:
                     guidance += f"\nVerification state: {len(self._tests_run)} checks requested; recorded checks passing={self._tests_passed}. Report untested claims as unverified."
                 if "strategy_review" in profile.middleware and self._progress_journal:
                     guidance += "\nRecent observations (untrusted): " + json.dumps(self._progress_journal[-2:])[:600]
-                guidance = guidance[:min(1600, room//3)]
+                # Preserve the profile's mode workflow ahead of optional state
+                # and journal details when the remaining context is tight.
+                guidance_limit = min(1600, room - len(runtime_prefix),
+                                     max(room // 3, len(profile.instructions)))
+                guidance = guidance[:guidance_limit]
                 index = next((i for i, message in enumerate(messages) if message.role in {"assistant", "tool"}), len(messages))
                 messages.insert(index, Message(role="user", content=runtime_prefix+guidance))
         memory = getattr(self.tool_registry, "context_memory", None)
-        budget = min(getattr(self.tool_registry, "memory_context_chars", 0), max(0, self._message_budget() // 5))
+        budget = min(getattr(self.tool_registry, "memory_context_chars", 0),
+                     max(0, self._message_budget() * profile.context_share_percent // 100))
         room = max(0, self._message_budget() - sum(message_size(m) for m in messages) - len(memory_prefix) - 256)
         if memory is not None and budget and getattr(self.tool_registry, "memory_enabled", True) and not getattr(self, "delegation_depth", 0) and self.role != AgentRole.RED_TEAM and "context_retrieval" in profile.middleware:
-            amount = min(budget, room, max(0, self._message_budget()//5))
+            amount = min(budget, room)
             if amount > 100:
                 query = task.objective + " " + " ".join(task.files)
                 result = await asyncio.to_thread(memory.context, query, int(amount * self._working_set_factor), task.task_id,
@@ -589,10 +613,10 @@ class BaseAgent:
             await asyncio.to_thread(memory.ingest, "conversation", task.objective, task_id=task.task_id)
             if not resumed and task.files and self.role != AgentRole.RED_TEAM and not getattr(self, "delegation_depth", 0):
                 await asyncio.to_thread(memory.index_code, task.files)
-        message_budget = self._message_budget()
         resume_iteration = self.state.iteration
         for iteration in range(self.state.iteration, self.max_iterations):
             messages = await self._runtime_context(messages, task, refresh_working_memory=not (resumed and iteration == resume_iteration))
+            message_budget = self._message_budget()
             reminder_prefix = "Engine boundary reminder:\n"
             if (iteration + 1) % 5 == 0:
                 messages = [m for m in messages if not m.content.startswith(reminder_prefix)]
@@ -1224,6 +1248,8 @@ class BaseAgent:
             cap = max(2, min(6000, self.context_window_chars))
         else:
             cap = max(2, min(tokens, tokens * 3 - getattr(config, "max_tokens", 4096) * 3 - min(3000, tokens)))
+        if profile is not None:
+            cap = min(cap, profile.catalog_char_limit)
         from local_coder.context.catalog import select_tool_catalog
         selection = select_tool_catalog(schemas, role=self.role.value, task=task.objective,
                                         char_budget=cap, requested_names=sorted(self._discovered_tools),
@@ -1389,7 +1415,11 @@ class BaseAgent:
         reported = self._last_prompt_tokens / context if isinstance(context, int) and context > 0 else 0
         history = sum(message_size(message) for message in self.state.messages) if self.state else 0
         estimated = history / max(1, self._message_budget())
-        return sliding_tool_output_budget(self.max_tool_output_chars, self.max_tool_output_lines,
+        max_chars = self.max_tool_output_chars
+        profile = getattr(self, "_active_profile", None)
+        if profile is not None:
+            max_chars = min(max_chars, profile.tool_result_char_limit)
+        return sliding_tool_output_budget(max_chars, self.max_tool_output_lines,
                                           max(reported, estimated))
 
     def _project_root(self) -> Path | None:
