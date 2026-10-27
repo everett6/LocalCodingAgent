@@ -64,6 +64,7 @@ export default function App() {
   function chooseSession(id: string) {
     setView('conversation')
     const session = sessions.find(item => item.session_id === id)
+    if (session) setGoalId(session.goal_id || '')
     if (session?.mode) setMode(session.mode)
     if (session?.engagement_id) setEngagement(session.engagement_id)
     if (id === selected) return
@@ -178,7 +179,7 @@ export default function App() {
         engagementId = created.id; setEngagement(created.id)
       }
       const job = await api<Session>('/jobs', 'POST', {
-        goal_id: goalId || undefined, request: taskObjective(objective, contextFiles, taskMode), mode: taskMode, action: taskMode === 'red_team' ? 'run' : action,
+        goal_id: goalId || null, request: taskObjective(objective, contextFiles, taskMode), mode: taskMode, action: taskMode === 'red_team' ? 'run' : action,
         target_path: sourceOnly ? engagementDraft.paths.split('\n').find(path => path.trim()) || '.' : target || '.',
         fix: taskMode === 'red_team' ? false : fix,
         engagement_id: taskMode === 'red_team' ? engagementId || undefined : undefined,
@@ -201,7 +202,7 @@ export default function App() {
     if (quotaPaused && !quotaBudgetReady) { setView('harness'); setError('Set a positive task dollar cap before continuing with a metered or unpriced cloud model.'); return }
     setSending(true)
     try {
-      const job = await api<Session>('/jobs', 'POST', { request: `Resume: ${current.request}`, resume_checkpoint: current.checkpoint, mode: current.mode || mode, engagement_id: current.engagement_id, allow_model_change: quotaPaused ? true : undefined })
+      const job = await api<Session>('/jobs', 'POST', { request: `Resume: ${current.request}`, resume_checkpoint: current.checkpoint, mode: current.mode || mode, engagement_id: current.engagement_id, goal_id: current.goal_id, parent_session_id: current.session_id, allow_model_change: quotaPaused ? true : undefined })
       setSessions(previous => [job, ...previous]); chooseSession(job.session_id)
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Cannot resume checkpoint') }
     finally { setSending(false) }

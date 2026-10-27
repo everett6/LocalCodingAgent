@@ -370,6 +370,15 @@ class EngagementStore:
         kinds = {'source_read', 'static_scan', 'scanner_import', 'http_observation', 'proxy_history'}
         events = [event for event in record['events'] if event['kind'] in kinds]
         lookup = {event['id']: event for event in events}
+        # The visible working set is a rolling excerpt. Progress must instead
+        # cover the bounded durable journal, so rereading an older asset cannot
+        # appear new merely because it fell out of that excerpt. Transport
+        # attempt IDs identify executions, not changed observations.
+        observations = {hashlib.sha256(json.dumps({
+            'kind': event['kind'],
+            'data': {key: value for key, value in event['data'].items() if key != 'attempt_id'},
+        }, sort_keys=True).encode()).hexdigest() for event in events}
+        evidence_digest = hashlib.sha256(json.dumps(sorted(observations)).encode()).hexdigest()
         for event in events[-20:]:
             data = event['data']
             assets = self._evidence_assets(record, event)
@@ -423,7 +432,8 @@ class EngagementStore:
         if any(item['status'] != 'complete' for item in coverage):
             gaps.append('Static coverage is partial or unknown; narrow the scope or inspect skipped files')
         snapshot = _clean({'phase': record['phase'], 'scope': record['scope'], 'steps': record['steps'][:30],
-                           'evidence': summaries, 'findings': findings, 'coverage': coverage,
+                           'evidence': summaries, 'evidence_digest': evidence_digest,
+                           'findings': findings, 'coverage': coverage,
                            'counts': {'evidence': len(events), 'findings': len(record['findings'])}, 'gaps': gaps})
         # Preserve absence as absence without exposing authorization references.
         snapshot['scope']['authorization'] = '[REDACTED]' if record['scope'].get('authorization') else ''

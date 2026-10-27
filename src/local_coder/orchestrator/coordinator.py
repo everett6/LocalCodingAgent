@@ -603,7 +603,13 @@ class Coordinator:
                 
                 parsed = json.loads(json_str)
                 tasks = []
-                for t in parsed.get("tasks", []):
+                namespace = uuid.uuid4().hex[:12]
+                rows = parsed.get("tasks", [])
+                aliases = [t.get("task_id", f"task_{index}") for index, t in enumerate(rows)]
+                if any(not isinstance(alias, str) or not alias or len(alias) > 100 for alias in aliases) or len(set(aliases)) != len(aliases):
+                    raise ValueError("Plan task IDs must be unique bounded strings")
+                identities = {alias: f"{namespace}:{alias}" for alias in aliases}
+                for index, t in enumerate(rows):
                     role_str = t.get("role", "coder").upper()
                     try:
                         role = AgentRole[role_str]
@@ -611,13 +617,13 @@ class Coordinator:
                         role = AgentRole.CODER
                         
                     task_obj = AgentTask(
-                        task_id=t.get("task_id", f"task_{len(tasks)}"),
+                        task_id=identities[aliases[index]],
                         role=role,
                         objective=t.get("objective", request),
                         files=t.get("files", []),
                         constraints=t.get("constraints", []),
                         success_criteria=t.get("success_criteria", []),
-                        depends_on=t.get("depends_on", []),
+                        depends_on=[identities.get(dependency, f"{namespace}:{dependency}") for dependency in t.get("depends_on", [])],
                         model_name=t.get("model_name"),
                     )
                     tasks.append(task_obj)
@@ -633,7 +639,6 @@ class Coordinator:
                 pass
             
         task = AgentTask(
-            task_id="fallback_task",
             role=AgentRole.CODER,
             objective=request,
             files=[],
@@ -761,17 +766,23 @@ class Coordinator:
     def _parallelism_for_wave(self, tasks: list[AgentTask]) -> int:
         """Only parallelize mutations when their file scopes are explicit and disjoint."""
         configured = max(1, self.config.agentic.max_parallel_agents)
-        mutating_roles = {AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.TESTER}
+        mutating_roles = {AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.TESTER, AgentRole.BUG_HUNTER}
         mutating_tasks = [task for task in tasks if task.role in mutating_roles]
         if not mutating_tasks:
             return configured
         if any(not task.files for task in mutating_tasks):
             return 1
 
-        seen: set[str] = set()
+        from local_coder.workspace import Workspace
+        workspace = Workspace(self.project_root)
+        seen: set[Path] = set()
         for task in mutating_tasks:
-            file_scope = set(task.files)
-            if seen.intersection(file_scope):
+            try:
+                file_scope = {workspace.resolve(path) for path in task.files}
+            except (ValueError, OSError):
+                return 1
+            if any(left == right or left.is_relative_to(right) or right.is_relative_to(left)
+                   for left in file_scope for right in seen):
                 return 1
             seen.update(file_scope)
         return configured
@@ -986,7 +997,7 @@ class Coordinator:
             ToolName.READ_FILE, ToolName.LIST_FILES, ToolName.SEARCH_FILES,
             ToolName.GREP, ToolName.CODE_SEARCH, ToolName.REPO_MAP,
             ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG,
-            ToolName.LANGUAGE_CONTEXT, ToolName.MEMORY_SEARCH,
+            ToolName.LANGUAGE_CONTEXT, ToolName.MEMORY_SEARCH, ToolName.WEB_SEARCH,
         }
         permissions = self.tool_registry._permissions
         saved = {role: set(allowed) for role, allowed in permissions.items()}
@@ -1061,7 +1072,7 @@ class Coordinator:
         focus_note = f" Focus: {focus}" if focus else ""
         constraints = [
             "Read-only: do not modify project files (record_finding writes only the review ledger).",
-            "Analyze only the local workspace; do not contact external hosts.",
+            "Analyze only the local workspace. Configured web_search may research public references; do not scan, probe, or execute against external hosts.",
         ]
 
         if len(batches) <= 1:

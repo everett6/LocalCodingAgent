@@ -116,6 +116,7 @@ class ToolName(str, enum.Enum):
     DELEGATE_TASK = "delegate_task"
     GENERATED_TOOL = "generated_tool"
     MCP_CALL = "mcp_call"
+    WEB_SEARCH = "web_search"
     SKILL_LIBRARY = "skill_library"
 
 

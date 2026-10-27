@@ -38,10 +38,10 @@ class InvestigationAgent(BaseAgent):
     async def execute(self, task):
         profile = getattr(getattr(self.model, "config", None), "profile", "generic")
         if profile in {"glm53", "qwen38"} or profile.startswith("openrouter_"):
-            self.max_iterations = 40
-            self.max_tool_calls = 160
-            self.context_window_chars = min(self.model.config.context_length * 3, 240000)
-            self.compact_context_chars = self.context_window_chars // 2
+            self.max_iterations = min(self.max_iterations, 40)
+            self.max_tool_calls = min(self.max_tool_calls, 160)
+            self.context_window_chars = min(self.context_window_chars, self.model.config.context_length * 3, 240000)
+            self.compact_context_chars = min(self.compact_context_chars, self.context_window_chars // 2)
         task = task.model_copy(deep=True)
         scans = ([('run_sast', {"tool": "builtin"}), ('audit_config', {}), ('audit_dependencies', {})]
                  if self.role == AgentRole.SECURITY else [('run_bug_scan', {})])

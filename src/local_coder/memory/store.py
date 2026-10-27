@@ -5,7 +5,7 @@ import json
 import logging
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -352,10 +352,11 @@ class MemoryStore:
     def _cleanup_scratchpad_sync(self, max_age_hours: int) -> int:
         conn = self._get_conn()
         try:
+            cutoff = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
             cursor = conn.execute(
                 """DELETE FROM agent_scratchpad
-                   WHERE created_at < datetime('now', ?)""",
-                (f"-{max_age_hours} hours",),
+                   WHERE created_at < ?""",
+                (cutoff,),
             )
             conn.commit()
             return cursor.rowcount

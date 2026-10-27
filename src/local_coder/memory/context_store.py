@@ -327,16 +327,23 @@ class ContextMemory:
                 self._refresh_code_graph(connection)
         return [self.get(row["id"]) for row in rows]
 
-    def _freshness(self, row: dict, head: str | None) -> str:
+    def _freshness(self, row: dict, head: str | None, source_hashes: dict[str, str | None] | None = None) -> str:
         if row["source_path"]:
-            try:
-                path = self._path(row["source_path"])
-                if not path.is_file():
-                    return "source_missing"
-                if path.stat().st_size > self.max_file_bytes or _digest(path.read_bytes()) != row["source_hash"]:
-                    return "source_changed"
-            except (OSError, ValueError):
+            # Share a source snapshot only within one retrieval. Each stored row
+            # still compares its own hash, and the next request reads anew.
+            source_hashes = {} if source_hashes is None else source_hashes
+            source = row["source_path"]
+            if source not in source_hashes:
+                try:
+                    path = self._path(source)
+                    source_hashes[source] = (None if not path.is_file() else "" if path.stat().st_size > self.max_file_bytes
+                                             else _digest(path.read_bytes()))
+                except (OSError, ValueError):
+                    source_hashes[source] = None
+            if source_hashes[source] is None:
                 return "source_missing"
+            if source_hashes[source] != row["source_hash"]:
+                return "source_changed"
             if (row["metadata"].get("correction_status") == "human_corrected_unverified"
                     or row["metadata"].get("structure_status") == "corrected_unverified"):
                 return "corrected_unverified"
@@ -346,10 +353,11 @@ class ContextMemory:
             return "head_changed"
         return "fresh"
 
-    def _view(self, connection: sqlite3.Connection, record: sqlite3.Row, head: str | None) -> dict:
+    def _view(self, connection: sqlite3.Connection, record: sqlite3.Row, head: str | None,
+              source_hashes: dict[str, str | None] | None = None) -> dict:
         row = dict(record)
         row["metadata"] = json.loads(row["metadata"])
-        row["freshness"] = self._freshness(row, head)
+        row["freshness"] = self._freshness(row, head, source_hashes)
         row["head_changed"] = row["head"] != head
         row["source_status"] = ("content_verified" if row["freshness"] == "fresh" else row["freshness"]) if row["source_path"] else "not_source_bound"
         stored = connection.execute("SELECT backend FROM vectors WHERE memory_id=?", (row["id"],)).fetchone()
@@ -426,8 +434,9 @@ class ContextMemory:
                 seen = {record["id"] for record in records}
                 records = list(records) + [record for record in additional if record["id"] not in seen]
             ranked, candidates = [], []
+            source_hashes: dict[str, str | None] = {}
             for record in records:
-                row = self._view(connection, record, head)
+                row = self._view(connection, record, head, source_hashes)
                 stored_vector = json.loads(row.pop("vector"))
                 backend = row.pop("vector_backend")
                 lexical = row.pop("lexical")
@@ -476,7 +485,7 @@ class ContextMemory:
                         continue
                     dependencies = connection.execute("SELECT m.*,c.expression AS call_expression,c.line AS call_line,c.resolution AS call_resolution FROM code_calls c JOIN memories m ON m.id=c.target_id WHERE c.source_id=? AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY c.line,c.target_id LIMIT 4", (row['id'], task_id, task_id)).fetchall()
                     for record in dependencies:
-                        helper = self._view(connection, record, head)
+                        helper = self._view(connection, record, head, source_hashes)
                         expression, line = helper.pop('call_expression'), helper.pop('call_line')
                         resolution = helper.pop('call_resolution')
                         if helper['freshness'] != 'fresh':

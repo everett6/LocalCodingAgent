@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextvars
+import sqlite3
 import time
 from typing import Any
 
@@ -133,10 +134,12 @@ class ToolRegistry:
 
         # code_search and repo_map are read-only, so every role that can
         # grep can use them.
-        for allowed in self._permissions.values():
+        for role, allowed in self._permissions.items():
             if ToolName.GREP in allowed:
                 allowed.add(ToolName.CODE_SEARCH)
                 allowed.add(ToolName.REPO_MAP)
+                if role != AgentRole.EXPLOIT_VALIDATOR:
+                    allowed.add(ToolName.WEB_SEARCH)
     
     def register(self, tool: Tool) -> None:
         """Register a tool instance."""
@@ -389,8 +392,13 @@ class ToolRegistry:
                 current = self.task_context.get() or {}
                 kind = "finding" if name_enum == ToolName.RECORD_FINDING and result.success else "tool" if result.success else "failure"
                 source = arguments.get("path") if name_enum in {ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.LANGUAGE_CONTEXT} else None
-                await asyncio.to_thread(memory.ingest, kind, result.output[:16000], source_path=source,
-                                        task_id=current.get("task_id"), metadata={"tool": tool_name, "success": result.success})
+                try:
+                    await asyncio.to_thread(memory.ingest, kind, result.output[:16000], source_path=source,
+                                            task_id=current.get("task_id"), metadata={"tool": tool_name, "success": result.success})
+                except (OSError, ValueError, sqlite3.Error):
+                    # Optional evidence storage must not turn a known completed
+                    # mutation into an unknown failure that invites a replay.
+                    result.data["memory_ingest_failed"] = True
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)
             return result

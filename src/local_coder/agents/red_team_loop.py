@@ -21,7 +21,7 @@ def progress_fingerprint(snapshot):
     findings = [{key: item.get(key) for key in ('id', 'title', 'asset', 'source_status')}
                 for item in snapshot.get('findings', [])]
     value = {'phase': snapshot.get('phase'), 'steps': snapshot.get('steps', []),
-             'evidence': sorted(evidence), 'findings': findings}
+             'evidence': snapshot.get('evidence_digest', sorted(evidence)), 'findings': findings}
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 

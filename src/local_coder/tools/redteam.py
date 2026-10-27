@@ -306,4 +306,4 @@ def bind_engagement(registry, project_root, engagement_id):
     for cls in generated:
         registry.register(cls(project_root, safety_harness=getattr(registry, "safety_harness", None),
                               approval_callback=getattr(registry, "approval_callback", None), engagement_id=engagement_id))
-    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY}
+    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY, ToolName.WEB_SEARCH}

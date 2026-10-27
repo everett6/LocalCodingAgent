@@ -12,15 +12,21 @@ export function isContextPath(path: string): boolean {
 export function taskObjective(request: string, files: string[], mode: Mode): string {
   if (mode === 'red_team') return request
   const selected = [...new Set(files.filter(isContextPath))].slice(0, 12)
-  return selected.length ? `${request}\n\nRelevant local files:\n${selected.map(path => `@${path}`).join('\n')}` : request
+  let result = request
+  for (const path of selected) {
+    const addition = `${result === request ? '\n\nRelevant local files:\n' : '\n'}@${path}`
+    if (result.length + addition.length <= 32000) result += addition
+  }
+  return result
 }
 
 /** A new job must carry the reviewed plan; conversation selection is not model context. */
 export function planDraft(objective: string, report: string): string {
-  const limit = 60000
-  const excerpt = report.slice(0, limit)
-  const note = report.length > limit ? '\n\n[Plan excerpt truncated. Review the complete saved report before implementation.]' : ''
-  return `Implement this reviewed plan. Verify its assumptions against the current workspace before editing.\n\nOriginal objective: ${objective.slice(0, 12000)}\n\nReviewed plan:\n${excerpt}${note}`
+  // Leave room for file context within the API's 32,000-character request cap.
+  const prefix = `Implement this reviewed plan. Verify its assumptions against the current workspace before editing.\n\nOriginal objective: ${objective.slice(0, 8000)}\n\nReviewed plan:\n`
+  const note = '\n\n[Plan excerpt truncated. Review the complete saved report before implementation.]'
+  const limit = 28000 - prefix.length
+  return prefix + (report.length > limit ? report.slice(0, limit - note.length) + note : report)
 }
 
 export type PlanTask = { task_id: string; objective: string; status?: string }

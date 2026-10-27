@@ -50,6 +50,7 @@ def create_tool_registry(
     from local_coder.core.snapshots import FileSnapshots
     from local_coder.integrations.mcp import MCPManager
     from local_coder.tools.mcp import MCPTool
+    from local_coder.tools.web_search import WebSearchTool
     from local_coder.skills import SkillLibrary, SkillLibraryTool
     from local_coder.types import AgentRole, ToolName
     registry.context_memory = ContextMemory(project_root)
@@ -73,7 +74,7 @@ def create_tool_registry(
     for cls in (GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool):
         registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
     for tool in (MemorySearchTool(registry.context_memory), MemoryWriteTool(registry.context_memory), TaskMemoryTool(registry.context_memory),
-                 LanguageContextTool(registry.language_service), MCPTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
+                 LanguageContextTool(registry.language_service), MCPTool(registry.mcp), WebSearchTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
                  HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision,
                                    improvement_evaluator=improvement_evaluator),
                  DelegateTaskTool(), GeneratedToolTool(registry.evolution, runner=registry.sandbox.run)):

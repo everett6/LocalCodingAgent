@@ -28,8 +28,9 @@ class AgentEvent:
         data: Optional[dict] = None,
         task_id: Optional[str] = None,
         timestamp: Optional[float] = None,
+        id: Optional[str] = None,
     ):
-        self.id = str(uuid.uuid4())
+        self.id = id if id is not None else str(uuid.uuid4())
         self.source = source
         self.event_type = event_type
         self.message = message
@@ -113,19 +114,21 @@ class InMemoryEventBus(EventBus):
             if len(self._all_events) > self._max_all_events:
                 self._all_events = self._all_events[-self._max_all_events:]
             
-            # Notify handlers for this event type
-            handlers = self._handlers.get(event.event_type, [])
-            for handler, priority in sorted(handlers, key=lambda x: -x[1]):
-                try:
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(event)
-                    else:
-                        handler(event)
-                except Exception as e:
-                    # Log error but don't crash the bus
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.error(f"Error in event handler for {event.event_type}: {e}")
+            # Freeze delivery order before callbacks may change subscriptions.
+            handlers = sorted(self._handlers.get(event.event_type, []), key=lambda x: -x[1])
+        # Callbacks can subscribe, unsubscribe or emit nested events. None of
+        # those operations may wait for a lock held by their own emitter.
+        for handler, priority in handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(event)
+                else:
+                    handler(event)
+            except Exception as e:
+                # Log error but don't crash the bus
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error in event handler for {event.event_type}: {e}")
     
     async def on(self, event_type: str, handler: Callable[[AgentEvent], None], priority: int = 0) -> None:
         """Register a handler for a specific event type."""

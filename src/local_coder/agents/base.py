@@ -287,29 +287,56 @@ class BaseAgent:
         return path
 
     async def _finish_run(self, response: AgentResponse) -> None:
-        ledger = getattr(self.tool_registry, "goal_ledger", None)
-        if ledger is not None and ledger.get(response.task_id):
-            revisions = {self._test_revisions.get(name) for name in self._tests_run}
-            revision = next(iter(revisions)) if len(revisions) == 1 else None
-            await asyncio.to_thread(ledger.finish, response, verification_revision=revision)
-        memory = getattr(self.tool_registry, "context_memory", None)
-        if memory is not None and getattr(self.tool_registry, "memory_enabled", True):
-            await asyncio.to_thread(memory.ingest, "decision", response.summary[:20000], task_id=response.task_id,
-                                    metadata={"status": response.status.value, "tests_passed": response.tests_passed})
-            await asyncio.to_thread(memory.task_state, response.task_id,
-                                    {"unfinished_work": [] if response.status == TaskStatus.COMPLETED else [self.state.objective],
-                                     "failed_attempts": [entry["observation"] for entry in self._progress_journal if not entry["success"]][-20:]})
-        evolution = getattr(self.tool_registry, "evolution", None)
-        if evolution is not None:
-            for revision in evolution.active_revisions():
-                evolution.record_outcome(revision["revision_id"], {"task_id": response.task_id, "completed": response.status == TaskStatus.COMPLETED,
-                                                                "tests_passed": response.tests_passed, "model_calls": response.metrics.model_calls})
+        # A completed execution must be durable before best-effort indexing and
+        # learning. Their failure cannot turn applied work into a replayable run.
         self.state.phase = AgentPhase.DONE if response.status == TaskStatus.COMPLETED else AgentPhase.FAILED
         self.state.finished_at = datetime.now()
         if self._run is not None:
             await self.runtime.end_run(self._run.run_id, self.state,
                                        success=response.status == TaskStatus.COMPLETED, result=response)
             self._run = None
+
+        def warning(component):
+            logger.warning("Completed run retained; optional %s tracking failed", component)
+            try:
+                self._emit_event("tracking_warning", f"Execution finished, but {component} tracking could not be updated.",
+                                 task_id=response.task_id, data={"component": component, "result_retained": True})
+            except Exception:
+                logger.warning("Optional tracking warning could not be delivered")
+
+        ledger = getattr(self.tool_registry, "goal_ledger", None)
+        if ledger is not None:
+            try:
+                if await asyncio.to_thread(ledger.get, response.task_id):
+                    revisions = {self._test_revisions.get(name) for name in self._tests_run}
+                    revision = next(iter(revisions)) if len(revisions) == 1 else None
+                    await asyncio.to_thread(ledger.finish, response, verification_revision=revision)
+            except (AgentBlocked, ProviderQuotaExhausted):
+                raise
+            except Exception:
+                warning("goal")
+        memory = getattr(self.tool_registry, "context_memory", None)
+        if memory is not None and getattr(self.tool_registry, "memory_enabled", True):
+            try:
+                await asyncio.to_thread(memory.ingest, "decision", response.summary[:20000], task_id=response.task_id,
+                                        metadata={"status": response.status.value, "tests_passed": response.tests_passed})
+                await asyncio.to_thread(memory.task_state, response.task_id,
+                                        {"unfinished_work": [] if response.status == TaskStatus.COMPLETED else [self.state.objective],
+                                         "failed_attempts": [entry["observation"] for entry in self._progress_journal if not entry["success"]][-20:]})
+            except (AgentBlocked, ProviderQuotaExhausted):
+                raise
+            except Exception:
+                warning("memory")
+        evolution = getattr(self.tool_registry, "evolution", None)
+        if evolution is not None:
+            try:
+                for revision in evolution.active_revisions():
+                    evolution.record_outcome(revision["revision_id"], {"task_id": response.task_id, "completed": response.status == TaskStatus.COMPLETED,
+                                                                    "tests_passed": response.tests_passed, "model_calls": response.metrics.model_calls})
+            except (AgentBlocked, ProviderQuotaExhausted):
+                raise
+            except Exception:
+                warning("evolution")
 
     async def _maybe_draft(self, task: AgentTask):
         """Best-effort speculative draft of the first listed file's edit,
@@ -1056,7 +1083,8 @@ class BaseAgent:
             (("harness", "scaffold", "self-improv"), ["harness_evolve", "generated_tool", "delegate_task"]),
             (("memory", "recall", "context"), ["memory_search", "task_memory", "memory_write", "language_context"]),
             (("github", "mcp", "connection"), ["mcp_call", "skill_library"]),
-            (("security", "vulnerab", "injection", "audit", "red team"), ["redteam_workflow", "redteam_read_source", "generate_exploit", "analyze_privilege_escalation", "generate_fuzz_cases", "security_playbook", "run_sast", "record_finding"]),
+            (("search", "research", "cve", "advisory", "documentation", "bounty"), ["web_search"]),
+            (("security", "vulnerab", "injection", "audit", "red team"), ["redteam_workflow", "redteam_read_source", "web_search", "generate_exploit", "analyze_privilege_escalation", "generate_fuzz_cases", "security_playbook", "run_sast", "record_finding"]),
         )
         for words, names in groups:
             if any(word in objective for word in words):

@@ -10,6 +10,12 @@ Existing `local-coder` commands, saved workspace directories, provider settings,
 
 *Workspace preview with synthetic tasks; no model is connected in this fixture.*
 
+Agent workflow improvements and remaining work are documented in the
+[execution and context audit](docs/reviews/2026-10-26-agentic-audit.md).
+Agents also have [bounded public web search](docs/web-search.md) through an
+explicitly configured MCP search service; no search account or credential is
+enabled automatically.
+
 ## Install
 
 Install the command into your Python environment:

@@ -39,8 +39,8 @@ Recommend separate reviewed sandbox validation for supported local findings.'''
 
     async def execute(self, task):
         self._loop_key, self._stalled_rounds, self._snapshot = None, 0, {}
-        self.max_iterations = 40
-        self.max_tool_calls = 160
+        self.max_iterations = min(self.max_iterations, 40)
+        self.max_tool_calls = min(self.max_tool_calls, 160)
         config = getattr(self.model, 'config', None)
         if config is not None and (getattr(config, 'profile', '') in {'glm53', 'qwen38'} or getattr(config, 'profile', '').startswith('openrouter_')):
             self.context_window_chars = min(self.context_window_chars, config.context_length * 3, 240000)
