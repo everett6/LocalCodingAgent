@@ -14,11 +14,12 @@ from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 class OpenAICompatibleBackend(BaseModelBackend):
     """Backend for OpenAI-compatible APIs (vLLM, LMStudio, llama.cpp server)."""
 
-    def __init__(self, config: ModelConfig, quota_guard=None):
+    def __init__(self, config: ModelConfig, quota_guard=None, *, trust_env: bool = True):
         super().__init__(config)
         self.quota_guard = quota_guard
         key = config.resolve_api_key()
         self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0,
+                                        trust_env=trust_env, follow_redirects=False,
                                         headers={"Authorization": f"Bearer {key}"} if key else {})
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:

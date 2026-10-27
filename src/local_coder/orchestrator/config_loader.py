@@ -243,7 +243,8 @@ def load_config(
     fallbacks = {}
     for name, alternatives in (routing_data.get("fallbacks", {}) or {}).items():
         fallbacks[name] = [alternatives] if isinstance(alternatives, str) else list(alternatives or [])
-    routing = RoutingConfig(escalate_to=routing_data.get("escalate_to"), fallbacks=fallbacks)
+    routing = RoutingConfig(**{key: value for key, value in routing_data.items()
+                              if key in RoutingConfig.model_fields and key != "fallbacks"}, fallbacks=fallbacks)
 
     tools_data = data.get("tools", {}) or {}
     tool_roles = {role: list(names or []) for role, names in (tools_data.get("roles", {}) or {}).items()}

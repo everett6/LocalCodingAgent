@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
 import { ContextAccountingPanel } from './ContextAccountingPanel'
+import { AutoRoutingPanel } from './AutoRoutingPanel'
 import { ReadinessPanel } from './ReadinessPanel'
 import type { Readiness } from './ReadinessPanel'
 
@@ -256,6 +257,7 @@ export function HarnessPanel({ disabled = false, mode = 'coding' }: { disabled?:
     {tab === 'controls' && <>
       <ReadinessPanel readiness={status?.readiness} />
       <ModelInspector status={status} />
+      <AutoRoutingPanel disabled={disabled} />
       {status && <details open>
         <summary>Current runtime</summary>
         <p>{budget ? `${budget.requests.toLocaleString()}${budget.limits?.max_requests !== undefined ? ` / ${budget.limits.max_requests.toLocaleString()}` : ''} model calls · ${budget.tokens.toLocaleString()}${budget.limits?.max_tokens !== undefined ? ` / ${budget.limits.max_tokens.toLocaleString()}` : ''} reported or reserved tokens` : 'No active task budget is available.'}</p>

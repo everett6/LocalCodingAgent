@@ -397,6 +397,11 @@ class RoutingConfig(BaseModel):
     """
     escalate_to: str | None = None
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+    auto_enabled: bool = Field(default=True, strict=True)
+    economy_model: str | None = Field(default=None, max_length=100)
+    local_classifier: str | None = Field(default=None, max_length=100)
+    classifier_timeout_seconds: float = Field(default=2, ge=0.25, le=5, strict=True)
+    allow_cross_provider: bool = Field(default=False, strict=True)
 
 
 class ToolSettings(BaseModel):

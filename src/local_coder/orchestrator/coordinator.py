@@ -184,18 +184,18 @@ class Coordinator:
             target = workspace.resolve(path)
             if roots and not any(target == root or target.is_relative_to(root) for root in roots):
                 raise ValueError("Child task path exceeds inherited scope")
-        agent = create_agent(child, await self.model_manager.get_model(child), self.tool_registry, self._dispatch,
+        inherited_constraints = [str(value)[:1000] for value in current.get("constraints", [])[:20]]
+        expected = "Return a concise summary, changed/artifact paths, actual checks and unresolved acceptance criteria. Model assertions are not verification."
+        task = AgentTask(role=child, objective=request["objective"], files=files,
+                         constraints=inherited_constraints + ["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate.", expected],
+                         success_criteria=[str(value)[:1000] for value in current.get("success_criteria", [])[:20]])
+        agent = create_agent(child, await self._model_for(child, task=task), self.tool_registry, self._dispatch,
                              context_window_chars=self.config.agentic.context_window_chars,
                              compact_context_chars=self.config.agentic.compact_context_chars)
         agent.delegation_depth = 1
         agent.host_write_scope = (() if inherited_scope is not None and not inherited_scope else
                                   tuple(str(workspace.resolve(path)) for path in files) or (str(workspace.root),))
         agent.host_parallel_worker = current.get("parallel_worker") is True
-        inherited_constraints = [str(value)[:1000] for value in current.get("constraints", [])[:20]]
-        expected = "Return a concise summary, changed/artifact paths, actual checks and unresolved acceptance criteria. Model assertions are not verification."
-        task = AgentTask(role=child, objective=request["objective"], files=files,
-                         constraints=inherited_constraints + ["Leaf task: preserve the parent's scope, shared budget, and approval requirements; do not delegate.", expected],
-                         success_criteria=[str(value)[:1000] for value in current.get("success_criteria", [])[:20]])
         self._emit("ORCHESTRATOR", "subagent_started", f"Started scoped {child.value} leaf task", data={
             "task_id": task.task_id, "parent_task_id": current["task_id"], "objective": task.objective,
             "files": files, "timeout_seconds": task.timeout_seconds,
@@ -477,6 +477,20 @@ class Coordinator:
                 self.tool_registry._permissions[AgentRole.EXPLORER] = explorer_permissions
                 self.tool_registry._permissions[AgentRole.PLANNER] = planner_permissions
 
+        # Narrow read-only answers need no paid planner, writer or reviewer.
+        # This is a host rule, never an instruction from a routing model.
+        from local_coder.models.auto_routing import classify_task
+        direct = classify_task(objective, AgentRole.EXPLORER, mode)
+        if (self.config.routing.auto_enabled and self.config.routing.economy_model
+                and direct.reason == "narrow_read_only"
+                and (checkpoint is None or checkpoint.get("plan") is None)):
+            response = await self._resumable(checkpoint, "economy_read",
+                lambda: self._execute_routed_read(objective), AgentResponse)
+            self._raise_if_blocked(response)
+            self._emit("ORCHESTRATOR", "task_completed" if response.status == TaskStatus.COMPLETED else "task_failed",
+                       "Read-only answer completed" if response.status == TaskStatus.COMPLETED else "Read-only answer failed")
+            return response.summary
+
         # Step 1: Explore repository
         self._emit("ORCHESTRATOR", "phase", "Exploring repository...")
         exploration = await self._resumable(checkpoint, "explore", lambda: self._explore(objective))
@@ -592,8 +606,22 @@ class Coordinator:
             "call repo_map with other terms to re-center it.\n" + text
         )
 
+    async def _execute_routed_read(self, request: str) -> AgentResponse:
+        task = AgentTask(role=AgentRole.EXPLORER, objective=request,
+                         constraints=["Read-only answer with source references and observed evidence."])
+        model = await self._model_for(task.role, task=task)
+        task.context.architecture = await self._repo_map(request)
+        agent = create_agent(task.role, model, self.tool_registry, self._dispatch,
+                             context_window_chars=self.config.agentic.context_window_chars,
+                             compact_context_chars=self.config.agentic.compact_context_chars)
+        self._emit_task_status(task.task_id, "running")
+        response = await agent.execute(task)
+        self._emit_task_status(task.task_id, response.status.value, response.summary[:200])
+        return response
+
     async def _explore(self, request: str) -> str:
-        model = await self.model_manager.get_model(AgentRole.EXPLORER)
+        routing_task = AgentTask(role=AgentRole.EXPLORER, objective=request)
+        model = await self._model_for(AgentRole.EXPLORER, task=routing_task)
 
         # Exploration's prefix (system prompt + repository structure) is the
         # part of the conversation most likely to be identical across
@@ -717,9 +745,24 @@ class Coordinator:
     async def _execute_simple(self, request: str, exploration: str, task_id: str | None = None) -> AgentResponse:
         planned = _planned_simple.get()
         role = planned.role if planned is not None else AgentRole.CODER
+        kwargs = {"task_id": task_id} if task_id else {}
+        task = AgentTask(
+            role=role,
+            objective=request,
+            context=TaskContext(previous_findings=[exploration] if exploration else []),
+            **kwargs,
+        )
+        if planned is not None:
+            task = planned.model_copy(deep=True)
+            task.context.previous_findings.append(exploration)
+        # Route against the full inherited task before adding a potentially large
+        # repository map. Neither selected context nor tool permissions are removed.
+        model = await self._model_for(role, task.model_name, task=task)
+        if not task.context.architecture:
+            task.context.architecture = await self._repo_map(task.objective, task.files)
         coder = create_agent(
             role,
-            await self._model_for(role, planned.model_name if planned is not None else None),
+            model,
             self.tool_registry,
             self._dispatch,
             context_window_chars=self.config.agentic.context_window_chars,
@@ -727,18 +770,6 @@ class Coordinator:
             drafter=await self._get_drafter() if role in (AgentRole.CODER, AgentRole.DEBUGGER) else None,
         )
         if coder:
-            kwargs = {"task_id": task_id} if task_id else {}
-            task = AgentTask(
-                role=AgentRole.CODER,
-                objective=f"Request: {request}\nContext: {exploration}",
-                context=TaskContext(architecture=await self._repo_map(request)),
-                **kwargs,
-            )
-            if planned is not None:
-                task = planned.model_copy(deep=True)
-                task.context.previous_findings.append(exploration)
-                if not task.context.architecture:
-                    task.context.architecture = await self._repo_map(task.objective, task.files)
             self._emit_task_status(task.task_id, "running")
             response = await coder.execute(task)
             self._raise_if_blocked(response)
@@ -906,7 +937,11 @@ class Coordinator:
                 if checkpoint is not None:
                     checkpoint.put(f"task.{task.task_id}", response.model_dump(mode="json"))
 
-    async def _model_for(self, role: AgentRole, model_name: str | None = None, escalate: bool = False):
+    async def _model_for(self, role: AgentRole, model_name: str | None = None, escalate: bool = False, *, task: AgentTask | None = None):
+        if task is not None and self.config.routing.auto_enabled and self.config.routing.economy_model:
+            model, decision = await self.model_manager.route_model(role, task, model_name, retry=escalate)
+            self._emit("ORCHESTRATOR", "routing_decision", "Resolved bounded task routing", task_id=task.task_id, data=decision)
+            return model
         if escalate:
             return await self.model_manager.get_model(role, model_name, escalate=True)
         if model_name is None:
@@ -932,7 +967,7 @@ class Coordinator:
             drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
             agent = create_agent(
                 task.role,
-                await self._model_for(task.role, task.model_name, escalate=escalate),
+                await self._model_for(task.role, task.model_name, escalate=escalate, task=task),
                 self.tool_registry,
                 self._dispatch,
                 context_window_chars=self.config.agentic.context_window_chars,

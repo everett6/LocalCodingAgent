@@ -203,6 +203,13 @@ def test_remote_one_click_redteam_uses_local_engagement_without_inference_networ
         "request": "Review this project's source code", "mode": "red_team"
     })
     assert status == 202 and completed.wait(2)
+    # close_all precedes durable completion; wait for the worker, not that
+    # intermediate callback, before asserting the persisted terminal status.
+    with server.lock:
+        running = server._jobs.get(job["session_id"])
+    if running is not None:
+        running["thread"].join(timeout=2)
+        assert not running["thread"].is_alive()
     engagement = server.engagements.load(observed[0]["engagement_id"])
     assert engagement["scope"]["origins"] == []
     assert engagement["scope"]["active_http"] is False

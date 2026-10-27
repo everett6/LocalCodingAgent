@@ -162,7 +162,7 @@ class RemoteControlServer(WorkbenchAPI):
         if self._using_inference and provider is None:
             raise ValueError("The on-device model is not ready")
         if provider is not None:
-            config.models = {"workbench": provider.model_copy(deep=True)}
+            config.models = {**config.models, "workbench": provider.model_copy(deep=True)}
             config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
         elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
@@ -186,6 +186,7 @@ class RemoteControlServer(WorkbenchAPI):
                     config.models[model.name] = model
                     for role in roles[purpose]:
                         config.agentic.role_models[role] = model.name
+        self._apply_auto_routing(config, provider)
         from local_coder.providers.context_policy import context_policy
         selected = provider or config.models.get(self.model_name or "default") or next(iter(config.models.values()), None)
         if selected is not None and selected.auto_context:
