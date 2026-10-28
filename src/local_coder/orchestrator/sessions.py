@@ -225,6 +225,108 @@ class Session:
             lines.append(f"\n## Request {turn['index'] + 1}: {turn['request']}\nResult:\n{result}")
         return "\n".join(lines)
 
+    def progress(self, turn_index: int | None = None) -> dict[str, Any] | None:
+        """Return a structured view of saved phases and DAG task transitions."""
+        if not self.turns:
+            return None
+        if turn_index is None:
+            turn = self.last_turn()
+        else:
+            if isinstance(turn_index, bool) or not isinstance(turn_index, int) or turn_index < 0:
+                raise ValueError("Turn index must be a non-negative integer")
+            turn = next((item for item in self.turns if item.get("index") == turn_index), None)
+            if turn is None:
+                raise SessionError(f"Turn not found: {turn_index}")
+
+        assert turn is not None
+        index = turn["index"]
+        checkpoints = turn.get("checkpoints", {})
+        current_phase = turn.get("phase")
+        planned_tasks: dict[str, dict[str, Any]] = {}
+        task_states: dict[str, dict[str, Any]] = {}
+
+        plan = checkpoints.get("plan")
+        if isinstance(plan, dict):
+            for item in plan.get("tasks", []):
+                if isinstance(item, dict) and isinstance(item.get("task_id"), str):
+                    planned_tasks[item["task_id"]] = item
+        plan_events = []
+        latest_status: dict[str, dict[str, Any]] = {}
+        if self.events_path.is_file():
+            with self.events_path.open(encoding="utf-8") as events:
+                for line in events:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("turn") != index:
+                        continue
+                    if event.get("event_type") == "phase":
+                        current_phase = event.get("message") or current_phase
+                    elif event.get("event_type") == "plan_created":
+                        data = event.get("data")
+                        if isinstance(data, dict) and isinstance(data.get("tasks"), list):
+                            plan_events = data["tasks"]
+                    elif event.get("event_type") == "task_status":
+                        data = event.get("data")
+                        if isinstance(data, dict) and isinstance(data.get("task_id"), str):
+                            latest_status[data["task_id"]] = data
+
+        if not planned_tasks:
+            for item in plan_events:
+                if isinstance(item, dict) and isinstance(item.get("task_id"), str):
+                    planned_tasks[item["task_id"]] = item
+
+        for task_id, task in planned_tasks.items():
+            saved = checkpoints.get(f"task.{task_id}")
+            status_data = latest_status.get(task_id, {})
+            status = status_data.get("status", "pending")
+            summary = status_data.get("note", "")
+            if isinstance(saved, dict):
+                status = saved.get("status", status)
+                summary = saved.get("summary", summary)
+            task_states[task_id] = {
+                "task_id": task_id,
+                "role": task.get("role", ""),
+                "objective": task.get("objective", ""),
+                "status": status,
+                "summary": summary,
+            }
+
+        if not planned_tasks and isinstance(checkpoints.get("execute"), dict):
+            result = checkpoints["execute"]
+            task_id = result.get("task_id", "execute")
+            task_states[task_id] = {
+                "task_id": task_id,
+                "role": "coder",
+                "objective": turn.get("request", ""),
+                "status": result.get("status", "unknown"),
+                "summary": result.get("summary", ""),
+            }
+
+        phase_names = ("explore", "plan", "execute", "review", "tests.0")
+        completed_phases = [name for name in phase_names if name in checkpoints]
+        completed_phases.extend(
+            name for name in checkpoints
+            if name.startswith(("tests.", "fix.")) and name not in completed_phases
+        )
+        return {
+            "session_id": self.session_id,
+            "turn_index": index,
+            "request": turn.get("request", ""),
+            "status": turn.get("status", "unknown"),
+            "current_phase": current_phase,
+            "completed_phases": completed_phases,
+            "tasks": list(task_states.values()),
+            "task_counts": {
+                status: sum(item["status"] == status for item in task_states.values())
+                for status in ("pending", "running", "completed", "failed")
+            },
+            "error": turn.get("error"),
+            "report_available": bool(turn.get("report")),
+            "updated_at": turn.get("finished_at") or turn.get("started_at"),
+        }
+
     def start_turn(self, request: str, phase: str = "run") -> dict[str, Any]:
         previous = self.unfinished_turn()
         if previous is not None:

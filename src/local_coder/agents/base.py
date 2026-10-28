@@ -24,6 +24,7 @@ from local_coder.context.compression import (
     truncate_tool_output,
 )
 from local_coder.statedir import state_path
+from local_coder.memory.lessons import ProjectLessonStore
 from local_coder.agents.tool_repair import (
     RepairedCall, extract_text_tool_calls, repair_tool_call, schemas_by_name,
 )
@@ -83,8 +84,8 @@ class BaseAgent:
         model,  # LocalModel protocol
         tool_registry,  # ToolRegistry
         event_callback: Callable[[AgentEvent], None] | None = None,
-        context_window_chars: int = 24000,
-        compact_context_chars: int = 12000,
+        context_window_chars: int = 180000,
+        compact_context_chars: int = 90000,
         drafter=None,  # Optional[SpeculativeDrafter]
         max_tool_output_chars: int | None = None,
     ):
@@ -910,6 +911,16 @@ class BaseAgent:
             parts.append("### Relevant symbols\n" + "\n".join(f"- {symbol}" for symbol in task.context.relevant_symbols))
         if task.context.guidelines:
             parts.append("## Project Guidelines (AGENTS.md)\n" + task.context.guidelines)
+
+        project_root = self._project_root()
+        if project_root is not None:
+            lessons = ProjectLessonStore(project_root).render()
+            if lessons:
+                parts.append(
+                    "## Operator-approved project lessons\n"
+                    "Apply these reusable project notes when relevant, but verify them "
+                    "against the current code and task:\n" + lessons
+                )
 
         if task.files:
             parts.append("## Relevant Files\n" + "\n".join(f"- {f}" for f in task.files))

@@ -115,7 +115,7 @@ def test_custom_commands_appear_in_help_and_completion(tmp_path):
     console = Console(file=io.StringIO(), width=100, color_system=None)
     console.print(ui.build_help_table())
     text = console.file.getvalue()
-    assert "Custom" in text and "/review-auth" in text and "Review auth" in text
+    assert "Skills & custom" in text and "/review-auth" in text and "Review auth" in text
     assert text.index("/quit") < text.index("/review-auth")
 
 
@@ -160,4 +160,5 @@ def test_commands_subcommand_when_empty(tmp_path):
     (tmp_path / "proj").mkdir()
     result = CliRunner().invoke(cli, ["--project", str(tmp_path / "proj"), "commands"])
     assert result.exit_code == 0
-    assert "No custom commands" in result.output
+    assert "Skills and custom commands" in result.output
+    assert "/implement" in result.output

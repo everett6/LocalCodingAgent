@@ -80,6 +80,8 @@ def test_load_config_falls_back_to_defaults_with_no_file(tmp_path):
 
     assert config.models == {}
     assert config.approval.require_approval_for_commands is True
+    assert config.agentic.context_window_chars == 180000
+    assert config.agentic.compact_context_chars == 90000
 
 
 # --- Layered config, env-var API keys, --set overrides, tools, routing ---

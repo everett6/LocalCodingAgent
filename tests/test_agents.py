@@ -116,6 +116,26 @@ def test_agent_resets_metrics_between_tasks():
     assert response.metrics.prompt_tokens == 2
 
 
+def test_operator_approved_project_lessons_are_added_to_task_context(tmp_path):
+    from local_coder.memory.lessons import ProjectLessonStore
+    from local_coder.types import ToolName
+
+    class WorkspaceRegistry(FakeRegistry):
+        def has_permission(self, role, tool_name):
+            return tool_name == ToolName.READ_FILE
+
+        def get_tool(self, tool_name):
+            return type("ReadTool", (), {"project_root": str(tmp_path)})()
+
+    ProjectLessonStore(tmp_path).add("Prefer the project's existing parser helpers.")
+    agent = LoopAgent(FakeModel([]), WorkspaceRegistry([]))
+
+    formatted = agent._format_task(AgentTask(role=AgentRole.CODER, objective="Parse config"))
+
+    assert "Operator-approved project lessons" in formatted
+    assert "Prefer the project's existing parser helpers." in formatted
+
+
 def test_agent_stops_after_max_iterations():
     model = FakeModel([
         ModelResponse(tool_calls=[ToolCall(name="read_file")]),

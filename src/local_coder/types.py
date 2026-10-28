@@ -21,6 +21,7 @@ class AgentRole(str, enum.Enum):
     BUG_HUNTER = "bug_hunter"
     RED_TEAM = "red_team"
     EXPLOIT_VALIDATOR = "exploit_validator"
+    EXPLOIT_GENERATOR = "exploit_generator"
 
 
 class SafetyTier(str, enum.Enum):
@@ -351,8 +352,8 @@ class VerificationConfig(BaseModel):
 class AgenticConfig(BaseModel):
     """Controls routing, context compaction, and resumable sessions."""
     role_models: dict[str, str] = Field(default_factory=dict)
-    context_window_chars: int = 24000
-    compact_context_chars: int = 12000
+    context_window_chars: int = 180000
+    compact_context_chars: int = 90000
     max_parallel_agents: int = 1
     # Disk-backed KV cache for the exploration prefix (llama-server's
     # /slots save/restore API; requires the server to be started with

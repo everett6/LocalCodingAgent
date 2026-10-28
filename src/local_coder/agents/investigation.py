@@ -40,8 +40,6 @@ class InvestigationAgent(BaseAgent):
         if profile in {"glm53", "qwen38"} or profile.startswith("openrouter_"):
             self.max_iterations = 40
             self.max_tool_calls = 160
-            self.context_window_chars = min(self.model.config.context_length * 3, 240000)
-            self.compact_context_chars = self.context_window_chars // 2
         task = task.model_copy(deep=True)
         scans = ([('run_sast', {"tool": "builtin"}), ('audit_config', {}), ('audit_dependencies', {})]
                  if self.role == AgentRole.SECURITY else [('run_bug_scan', {})])

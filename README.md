@@ -205,6 +205,15 @@ replace a built-in command. Outside interactive mode run one with
 `local-coder commands`. A command file is only a prompt: nothing in it is
 executed, and the request goes through the usual approval prompts.
 
+The harness also includes model-agnostic `/implement`, `/debug`, `/add-tests`,
+`/refactor`, `/handoff`, and `/reflect` skills. Inspect the available built-ins
+and custom prompts with `local-coder commands`; built-in names are reserved.
+For explicit, reusable project guidance, use `local-coder learn "Prefer the
+existing parser helpers"` and review or remove it with `local-coder lessons`
+and `local-coder forget <lesson-id>`. Only lessons entered by an operator are
+saved, under the ignored `.local-coder/lessons.json`; agents are instructed to
+verify them against the current code before applying them.
+
 ## Hooks
 
 Hooks run your own shell commands around the agent's tool calls, for
@@ -259,6 +268,7 @@ local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
 local-coder resume auth                # pick up auth's unfinished request
 local-coder sessions                   # list sessions
 local-coder sessions auth              # show a session's requests and finished phases
+local-coder progress auth               # show the latest phase and task-DAG status
 ```
 
 The coordinator checkpoints each phase as it finishes (exploration, plan, each
@@ -270,7 +280,8 @@ five, each trimmed) as context. `state.json` in the session folder holds the
 turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
 two terminals from running the same session at once. In the interactive
 prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
-manage it. `POST /run` on the remote server uses the same sessions, so repeating
+manage it; `/progress [id]` shows its durable phase and task-DAG status.
+`POST /run` on the remote server uses the same sessions, so repeating
 a `session_id` there continues it too.
 
 ## Local model server
@@ -356,13 +367,18 @@ task DAG, and each task may select a different configured model with
 
 ```yaml
 agentic:
-	context_window_chars: 24000
-	compact_context_chars: 12000
+  context_window_chars: 180000
+  compact_context_chars: 90000
 ```
 
 Long tool histories are compacted automatically while the system and task
 context remain available. Use `local-coder --model coding-model "..."` to route
-one run to a selected model.
+one run to a selected model. The context character budget defaults to 180000
+and is capped against each selected model's configured token window and output
+reserve, so the same harness works with short- and long-context providers
+without relying on a provider-specific profile name. Token usage reported by
+the provider triggers earlier compaction when the real prompt approaches its
+window.
 
 **Stagnation guard:** a small local model is far likelier than a frontier one
 to retry an identical failing tool call instead of changing approach. The

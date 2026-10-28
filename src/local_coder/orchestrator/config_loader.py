@@ -228,8 +228,8 @@ def load_config(
     role_models.update(routing_data.get("roles", {}) or {})
     agentic = AgenticConfig(
         role_models=role_models,
-        context_window_chars=agentic_data.get("context_window_chars", 24000),
-        compact_context_chars=agentic_data.get("compact_context_chars", 12000),
+        context_window_chars=agentic_data.get("context_window_chars", 180000),
+        compact_context_chars=agentic_data.get("compact_context_chars", 90000),
         max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
         session_cache=agentic_data.get("session_cache", False),
         repo_map_tokens=agentic_data.get("repo_map_tokens", 1024),
