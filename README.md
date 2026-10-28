@@ -52,6 +52,16 @@ orchestration—with the repeatable coding tasks in
 PYTHONPATH=src python benchmarks/run_coding_benchmark.py --runs 3
 ```
 
+Compare a candidate model/config against a baseline with the exact same
+task manifest and repetitions (repeat `--compare` for additional candidates):
+
+```sh
+PYTHONPATH=src python benchmarks/run_coding_benchmark.py \
+  --config config/local.yaml \
+  --compare config/frontier.yaml \
+  --runs 3
+```
+
 Each attempt starts from a fresh temporary project, confirms its tests fail
 before the task, runs the normal Coordinator workflow, then copies only the
 expected implementation outputs into a second clean workspace with the
@@ -65,7 +75,11 @@ count when comparing configurations. Setup and execution errors are recorded
 as failed attempts instead of being omitted from the score. This small starter
 suite currently covers whitespace normalization, merging sorted sequences,
 CSV parsing, and pagination; expand it with representative tasks from your own
-projects before drawing broad performance conclusions.
+projects before drawing broad performance conclusions. Comparison reports
+include overall and per-task success-rate deltas and median-latency ratios
+(below `1.0` means the candidate was faster). A zero exit code means the
+benchmark ran and produced measurements; task failures remain in the report
+and do not make a valid comparison an execution error.
 
 ### JSON output for scripts
 

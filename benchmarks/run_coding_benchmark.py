@@ -1,8 +1,8 @@
-"""Run repeatable, test-verified coding tasks against the configured model.
+"""Run repeatable, test-verified coding tasks against configured models.
 
-Each run gets a fresh temporary workspace. The benchmark restores its trusted
-tests before independently scoring the agent's patch, so changing a test
-cannot turn a failing solution into a passing result.
+Each attempt gets a fresh workspace, and results are scored in a separate
+workspace containing the trusted tests and only the expected implementation
+outputs. Multiple configurations can be compared on the same task set.
 """
 from __future__ import annotations
 
@@ -81,6 +81,39 @@ def _agent_claimed_tests_passed(agent_output: str) -> bool | None:
     if not match:
         return None
     return match.group(1).lower() == "passed"
+
+
+def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    measured = [item["latency_seconds"] for item in results if item["latency_seconds"] is not None]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        grouped.setdefault(result["task_id"], []).append(result)
+    tasks = {}
+    for task_id, attempts in grouped.items():
+        latencies = [
+            item["latency_seconds"]
+            for item in attempts
+            if item["latency_seconds"] is not None
+        ]
+        tasks[task_id] = {
+            "attempt_count": len(attempts),
+            "success_count": sum(item["success"] for item in attempts),
+            "success_rate": round(
+                sum(item["success"] for item in attempts) / len(attempts), 4
+            ),
+            "median_latency_seconds": round(statistics.median(latencies), 3) if latencies else None,
+        }
+    return {
+        "attempt_count": len(results),
+        "measured_attempt_count": len(measured),
+        "success_count": sum(item["success"] for item in results),
+        "success_rate": round(sum(item["success"] for item in results) / len(results), 4),
+        "latency_seconds": {
+            "mean": round(statistics.mean(measured), 3) if measured else None,
+            "median": round(statistics.median(measured), 3) if measured else None,
+        },
+        "tasks": tasks,
+    }
 
 
 def _load_tasks(path: Path) -> dict[str, Any]:
@@ -243,6 +276,8 @@ async def run_benchmark(
     runs: int,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    if runs < 1 or timeout_seconds < 1:
+        raise ValueError("runs and timeout_seconds must be positive integers")
     manifest = _load_tasks(tasks_path)
     task_results = []
     for task in manifest["tasks"]:
@@ -260,11 +295,7 @@ async def run_benchmark(
                     "benchmark_error": f"{type(exc).__name__}: {exc}",
                 })
 
-    latencies = [
-        result["latency_seconds"]
-        for result in task_results
-        if result["latency_seconds"] is not None
-    ]
+    summary = _summarize_results(task_results)
     return {
         "schema_version": 1,
         "kind": "test_verified_coding_benchmark",
@@ -273,23 +304,78 @@ async def run_benchmark(
         "config": str(config_path),
         "task_count": len(manifest["tasks"]),
         "runs_per_task": runs,
-        "attempt_count": len(task_results),
-        "measured_attempt_count": len(latencies),
-        "success_count": sum(result["success"] for result in task_results),
-        "success_rate": round(
-            sum(result["success"] for result in task_results) / len(task_results), 4
-        ),
-        "latency_seconds": {
-            "mean": round(statistics.mean(latencies), 3) if latencies else None,
-            "median": round(statistics.median(latencies), 3) if latencies else None,
-        },
+        **summary,
         "results": task_results,
+    }
+
+
+async def run_comparison(
+    config_paths: list[Path],
+    tasks_path: Path,
+    runs: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if len(config_paths) < 2:
+        raise ValueError("A model comparison needs a baseline config and at least one candidate config")
+    if len({path.resolve() for path in config_paths}) != len(config_paths):
+        raise ValueError("Each comparison config must be unique")
+
+    reports = [
+        await run_benchmark(path.resolve(), tasks_path, runs, timeout_seconds)
+        for path in config_paths
+    ]
+    baseline = reports[0]
+    comparisons = []
+    for candidate in reports[1:]:
+        baseline_tasks = baseline["tasks"]
+        task_deltas = {}
+        for task_id, candidate_task in candidate["tasks"].items():
+            baseline_rate = baseline_tasks[task_id]["success_rate"]
+            task_deltas[task_id] = round(candidate_task["success_rate"] - baseline_rate, 4)
+        baseline_median = baseline["latency_seconds"]["median"]
+        candidate_median = candidate["latency_seconds"]["median"]
+        comparisons.append({
+            "baseline_config": baseline["config"],
+            "candidate_config": candidate["config"],
+            "success_rate_delta": round(candidate["success_rate"] - baseline["success_rate"], 4),
+            "median_latency_ratio": (
+                round(candidate_median / baseline_median, 3)
+                if baseline_median is not None
+                and baseline_median > 0
+                and candidate_median is not None
+                else None
+            ),
+            "task_success_rate_deltas": task_deltas,
+        })
+
+    return {
+        "schema_version": 1,
+        "kind": "test_verified_coding_model_comparison",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "benchmark": baseline["benchmark"],
+        "runs_per_task": runs,
+        "baseline": baseline,
+        "candidates": reports[1:],
+        "comparisons": comparisons,
+        "exit_error_count": sum(
+            "benchmark_error" in result
+            for report in reports
+            for result in report["results"]
+        ),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=REPOSITORY_ROOT / "config" / "config.yaml")
+    parser.add_argument(
+        "--compare",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="CONFIG",
+        help="Compare another model config against --config; repeat for more candidates",
+    )
     parser.add_argument("--tasks", type=Path, default=REPOSITORY_ROOT / "benchmarks" / "coding_tasks.json")
     parser.add_argument("--runs", type=int, default=1, help="Fresh-workspace repetitions per task")
     parser.add_argument("--timeout", type=int, default=900, help="Maximum seconds per agent run")
@@ -304,14 +390,28 @@ def main() -> int:
     if not args.tasks.is_file():
         parser.error(f"Task manifest not found: {args.tasks}")
 
-    report = asyncio.run(
-        run_benchmark(args.config.resolve(), args.tasks.resolve(), args.runs, args.timeout)
-    )
+    if args.compare:
+        report = asyncio.run(
+            run_comparison(
+                [args.config, *args.compare],
+                args.tasks.resolve(),
+                args.runs,
+                args.timeout,
+            )
+        )
+        exit_error_count = report["exit_error_count"]
+    else:
+        report = asyncio.run(
+            run_benchmark(args.config.resolve(), args.tasks.resolve(), args.runs, args.timeout)
+        )
+        exit_error_count = sum(
+            "benchmark_error" in result for result in report["results"]
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
     print(f"\nReport saved to {args.output}")
-    return 0 if report["success_rate"] == 1 else 1
+    return 1 if exit_error_count else 0
 
 
 if __name__ == "__main__":

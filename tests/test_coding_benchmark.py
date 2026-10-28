@@ -17,6 +17,7 @@ from benchmarks.run_coding_benchmark import (
     _write_files,
     _run_case,
     run_benchmark,
+    run_comparison,
 )
 from local_coder.verification.test_runner import run_tests
 
@@ -127,6 +128,61 @@ def test_benchmark_records_setup_errors_as_failed_attempts(tmp_path):
     assert report["success_rate"] == 0
     assert report["latency_seconds"] == {"mean": None, "median": None}
     assert "Config file not found" in report["results"][0]["benchmark_error"]
+
+
+def test_result_summary_reports_success_and_latency_per_task():
+    from benchmarks.run_coding_benchmark import _summarize_results
+
+    summary = _summarize_results([
+        {"task_id": "alpha", "success": True, "latency_seconds": 2.0},
+        {"task_id": "alpha", "success": False, "latency_seconds": 4.0},
+        {"task_id": "beta", "success": True, "latency_seconds": None},
+    ])
+
+    assert summary["success_rate"] == pytest.approx(2 / 3, abs=0.0001)
+    assert summary["latency_seconds"] == {"mean": 3.0, "median": 3.0}
+    assert summary["tasks"]["alpha"]["success_rate"] == 0.5
+    assert summary["tasks"]["alpha"]["median_latency_seconds"] == 3.0
+    assert summary["tasks"]["beta"]["median_latency_seconds"] is None
+
+
+def test_model_comparison_reports_success_and_latency_deltas(tmp_path, monkeypatch):
+    async def fake_run_benchmark(config_path, tasks_path, runs, timeout_seconds):
+        baseline = config_path.name == "baseline.yaml"
+        return {
+            "schema_version": 1,
+            "kind": "test_verified_coding_benchmark",
+            "timestamp": "test",
+            "benchmark": "sample",
+            "config": str(config_path),
+            "runs_per_task": runs,
+            "attempt_count": 2,
+            "measured_attempt_count": 2,
+            "success_count": 1 if baseline else 2,
+            "success_rate": 0.5 if baseline else 1.0,
+            "latency_seconds": {"mean": 3.0 if baseline else 2.0, "median": 3.0 if baseline else 2.0},
+            "tasks": {
+                "alpha": {
+                    "attempt_count": 2,
+                    "success_count": 1 if baseline else 2,
+                    "success_rate": 0.5 if baseline else 1.0,
+                    "median_latency_seconds": 3.0 if baseline else 2.0,
+                }
+            },
+            "results": [],
+        }
+
+    monkeypatch.setattr("benchmarks.run_coding_benchmark.run_benchmark", fake_run_benchmark)
+    baseline_path = tmp_path / "baseline.yaml"
+    candidate_path = tmp_path / "candidate.yaml"
+    report = asyncio.run(
+        run_comparison([baseline_path, candidate_path], tmp_path / "tasks.json", 2, 60)
+    )
+
+    comparison = report["comparisons"][0]
+    assert comparison["success_rate_delta"] == 0.5
+    assert comparison["median_latency_ratio"] == pytest.approx(2 / 3, abs=0.001)
+    assert comparison["task_success_rate_deltas"] == {"alpha": 0.5}
 
 
 @pytest.mark.parametrize("tamper_tests", [False, True])
