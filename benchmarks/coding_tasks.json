@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "local-coder-smoke-coding",
+  "tasks": [
+    {
+      "id": "normalize-whitespace",
+      "request": "Implement normalize_whitespace(value: str) in math_utils.py. Collapse every run of whitespace to one ordinary space and remove leading and trailing whitespace. Keep the function type-annotated.",
+      "files": {
+        "math_utils.py": "def normalize_whitespace(value: str) -> str:\n    raise NotImplementedError\n",
+        "tests/test_math_utils.py": "from math_utils import normalize_whitespace\n\n\ndef test_collapses_spaces_and_trims_edges():\n    assert normalize_whitespace(\"  hello   world  \") == \"hello world\"\n\n\ndef test_collapses_tabs_and_newlines():\n    assert normalize_whitespace(\"hello\\tworld\\nagain\") == \"hello world again\"\n\n\ndef test_empty_and_whitespace_only_input():\n    assert normalize_whitespace(\"\") == \"\"\n    assert normalize_whitespace(\" \\t\\n \") == \"\"\n"
+      },
+      "test_file": "tests/test_math_utils.py",
+      "expected_changed_files": [
+        "math_utils.py"
+      ]
+    },
+    {
+      "id": "merge-sorted-lists",
+      "request": "Implement merge_sorted_lists(left: list[int], right: list[int]) -> list[int] in sequence_utils.py. Both inputs are already sorted ascending. Return a new sorted list containing every item, including duplicates. Do not mutate either input.",
+      "files": {
+        "sequence_utils.py": "def merge_sorted_lists(left: list[int], right: list[int]) -> list[int]:\n    raise NotImplementedError\n",
+        "tests/test_sequence_utils.py": "from sequence_utils import merge_sorted_lists\n\n\ndef test_merges_and_preserves_duplicates():\n    assert merge_sorted_lists([1, 3, 5], [2, 3, 6]) == [1, 2, 3, 3, 5, 6]\n\n\ndef test_handles_empty_inputs():\n    assert merge_sorted_lists([], [1, 2]) == [1, 2]\n    assert merge_sorted_lists([1, 2], []) == [1, 2]\n    assert merge_sorted_lists([], []) == []\n\n\ndef test_does_not_mutate_inputs():\n    left = [1, 4]\n    right = [2, 3]\n    merge_sorted_lists(left, right)\n    assert left == [1, 4]\n    assert right == [2, 3]\n"
+      },
+      "test_file": "tests/test_sequence_utils.py",
+      "expected_changed_files": [
+        "sequence_utils.py"
+      ]
+    },
+    {
+      "id": "parse-csv-row",
+      "request": "Implement parse_csv_row(row: str) -> list[str] in csv_utils.py. Parse exactly one CSV record, supporting quoted commas and escaped double quotes. Return strings and do not silently discard malformed input; let the standard library's CSV errors propagate.",
+      "files": {
+        "csv_utils.py": "def parse_csv_row(row: str) -> list[str]:\n    raise NotImplementedError\n",
+        "tests/test_csv_utils.py": "import pytest\nfrom csv_utils import parse_csv_row\n\n\ndef test_parses_quoted_commas():\n    assert parse_csv_row('Ada,42,\"Seattle, WA\"') == [\"Ada\", \"42\", \"Seattle, WA\"]\n\n\ndef test_parses_escaped_quotes():\n    assert parse_csv_row('\"She said \"\"hello\"\"\"') == ['She said \"hello\"']\n\n\ndef test_parses_empty_fields():\n    assert parse_csv_row(\"a,,c\") == [\"a\", \"\", \"c\"]\n"
+      },
+      "test_file": "tests/test_csv_utils.py",
+      "expected_changed_files": [
+        "csv_utils.py"
+      ]
+    },
+    {
+      "id": "paginate-one-based",
+      "request": "Implement paginate(items: list[str], page: int, page_size: int) -> list[str] in pagination.py. Pages are 1-based. Return an empty list for a page beyond the available items. Reject page or page_size values below 1 with ValueError. Do not mutate items.",
+      "files": {
+        "pagination.py": "def paginate(items: list[str], page: int, page_size: int) -> list[str]:\n    raise NotImplementedError\n",
+        "tests/test_pagination.py": "import pytest\nfrom pagination import paginate\n\n\ndef test_returns_one_based_pages():\n    items = [\"a\", \"b\", \"c\", \"d\", \"e\"]\n    assert paginate(items, 1, 2) == [\"a\", \"b\"]\n    assert paginate(items, 2, 2) == [\"c\", \"d\"]\n    assert paginate(items, 3, 2) == [\"e\"]\n\n\ndef test_page_past_end_is_empty():\n    assert paginate([\"a\"], 2, 1) == []\n\n\n@pytest.mark.parametrize(\"page,page_size\", [(0, 1), (-1, 1), (1, 0), (1, -2)])\ndef test_rejects_non_positive_page_values(page, page_size):\n    with pytest.raises(ValueError):\n        paginate([\"a\"], page, page_size)\n\n\ndef test_does_not_mutate_items():\n    items = [\"a\", \"b\", \"c\"]\n    paginate(items, 1, 2)\n    assert items == [\"a\", \"b\", \"c\"]\n"
+      },
+      "test_file": "tests/test_pagination.py",
+      "expected_changed_files": [
+        "pagination.py"
+      ]
+    }
+  ]
+}

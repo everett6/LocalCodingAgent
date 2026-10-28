@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .local-coder/
 benchmark_results.json
+benchmark_task_results.json
 *.egg-info/
 dist/
 build/

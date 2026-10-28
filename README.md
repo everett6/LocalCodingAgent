@@ -42,6 +42,31 @@ local-coder rollback <checkpoint-id>
 local-coder --version
 ```
 
+### Test-verified coding benchmark
+
+Compare real model task success—not just inference speed or fake-model
+orchestration—with the repeatable coding tasks in
+[`benchmarks/coding_tasks.json`](benchmarks/coding_tasks.json):
+
+```sh
+PYTHONPATH=src python benchmarks/run_coding_benchmark.py --runs 3
+```
+
+Each attempt starts from a fresh temporary project, confirms its tests fail
+before the task, runs the normal Coordinator workflow, then copies only the
+expected implementation outputs into a second clean workspace with the
+original benchmark tests for independent scoring. Success requires passing
+validation tests, changing every expected implementation file, and leaving
+the trusted tests untouched. The JSON report records per-attempt results and
+aggregate success rate and latency in
+`benchmark_task_results.json`; it may contain local paths and test output, so
+keep it local. Use the same task set, model configuration, and repetition
+count when comparing configurations. Setup and execution errors are recorded
+as failed attempts instead of being omitted from the score. This small starter
+suite currently covers whitespace normalization, merging sorted sequences,
+CSV parsing, and pagination; expand it with representative tasks from your own
+projects before drawing broad performance conclusions.
+
 ### JSON output for scripts
 
 Add `--json` to any command (before or after the subcommand) to get a single
