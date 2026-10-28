@@ -113,6 +113,8 @@ class RemoteControlServer(WorkbenchAPI):
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
         self._event_seq = 0
         self.lock = Lock()
+        from local_coder.statedir import state_path
+        state_path(project_root, '.local-coder/bootstrap')
         self.sessions = SessionStore(project_root)
         self._init_workbench()
         self._lease_file = None
@@ -140,6 +142,12 @@ class RemoteControlServer(WorkbenchAPI):
                 job["events"] = job["events"][-600:]
                 if event.event_type == "checkpoint_saved":
                     job["checkpoint"] = event.data.get("path")
+                if event.event_type == "verification_result" and event.source == "ORCHESTRATOR":
+                    data = event.data
+                    if (type(data.get("passed")) is bool and isinstance(data.get("command"), str)
+                            and 0 < len(data["command"]) <= 1000):
+                        job["verification"] = {"passed": data["passed"], "command": self._redact(data["command"]),
+                                               "recorded_at": event.timestamp.isoformat()}
             self.events.append(payload)
         if job is not None and event.event_type == "checkpoint_saved":
             # Make Resume available even when the process dies before the job finalizer.
@@ -154,7 +162,7 @@ class RemoteControlServer(WorkbenchAPI):
         if self._using_inference and provider is None:
             raise ValueError("The on-device model is not ready")
         if provider is not None:
-            config.models = {"workbench": provider.model_copy(deep=True)}
+            config.models = {**config.models, "workbench": provider.model_copy(deep=True)}
             config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
         elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
@@ -178,6 +186,7 @@ class RemoteControlServer(WorkbenchAPI):
                     config.models[model.name] = model
                     for role in roles[purpose]:
                         config.agentic.role_models[role] = model.name
+        self._apply_auto_routing(config, provider)
         from local_coder.providers.context_policy import context_policy
         selected = provider or config.models.get(self.model_name or "default") or next(iter(config.models.values()), None)
         if selected is not None and selected.auto_context:

@@ -42,6 +42,37 @@ class GoalLedger:
             raise ValueError('Unable to fingerprint workspace files') from exc
         return digest.hexdigest()
 
+    @staticmethod
+    def _proof_id(evidence):
+        return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest() if evidence else None
+
+    @classmethod
+    def _current(cls, row, rows, revision, seen=None):
+        seen = set() if seen is None else set(seen)
+        if row['id'] in seen:
+            return False
+        seen.add(row['id'])
+        proof = row.get('evidence')
+        if not isinstance(proof, dict) or proof.get('passed') is not True or proof.get('revision') != revision:
+            return False
+        if any(item['status'] != 'passed' for item in cls._acceptance(row)):
+            return False
+        refs = list(row.get('dependencies', [])) + [item['id'] for item in rows.values() if item.get('parent') == row['id']]
+        saved = proof.get('upstream', {})
+        return all(ref in rows and rows[ref]['status'] == 'completed'
+                   and saved.get(ref) == cls._proof_id(rows[ref].get('evidence'))
+                   and cls._current(rows[ref], rows, revision, seen) for ref in refs)
+
+    @staticmethod
+    def _acceptance(row):
+        proof = row.get('evidence') or {}
+        qualified = proof.get('acceptance', {})
+        checks = proof.get('checks', [])
+        return [{'criterion': criterion, 'status': 'passed' if proof.get('passed') is True
+                 and qualified.get(criterion) and all(check in checks for check in qualified[criterion]) else 'unresolved',
+                 'checks': qualified.get(criterion, [])}
+                for criterion in row.get('criteria', '').splitlines() if criterion.strip()]
+
     def list(self):
         with self.memory._connection() as db:
             rows = [json.loads(r[0]) for r in db.execute('SELECT payload FROM goals ORDER BY rowid')]
@@ -49,9 +80,15 @@ class GoalLedger:
             revision = self.revision()
         except ValueError:
             revision = None
+        indexed = {row['id']: row for row in rows}
         for row in rows:
             row['stalled'] = row['attempts'] >= 3 and row['status'] != 'completed'
-            row['evidence_stale'] = bool(row.get('evidence')) and row['evidence']['revision'] != revision
+            row['evidence_stale'] = bool(row.get('evidence')) and not self._current(row, indexed, revision)
+            row['acceptance'] = self._acceptance(row)
+            if row['evidence_stale']:
+                for criterion in row['acceptance']:
+                    if criterion['status'] == 'passed':
+                        criterion['status'] = 'stale'
         return rows
 
     def get(self, identity):
@@ -96,6 +133,8 @@ class GoalLedger:
             if not found:
                 raise ValueError('Unknown goal')
             row = json.loads(found[0])
+            rows = {item['id']: item for item in
+                    (json.loads(result[0]) for result in db.execute('SELECT payload FROM goals'))}
             status = changes.get('status', row['status'])
             if status not in {'pending', 'ready', 'running', 'blocked', 'verifying', 'completed'}:
                 raise ValueError('Invalid goal status')
@@ -103,12 +142,9 @@ class GoalLedger:
 
             def current_evidence(item):
                 nonlocal revision
-                proof = item.get('evidence')
-                if not proof or not proof['passed']:
-                    return False
                 if revision is None:
                     revision = self.revision()
-                return proof['revision'] == revision
+                return self._current(item, rows, revision)
 
             if status in {'running', 'completed'}:
                 for dep in row['dependencies']:
@@ -117,6 +153,10 @@ class GoalLedger:
                         raise ValueError('Dependency needs current completion evidence')
             if evidence is not _UNSET:
                 row['evidence'] = evidence
+                if evidence is not None:
+                    refs = row['dependencies'] + [item['id'] for item in rows.values() if item.get('parent') == identity]
+                    row['evidence'] = {**evidence, 'generation': uuid.uuid4().hex,
+                                      'upstream': {ref: self._proof_id(rows[ref].get('evidence')) for ref in refs}}
             elif status == 'running' and row['status'] != 'running':
                 row['evidence'] = None
             if status == 'completed':
@@ -126,7 +166,12 @@ class GoalLedger:
                         raise ValueError('Complete and verify child tasks first')
                     if evidence is _UNSET and not current_evidence(row):
                         row['evidence'] = {'passed': True, 'revision': revision,
-                                           'checks': [check for c in children for check in c['evidence']['checks']]}
+                                           'checks': [check for c in children for check in c['evidence']['checks']],
+                                           'generation': uuid.uuid4().hex,
+                                           'upstream': {ref: self._proof_id(rows[ref].get('evidence'))
+                                                        for ref in row['dependencies'] + [c['id'] for c in children]}}
+                if any(item['status'] != 'passed' for item in self._acceptance(row)):
+                    raise ValueError('Acceptance criteria need qualified observed checks; unresolved criteria remain')
                 if not current_evidence(row):
                     raise ValueError('Completion requires passing checks for the current workspace')
             if status == 'running' and row['status'] != 'running':
@@ -136,13 +181,20 @@ class GoalLedger:
             row.update({k: v for k, v in changes.items() if k != 'decision'})
             return self._write(db, row, 'updated')
 
-    def finish(self, response, *, verification_revision=_UNSET):
+    def finish(self, response, *, verification_revision=_UNSET, acceptance_checks=None):
         evidence = None
+        acceptance_checks = {} if acceptance_checks is None else acceptance_checks
+        if (not isinstance(acceptance_checks, dict) or len(acceptance_checks) > 100
+            or any(not isinstance(key, str) or not isinstance(checks, list) or not checks
+                   or any(not isinstance(check, str) or check not in response.tests_run for check in checks)
+                   for key, checks in acceptance_checks.items())):
+            raise ValueError('Acceptance qualification must reference observed checks')
         if response.tests_run:
             try:
                 revision = self.revision() if verification_revision is _UNSET else verification_revision
                 if revision is not None:
-                    evidence = {'checks': response.tests_run, 'passed': response.tests_passed, 'revision': revision}
+                    evidence = {'checks': response.tests_run, 'passed': response.tests_passed, 'revision': revision,
+                                'acceptance': acceptance_checks}
             except ValueError:
                 pass
         status = 'verifying' if response.status.value == 'completed' else 'blocked'

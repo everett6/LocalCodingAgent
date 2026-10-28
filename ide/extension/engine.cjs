@@ -42,8 +42,19 @@ function validateProvider(provider) {
 function isAllowedEngineRequest(route, method) {
   if (typeof route !== 'string' || route.length > 4096 || /[\\#\r\n]/.test(route) || !['GET','POST'].includes(method)) return false;
   const pathname = route.split('?')[0];
+  if (pathname === '/integrations/search/doctor') return route === pathname && ['GET', 'POST'].includes(method);
+  if (pathname === '/context/debugger') return route === pathname && method === 'GET';
+  if (pathname === '/status' && route.includes('?summary')) return route === '/status?summary=1' && method === 'GET';
   if (!route.startsWith('/') || route.startsWith('//') || /%(2e|2f|5c|00)/i.test(pathname)) return false;
   try { if (new URL(route, 'http://127.0.0.1').pathname !== pathname) return false; } catch { return false; }
+
+  if (method === 'GET' && ['/evaluations', '/findings', '/memory/retrievals', '/context/accounting', '/research/advisories/updates', '/inference/tuning/history', '/doctor'].includes(pathname)) return true;
+  if (method === 'GET' && (/^\/evaluations\/[a-f0-9]{32}$/.test(pathname) || /^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}$/.test(pathname) || /^\/findings\/[a-f0-9]{24}$/.test(pathname) || /^\/memory\/retrievals\/[a-f0-9]{32}$/.test(pathname))) return true;
+  if (method === 'POST' && ['/evaluations/run', '/evaluations/model/run', '/evaluations/heldout/run', '/context/tokenizer', '/research/advisories/update', '/inference/tuning/start', '/inference/tuning/apply', '/doctor/repair'].includes(pathname)) return true;
+  if (method === 'POST' && (/^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}\/cancel$/.test(pathname) || /^\/findings\/[a-f0-9]{24}\/(review|prepare|verify|suppress|reopen)$/.test(pathname))) return true;
+
+  if(method==='GET'&&['/research/capabilities','/research/evidence','/research/report','/research/dependencies','/research/advisories','/memory/structure'].includes(pathname))return true;
+  if(method==='POST'&&['/research/audit','/research/sarif/import','/research/advisories/import'].includes(pathname))return true;
   if(method==='GET'&&['/providers/models','/providers/usage','/providers/quota','/providers/profiles','/inference/discovery'].includes(pathname))return true;
   if(method==='POST'&&(['/providers/discover','/providers/profiles/save','/inference/discover','/inference/discovery/cancel','/inference/discovery/select'].includes(pathname)||/^\/providers\/profiles\/[a-f0-9]{32}\/(select|delete)$/.test(pathname)))return true;
   if (/^\/(status|settings|workspace|diff|files|file|events|jobs|shutdown|engagements)(\/[^?#]*)?(\?[^#]*)?$/.test(route)) return true;
@@ -78,7 +89,7 @@ class EngineConnection {
       return;
     }
     if(await this._attachDiscovered())return;
-    if(!this.options.executable)throw new Error('Build the Local Coder engine or configure its executable in user settings');
+    if(!this.options.executable)throw new Error('Build the Clin engine or configure its executable in user settings');
     this.token=randomBytes(32).toString('hex');
     const child=spawn(this.options.executable,this.options.args||[],{
       cwd:this.options.cwd||this.options.workspace,
@@ -92,8 +103,8 @@ class EngineConnection {
       await new Promise((resolve,reject)=>{
         let buffer='';
         const timer=setTimeout(()=>finish(new Error('Engine startup timed out')),this.options.startupTimeout||30000);
-        const onError=()=>finish(new Error('Cannot start Local Coder engine executable'));
-        const onExit=()=>finish(new Error('Local Coder engine exited before becoming ready'));
+        const onError=()=>finish(new Error('Cannot start Clin engine executable'));
+        const onExit=()=>finish(new Error('Clin engine exited before becoming ready'));
         const onData=chunk=>{
           buffer+=chunk.toString();
           if(buffer.length>65536){finish(new Error('Invalid engine readiness response'));return;}
@@ -148,7 +159,7 @@ class EngineConnection {
         res.on('error',()=>reject(new Error('Engine response interrupted')));
       });
       req.on('timeout',()=>req.destroy(new Error('Engine request timed out')));
-      req.on('error',()=>reject(new Error('Cannot reach Local Coder engine')));
+      req.on('error',()=>reject(new Error('Cannot reach Clin engine')));
       if(payload)req.write(payload);
       req.end();
     });

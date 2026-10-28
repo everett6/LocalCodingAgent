@@ -29,7 +29,7 @@ def state_path(project_root: str | os.PathLike, relpath: str | os.PathLike) -> P
         current = current / part
         if current.is_symlink():
             raise ValueError(f"Refusing to write through symlink: {current}")
-        current.mkdir(exist_ok=True)
+        current.mkdir(mode=0o700, exist_ok=True)
         if rel.parts[0] == STATE_DIR and current == root / STATE_DIR:
             _ignore_in_git(current)
     target = current / rel.parts[-1]

@@ -17,7 +17,9 @@ def test_persistent_goal_evidence_and_workspace_invalidation(tmp_path):
         ledger.update(child['id'],{'status':'completed'})
     ledger.update(child['id'],{'status':'running','decision':'Keep public API'})
     ledger.finish(SimpleNamespace(task_id=child['id'],status=TaskStatus.COMPLETED,tests_run=['pytest parser'],tests_passed=True,summary='Verified'))
-    ledger.update(parent['id'],{'status':'completed'})
+    ledger.finish(finished(parent['id'], ['pytest parser']),
+                  acceptance_checks={'Parser regressions pass': ['pytest parser']})
+    assert ledger.get(parent['id'])['status'] == 'completed'
     restored=GoalLedger(tmp_path)
     assert restored.get(child['id'])['decisions']==['Keep public API']
     assert restored.briefing()==''

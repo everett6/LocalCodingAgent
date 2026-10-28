@@ -74,20 +74,28 @@ class GrepTool(Tool):
             
             has_rg = shutil.which("rg") is not None
             if has_rg:
-                cmd = ["rg", "-n", "--no-heading", "--color", "never", pattern]
+                cmd = ["rg", "-n", "--no-heading", "--color", "never"]
                 if file_pattern:
                     cmd.extend(["-g", file_pattern])
-                cmd.append(str(target))
+                cmd.extend(["--", pattern, str(target)])
             else:
-                cmd = ["grep", "-rnE", pattern, str(target)]
+                cmd = ["grep", "-rnE"]
                 if file_pattern:
-                    cmd = ["find", str(target), "-name", file_pattern, "-exec", "grep", "-HnE", pattern, "{}", "+"]
+                    cmd.append(f"--include={file_pattern}")
+                cmd.extend(["--", pattern, str(target)])
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.project_root
             )
             stdout, stderr = await proc.communicate()
+            if proc.returncode not in (0, 1):
+                return ToolResult(
+                    success=False,
+                    output="Search failed: " + (stderr.decode(errors="replace").strip()[:2000] or f"exit code {proc.returncode}"),
+                    exit_code=proc.returncode,
+                    duration_ms=int((time.time()-start_t)*1000),
+                )
             
             lines = stdout.decode().strip().splitlines()
             if not lines:

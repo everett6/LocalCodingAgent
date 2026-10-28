@@ -488,6 +488,33 @@ class LanguageService:
                            "provider": "lsp"})
         return result
 
+    @staticmethod
+    def _python_relations(text: str, path: str, symbol: str) -> dict:
+        """Bounded static candidates in one source snapshot, never runtime claims."""
+        result = {"definitions": [], "references": [], "callers": []}
+        if not symbol or not re.fullmatch(r"[A-Za-z_]\w*", symbol):
+            return result
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return result
+        functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for node in ast.walk(tree):
+            location = {"path": path, "line": getattr(node, 'lineno', 1),
+                        "character": getattr(node, 'col_offset', 0), "provider": "python-ast-static"}
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+                result['definitions'].append({**location, 'name': symbol, 'end_line': node.end_lineno})
+            if isinstance(node, ast.Name) and node.id == symbol or isinstance(node, ast.Attribute) and node.attr == symbol:
+                if len(result['references']) < 20:
+                    result['references'].append(location)
+            if isinstance(node, ast.Call) and (isinstance(node.func, ast.Name) and node.func.id == symbol or isinstance(node.func, ast.Attribute) and node.func.attr == symbol):
+                containers = [function for function in functions if function.lineno <= node.lineno <= (function.end_lineno or function.lineno)]
+                caller = min(containers, key=lambda function: (function.end_lineno or function.lineno) - function.lineno) if containers else None
+                if len(result['callers']) < 20:
+                    result['callers'].append({**location, 'name': caller.name if caller else '<module>', 'resolution': 'static-name-candidate; runtime dispatch unproven'})
+        result['definitions'] = result['definitions'][:20]
+        return result
+
     async def context(self, path: str | Path, line: int = 1, character: int = 0,
                       query: str | None = None, char_budget: int = 4000) -> dict:
         full = self._path(path)
@@ -562,16 +589,35 @@ class LanguageService:
                 result["availability"]["parser"] = "python-ast" if adapter.language == "python" else "tree-sitter" if adapter.language in self._parsers else None
                 if adapter.language in self._parser_errors:
                     result["availability"]["parser_error"] = self._parser_errors[adapter.language]
+        result['callers'] = []
+        result['availability']['reference_coverage'] = 'language-server' if result['availability']['semantic'] else 'unavailable'
+        if adapter and adapter.language == 'python':
+            cursor = _lines(text)[line - 1]
+            selected_name = query or next((match.group() for match in re.finditer(r'[A-Za-z_]\w*', cursor)
+                                          if match.start() <= character <= match.end()), '')
+            relations = self._python_relations(text, result['path'], selected_name)
+            for key in ('definitions', 'references'):
+                if not result[key]:
+                    result[key] = relations[key]
+            result['callers'] = relations['callers']
+            if not result['availability']['semantic']:
+                result['availability']['reference_coverage'] = 'current-file-static-only'
         if query:
             result["symbols"] = sorted(result["symbols"], key=lambda s: query.lower() not in s["name"].lower())
         lines = _lines(text)
-        excerpt = "\n".join(f"{i + 1}: {lines[i][:300]}" for i in range(max(0, line - 3), min(len(lines), line + 2)))
+        focus = line
+        if query:
+            local_definition = next((definition for definition in result['definitions'] if definition['path'] == result['path']), None)
+            if local_definition:
+                focus = local_definition['line']
+        excerpt = "\n".join(f"{i + 1}: {lines[i][:300]}" for i in range(max(0, focus - 1), min(len(lines), focus + 12)))[:2000]
         title = f"Language context: {result['path']} ({result['language']})\n"
         if not result["availability"]["semantic"]:
             title += "Semantic context unavailable; showing bounded fallback context.\n"
         rows = [f"Diagnostics: {result['availability']['diagnostics']} ({len(result['diagnostics'])} reported; capped at 50)"]
         rows.extend(f"diagnostic: {d['line']}:{d['character']} severity={d['severity']} {d['message']}" for d in result["diagnostics"])
         rows.extend(f"{s['line']}: {s['name']} [{s['provider']}]" for s in result["symbols"][:40])
+        rows.extend(f"caller: {s['name']} at {s['path']}:{s['line']} [static candidate]" for s in result['callers'][:20])
         for key in ("definitions", "references"):
             rows.extend(f"{key}: {s['path']}:{s['line']}:{s['character']}" for s in result[key][:20])
         result["text"] = (title + "\n".join(rows) + "\n" + result["hover"] + "\n" + excerpt)[:budget]

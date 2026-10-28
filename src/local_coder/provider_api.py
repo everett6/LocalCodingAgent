@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from local_coder.auto_routing_api import AutoRoutingAPI
 from local_coder.harness_api import _object, _query
 from local_coder.inference_discovery import DiscoveryManager
 from local_coder.providers.catalog import CatalogService, is_openrouter
@@ -24,7 +25,7 @@ def _flag(query, name, default="0"):
     return value == "1"
 
 
-class ProviderAPI:
+class ProviderAPI(AutoRoutingAPI):
     def _init_provider_api(self):
         self.catalog_service = CatalogService(self.project_root)
         self.provider_profiles = ProviderProfileStore(self.project_root)
@@ -63,6 +64,9 @@ class ProviderAPI:
 
     def _provider_get(self, path, query):
         """Return (handled, payload); callers supply parsed query lists."""
+        if path == "/routing/settings":
+            _object(query, set())
+            return True, self._routing_settings_status()
         if path == "/providers/models":
             _object(query, {"source", "refresh"})
             if _query(query, "source", "openrouter") != "openrouter":
@@ -102,6 +106,8 @@ class ProviderAPI:
         return False, None
 
     def _provider_post(self, path, body):
+        if path == "/routing/settings":
+            return True, self._routing_settings_post(body)
         if path == "/providers/discover":
             _object(body, {"backend", "base_url", "api_key", "api_key_env"})
             backend = ModelBackend(body.get("backend", "openai_compatible"))

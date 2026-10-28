@@ -14,11 +14,12 @@ from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 class OpenAICompatibleBackend(BaseModelBackend):
     """Backend for OpenAI-compatible APIs (vLLM, LMStudio, llama.cpp server)."""
 
-    def __init__(self, config: ModelConfig, quota_guard=None):
+    def __init__(self, config: ModelConfig, quota_guard=None, *, trust_env: bool = True):
         super().__init__(config)
         self.quota_guard = quota_guard
         key = config.resolve_api_key()
         self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0,
+                                        trust_env=trust_env, follow_redirects=False,
                                         headers={"Authorization": f"Bearer {key}"} if key else {})
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
@@ -154,7 +155,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def _collect_stream(self, payload):
         """Assemble indexed tool deltas before any tool may execute."""
         content, reasoning, calls, usage, details = [], [], {}, {}, []
-        finish, model = "stop", self.config.model_id
+        finish, model = None, self.config.model_id
         async with self.client.stream("POST", "/chat/completions", json=payload) as response:
             await self._observe_response_quota(response)
             response.raise_for_status()
@@ -181,6 +182,10 @@ class OpenAICompatibleBackend(BaseModelBackend):
                         assembled["id"] += call.get("id") or ""
                         for key in ("name", "arguments"):
                             assembled["function"][key] += call.get("function", {}).get(key) or ""
+        if finish is None:
+            # EOF (or a bare [DONE]) does not establish that all tool deltas
+            # arrived. Never execute a syntactically valid but partial call.
+            raise RuntimeError("Provider returned an incomplete completion stream")
         return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning) or None,
                                           "tool_calls": [calls[i] for i in sorted(calls)], "reasoning_details": details or None}, "finish_reason": finish}],
                 "usage": usage, "model": model}

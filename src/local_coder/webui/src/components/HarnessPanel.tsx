@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
+import { ContextAccountingPanel } from './ContextAccountingPanel'
+import { AutoRoutingPanel } from './AutoRoutingPanel'
+import { ReadinessPanel } from './ReadinessPanel'
+import type { Readiness } from './ReadinessPanel'
 
 type Settings = {
   memory_enabled: boolean
@@ -32,12 +36,28 @@ type Budget = {
   limits?: { max_requests?: number; max_tokens?: number; max_cost_usd?: number | null }
 }
 type HarnessStatus = {
+  model_profile?: ModelProfile | null
+  model_index?: { retrieved_at?: string; model_count?: number; variant_count?: number } | null
+  readiness?: Readiness
   settings: Settings
   safety_tier: string
   budget: Budget | null
   sandbox: { backend?: string; ready?: boolean; reason?: string; network?: string; host_filesystem?: string }
   evolution: Revision[]
   language?: { adapter_count?: number; languages?: { server_available?: boolean; server_running?: boolean }[]; note?: string }
+}
+type ModelProfile = {
+  identity?: string
+  family?: string
+  role?: string
+  workflow?: string[]
+  strategy?: string
+  context_share_percent?: number
+  catalog_char_limit?: number
+  tool_result_char_limit?: number
+  max_strategy_attempts?: number
+  provenance?: Record<string, unknown>
+  capabilities?: Record<string, unknown>
 }
 type Snapshot = { id: string; created_at: string | number; paths: string[]; status: string }
 type SnapshotDiff = { id: string; files: { path: string; before: string; after: string }[]; diff: string }
@@ -82,7 +102,35 @@ function dateLabel(value: string | number): string {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
 }
 
-export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
+function ModelInspector({ status }: { status: HarnessStatus | null }) {
+  const profile = status?.model_profile
+  const provenance = profile?.provenance || {}
+  const value = (...keys: string[]) => {
+    for (const key of keys) {
+      const candidate = provenance[key]
+      if (typeof candidate === 'string' || typeof candidate === 'number') return String(candidate)
+    }
+    return 'Unknown'
+  }
+  const limit = (count?: number) => count == null ? 'Not reported' : count.toLocaleString()
+  return <details open aria-label="Automatic model harness">
+    <summary>Automatic model harness</summary>
+    {profile ? <>
+      <p><strong>{profile.identity || 'Unknown model'}</strong> · {profile.family || 'Generic family'} · {profile.role || 'Unknown role'}</p>
+      <p className="hint">Resolved from the selected model and task mode. Refresh after changing the model to inspect its current scaffold.</p>
+      {profile.workflow?.length ? <ol>{profile.workflow.map((step, index) => <li key={index}>{step}</li>)}</ol> : <p>Workflow not reported by this engine.</p>}
+      <p>Strategy: {profile.strategy || 'Not reported'} · Attempts: {limit(profile.max_strategy_attempts)}</p>
+      <p>Context share: {profile.context_share_percent == null ? 'Not reported' : `${profile.context_share_percent}%`} · Tool catalog: {limit(profile.catalog_char_limit)} characters · Tool results: {limit(profile.tool_result_char_limit)} characters</p>
+      <p className="hint">Identity match: {value('match', 'match_method', 'match_type')}. Index identity rank: {value('model_rank', 'rank')}. Snapshot: {value('retrieved_at', 'verified_at')}.</p>
+      <p className="hint">Policy basis: {value('policy_basis')}. Provider mapping: {value('provider_mapping')}. Best source row: {value('leaderboard_row')}.</p>
+      <p className="hint">Rank describes the source index, and does not measure this harness. Unknown or family matches do not establish ranked model identity or provider capabilities. Source variant settings are not automatically applied.</p>
+      {profile.capabilities && <details><summary>Capability evidence</summary><pre className="source-view" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{JSON.stringify(profile.capabilities, null, 2)}</pre></details>}
+    </> : <p className="hint">Model harness details are unavailable. Select a model or refresh after updating the engine.</p>}
+    {status?.model_index && <p className="hint">Local index: {limit(status.model_index.model_count)} identities · {limit(status.model_index.variant_count)} variants{status.model_index.retrieved_at ? ` · Retrieved ${status.model_index.retrieved_at}` : ''}. <a href="https://artificialanalysis.ai/leaderboards/models?deprecation=all" target="_blank" rel="noopener noreferrer">Artificial Analysis source</a></p>}
+  </details>
+}
+
+export function HarnessPanel({ disabled = false, mode = 'coding' }: { disabled?: boolean; mode?: string }) {
   const [tab, setTab] = useState<'controls' | 'snapshots' | 'revisions'>('controls')
   const [status, setStatus] = useState<HarnessStatus | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -102,7 +150,7 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
     const version = ++loadVersion.current
     try {
       const [harness, history] = await Promise.all([
-        api<HarnessStatus>('/harness'), api<{ snapshots: Snapshot[] }>('/snapshots'),
+        api<HarnessStatus>(`/harness?mode=${encodeURIComponent(mode)}`), api<{ snapshots: Snapshot[] }>('/snapshots'),
       ])
       if (version !== loadVersion.current) return
       setStatus(harness)
@@ -114,7 +162,7 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
     } finally {
       if (version === loadVersion.current) setLoading(false)
     }
-  }, [])
+  }, [mode])
 
   useEffect(() => {
     let active = true
@@ -195,6 +243,7 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
   const codeStyle = { maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 } as const
 
   return <section className="playbook-view" aria-labelledby="harness-title">
+    <ContextAccountingPanel disabled={disabled} />
     <h1 id="harness-title">Harness controls</h1>
     <p>Set task limits, inspect saved scaffolding and review file snapshots. Permissions, project scope, approvals and shared budgets remain enforced by the engine.</p>
     <nav className="settings-tabs" aria-label="Harness views">
@@ -206,6 +255,9 @@ export function HarnessPanel({ disabled = false }: { disabled?: boolean }) {
     {message && <p role="status">{message}</p>}
     {loading && <p role="status">Loading harness state…</p>}
     {tab === 'controls' && <>
+      <ReadinessPanel readiness={status?.readiness} />
+      <ModelInspector status={status} />
+      <AutoRoutingPanel disabled={disabled} />
       {status && <details open>
         <summary>Current runtime</summary>
         <p>{budget ? `${budget.requests.toLocaleString()}${budget.limits?.max_requests !== undefined ? ` / ${budget.limits.max_requests.toLocaleString()}` : ''} model calls · ${budget.tokens.toLocaleString()}${budget.limits?.max_tokens !== undefined ? ` / ${budget.limits.max_tokens.toLocaleString()}` : ''} reported or reserved tokens` : 'No active task budget is available.'}</p>

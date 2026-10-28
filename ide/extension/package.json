@@ -1,7 +1,7 @@
 {
   "name": "local-coder",
-  "displayName": "Local Coder",
-  "description": "Local agent harness, bring-your-own-provider, coding and evidence-led investigations.",
+  "displayName": "Clin",
+  "description": "Clin coding workspace with your own model provider and evidence-led investigations.",
   "version": "0.1.0",
   "publisher": "local-coder",
   "license": "MIT",
@@ -28,83 +28,83 @@
     "commands": [
       {
         "command": "localCoder.run",
-        "title": "Local Coder: Run Coding Task"
+        "title": "Clin: Run Coding Task"
       },
       {
         "command": "localCoder.plan",
-        "title": "Local Coder: Plan Coding Task"
+        "title": "Clin: Plan Coding Task"
       },
       {
         "command": "localCoder.review",
-        "title": "Local Coder: Review Changes"
+        "title": "Clin: Review Changes"
       },
       {
         "command": "localCoder.security",
-        "title": "Local Coder: Investigate Security"
+        "title": "Clin: Investigate Security"
       },
       {
         "command": "localCoder.bugs",
-        "title": "Local Coder: Hunt Bugs"
+        "title": "Clin: Hunt Bugs"
       },
       {
         "command": "localCoder.configureProvider",
-        "title": "Local Coder: Configure Provider and Harness"
+        "title": "Clin: Configure Provider and Harness"
       },
       {
         "command": "localCoder.forgetProviderKey",
-        "title": "Local Coder: Forget Saved Provider Key"
+        "title": "Clin: Forget Saved Provider Key"
       },
       {
         "command": "localCoder.cancel",
-        "title": "Local Coder: Cancel Task"
+        "title": "Clin: Cancel Task"
       },
       {
         "command": "localCoder.refresh",
-        "title": "Local Coder: Refresh Tasks",
+        "title": "Clin: Refresh Tasks",
         "icon": "$(refresh)"
       },
       {
         "command": "localCoder.openResult",
-        "title": "Local Coder: Open Task Result"
+        "title": "Clin: Open Task Result"
       },
       {
         "command": "localCoder.diff",
-        "title": "Local Coder: Show Workspace Diff"
+        "title": "Clin: Show Workspace Diff"
       },
       {
         "command": "localCoder.activity",
-        "title": "Local Coder: Show Agent Activity"
+        "title": "Clin: Show Agent Activity"
       },
       {
         "command": "localCoder.redteam",
-        "title": "Local Coder: Red Team Engagement"
+        "title": "Clin: Red Team Engagement"
       },
       {
         "command": "localCoder.engagementReport",
-        "title": "Local Coder: Open Engagement Evidence Report"
+        "title": "Clin: Open Engagement Evidence Report"
       },
       {
         "command": "localCoder.updateIDE",
-        "title": "Local Coder: Check for IDE Updates"
+        "title": "Clin: Check for IDE Updates"
       },
       {
         "command": "localCoder.languageContext",
-        "title": "Local Coder: Inspect Language Context"
+        "title": "Clin: Inspect Language Context"
       },
       {
         "command": "localCoder.snapshotDiff",
-        "title": "Local Coder: Compare Edit Snapshot"
+        "title": "Clin: Compare Edit Snapshot"
       },
       {
         "command": "localCoder.memoryInspector",
-        "title": "Local Coder: Inspect Context Memory"
+        "title": "Clin: Inspect Context Memory"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "localCoder",
-          "title": "Local Coder",
+          "title": "Clin",
           "icon": "media/agent.svg"
         }
       ]
@@ -181,7 +181,7 @@
       ]
     },
     "configuration": {
-      "title": "Local Coder",
+      "title": "Clin",
       "properties": {
         "localCoder.engineExecutable": {
           "type": "string",
@@ -193,7 +193,7 @@
           "type": "boolean",
           "default": true,
           "scope": "application",
-          "description": "Automatically install validated Local Coder IDE fork releases from everett6/LocalCodingAgent. Linux x64 only. Restart to activate. Retains the previous installation."
+          "description": "Automatically install validated Clin IDE fork releases from everett6/LocalCodingAgent. Linux x64 only. Restart to activate. Retains the previous installation."
         }
       }
     },

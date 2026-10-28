@@ -25,10 +25,10 @@ from local_coder.core.snapshots import FileSnapshots
 from local_coder.harness.evolution import EvolutionStore
 from local_coder.integrations.mcp import MCPManager
 from local_coder.memory.context_store import ContextMemory, _clean
-from local_coder.models.profiles import validate_overlay
+from local_coder.models.profiles import resolve_profile, validate_overlay
 from local_coder.skills import SkillLibrary
 from local_coder.statedir import state_path, write_state_file
-from local_coder.types import HarnessSettings, SafetyTier
+from local_coder.types import AgentMode, AgentRole, HarnessSettings, ModelConfig, SafetyTier
 
 HARNESS_PATH = ".local-coder/harness/settings.json"
 LANGUAGE_PATH = ".local-coder/language/settings.json"
@@ -222,7 +222,46 @@ class HarnessAPI:
     def _language_service(self):
         return LanguageService(self._harness_root, **self.language_settings())
 
-    def _harness_status(self):
+    def _model_profile_status(self, settings, mode=None):
+        """Describe the selected role scaffold without serializing provider config."""
+        from local_coder.models.router import resolve_model_name
+        from local_coder.orchestrator.config_loader import load_config
+
+        config = load_config(
+            getattr(self, "config_path", None),
+            project_root=str(self._harness_root),
+            overrides=getattr(self, "config_overrides", None),
+        )
+        selected_mode = AgentMode(mode or config.mode)
+        role = {
+            AgentMode.CODING: AgentRole.CODER,
+            AgentMode.CYBERSECURITY: AgentRole.SECURITY,
+            AgentMode.BUG_HUNTING: AgentRole.BUG_HUNTER,
+            AgentMode.RED_TEAM: AgentRole.RED_TEAM,
+        }[selected_mode]
+        if getattr(self, "_using_inference", False) or getattr(self, "_provider", None) is not None:
+            model = self._selected_provider_config()
+        elif config.models:
+            name = resolve_model_name(config, role, getattr(self, "model_name", None))
+            model = config.models[name]
+        else:
+            model = None
+        if selected_mode == AgentMode.BUG_HUNTING and hasattr(self, "provider_profiles"):
+            mapping_path = state_path(self._harness_root, ".local-coder/bug-models.json")
+            mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else {}
+            if mapping.get("exploit"):
+                record = self.provider_profiles.get(mapping["exploit"])
+                model = ModelConfig.model_validate({**record["provider"], "name": "bug-exploit"})
+        overrides = dict(settings.profile_overrides)
+        evolution = getattr(getattr(self, "current_registry", None), "evolution", None)
+        if evolution is not None:
+            overrides.update(evolution.active_overlay())
+        profile = resolve_profile(model, role, overrides) if model is not None else None
+        describe = getattr(profile, "describe", None)
+        return _clean(describe()) if callable(describe) else None
+
+    def _harness_status(self, mode=None):
+        from local_coder.release_readiness import readiness_report
         settings = self.harness_settings()
         ledger = getattr(self, "current_budget", None)
         budget = ledger.status() if ledger is not None else None
@@ -235,19 +274,29 @@ class HarnessAPI:
         )
         current = getattr(self, "current_registry", None)
         sandbox = self._sandbox_probe or getattr(current, "sandbox", None) or SandboxRunner(settings.sandbox_backend, settings.sandbox_image)
+        try:
+            from local_coder.models.specialization import index_summary
+        except ImportError:
+            model_index = None
+        else:
+            model_index = index_summary()
         return {
+            "model_profile": self._model_profile_status(settings, mode),
+            "model_index": model_index,
             "settings": settings.model_dump(mode="json"),
             "safety_tier": tier.value,
             "budget": budget,
             "sandbox": sandbox.status(),
             "evolution": _clean(EvolutionStore(self._harness_root).history()[-100:]),
             "language": self._language_service().status(),
+            "readiness": readiness_report(self._harness_root),
         }
 
     def _harness_get(self, path, query):
         _object(query)
         if path in {"/harness", "/harness/settings"}:
-            return self._harness_status()
+            _object(query, {"mode"})
+            return self._harness_status(_query(query, "mode", None))
         if path == "/memory":
             return {
                 "memories": self.context_memory.list_memories(
@@ -266,6 +315,10 @@ class HarnessAPI:
             }
         if path == "/integrations/mcp":
             return MCPManager(self._harness_root).status()
+        if path == "/integrations/search/doctor":
+            _object(query, set())
+            from local_coder.tools.web_search import search_connection_doctor
+            return asyncio.run(search_connection_doctor(MCPManager(self._harness_root)))
         if path == "/integrations/skills":
             return {"skills": self._skill_library.list()}
         parts = [unquote(part) for part in path.strip("/").split("/")]
@@ -400,6 +453,20 @@ class HarnessAPI:
 
             with self._harness_idle():
                 return asyncio.run(probe())
+        if path == "/integrations/search/doctor":
+            _object(body, {"server"})
+            server = _text(body.get("server"), maximum=100)
+            from local_coder.tools.web_search import search_connection_doctor
+
+            async def doctor():
+                manager = MCPManager(self._harness_root, approval_callback=self.approvals.request)
+                try:
+                    return await search_connection_doctor(manager, server=server, probe=True)
+                finally:
+                    await manager.close()
+
+            with self._harness_idle():
+                return asyncio.run(doctor())
         if path == "/integrations/skills/save":
             _object(body, {"skill", "title", "content", "description"})
             return self._skill_library.save(

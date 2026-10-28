@@ -1,0 +1,18 @@
+/* Bundled Google families keep Linux, Windows and macOS text consistent. */
+:root{font-optical-sizing:auto;font-weight:400;letter-spacing:normal}
+.studio,.studio .settings-dialog{font-family:var(--font-ui);letter-spacing:normal}
+.studio .sidebar-caption{font-weight:500;letter-spacing:-.015em}
+.studio .main-nav>button,.studio .workbench-nav>button{font-size:13px;font-weight:400}
+.studio .sidebar-conversations>button{font-size:12px;line-height:1.5}
+.studio .home-intro h1{font-weight:500;letter-spacing:-.025em}
+.studio .report-document{font-size:14px;line-height:1.75;letter-spacing:normal}
+.studio .report-heading-1,.studio .report-heading-2,.studio .playbook-view h1,.studio .goal-page h1{font-weight:500;letter-spacing:-.02em}
+.studio pre,.studio code,.studio .report-code pre{font-family:var(--font-code);font-variant-ligatures:none;letter-spacing:normal}
+.studio .composer{position:relative}
+.studio .composer-slash-menu{position:absolute;bottom:calc(100% + 10px);left:0;right:0;z-index:35;max-height:min(330px,45dvh);overflow:auto;background:#222426;border:1px solid #45474b;border-radius:10px;padding:6px;box-shadow:0 14px 36px #0005;text-align:left}
+.studio .composer-slash-menu>button{display:flex;align-items:center;gap:15px;width:100%;padding:10px 12px;border-radius:6px;text-align:left;color:var(--text);min-height:39px}
+.studio .composer-slash-menu>button.active{background:#35373c}.composer-slash-menu strong{font-size:13px;font-weight:500;min-width:75px}.composer-slash-menu>button>span{font-size:12px;color:var(--muted)}.composer-slash-menu>p{margin:5px 8px 2px;padding:8px 4px 3px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.studio .slash-trigger{font-size:17px;color:var(--muted)}
+.composer-command-notice{display:flex;gap:12px;align-items:flex-start;background:var(--surface);border:1px solid var(--border);padding:12px 14px;border-radius:8px;margin:0 0 14px;font-size:12px;line-height:1.7;max-height:260px;overflow:auto}
+.composer-command-notice>span{white-space:pre-wrap;overflow-wrap:anywhere;flex:1}.composer-command-notice>button{display:flex;padding:3px;color:var(--muted);border-radius:4px}
+@media(max-width:700px){.composer-slash-menu>button>span{font-size:11px}.studio .composer-slash-menu>button{gap:6px;padding:9px}.composer-slash-menu strong{min-width:65px}}

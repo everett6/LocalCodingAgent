@@ -15,6 +15,8 @@ type Memory = {
   created_at?: string
   updated_at?: string
   freshness?: string
+  source_status?: string
+  head_changed?: boolean
   embedding_backend?: string
   reasons?: string[]
   links?: string[]
@@ -27,10 +29,27 @@ type MemoryStatus = {
   embedding_kind?: string
   neural_embeddings?: boolean
 }
+type RetrievalAudit = {
+  id: string
+  created_at: string
+  query_preview: string
+  query_hash: string
+  char_budget: number
+  used_characters: number
+  rendered_characters?: number
+  candidate_count: number
+  omitted_candidates: number
+  candidates: {
+    id: string; kind: string; source_ref?: string; freshness?: string
+    score?: number; selected: boolean; reasons?: string[]; exclusion?: string
+    characters?: number; truncated?: boolean
+  }[]
+}
 type IndexResult = { files?: number; chunks?: number; skipped?: number }
 
 export function MemoryInspector() {
   const [items, setItems] = useState<Memory[]>([])
+  const [audits, setAudits] = useState<RetrievalAudit[]>([])
   const [status, setStatus] = useState<MemoryStatus | null>(null)
   const [query, setQuery] = useState('')
   const [activeQuery, setActiveQuery] = useState('')
@@ -52,7 +71,9 @@ export function MemoryInspector() {
           : api<{ memories: Memory[] }>('/memory?limit=50'),
         api<MemoryStatus>('/memory/status'),
       ])
+      const auditResponse = await api<{ retrievals: RetrievalAudit[] }>('/memory/retrievals?limit=5')
       if (version !== requestVersion.current) return
+      setAudits(auditResponse.retrievals)
       setError('')
       setItems('items' in response ? response.items : response.memories)
       setStatus(memoryStatus)
@@ -159,6 +180,24 @@ export function MemoryInspector() {
     {loading && <p role="status">Loading memory…</p>}
     {!loading && !items.length && <p>{activeQuery ? 'No matching evidence found.' : 'No memory chunks stored yet.'}</p>}
     {activeQuery && <p className="hint">Results for “{activeQuery}”. Text retrieval is limited to 4000 characters.</p>}
+    <details>
+      <summary>Recent retrieval decisions ({audits.length})</summary>
+      <p className="hint">Only bounded provenance and redacted query previews are stored. Up to 100 retrievals are retained; candidate evidence text is omitted.</p>
+      {!audits.length && <p>No recorded retrievals yet.</p>}
+      {audits.map(audit => <details key={audit.id}>
+        <summary>{audit.created_at} · {audit.query_preview || 'Empty query'} · {audit.used_characters}/{audit.char_budget} evidence characters</summary>
+        <p className="hint">Query hash: {audit.query_hash} · {audit.candidate_count} candidates
+          {audit.rendered_characters !== undefined && ` · ${audit.rendered_characters} characters including context headers`}</p>
+        {audit.omitted_candidates > 0 && <p>{audit.omitted_candidates} candidate summaries omitted by the audit limit.</p>}
+        <ul>{audit.candidates.map(candidate => <li key={candidate.id}>
+          <strong>{candidate.selected ? 'Selected' : 'Excluded'}</strong> · {candidate.source_ref || candidate.id}
+          {' · '}{candidate.freshness || 'Freshness unavailable'}
+          {candidate.score !== undefined && ` · score ${candidate.score}`}
+          {candidate.selected && ` · ${candidate.characters ?? 0} characters${candidate.truncated ? ' (truncated)' : ''}`}
+          <p>{candidate.exclusion || candidate.reasons?.join('; ')}</p>
+        </li>)}</ul>
+      </details>)}
+    </details>
     <div aria-busy={disabled}>
       {items.map(item => {
         const stale = item.freshness && item.freshness !== 'fresh'
@@ -177,6 +216,7 @@ export function MemoryInspector() {
             <dl style={{ overflowWrap: 'anywhere' }}>
               <dt>Memory ID</dt><dd>{item.id}</dd>
               <dt>Source</dt><dd>{item.source_ref || item.source_path || 'Conversation or recorded evidence'}</dd>
+              <dt>Source freshness</dt><dd>{item.source_status || item.freshness || 'Unavailable'}{item.head_changed ? ' · Git HEAD changed since recording' : ''}</dd>
               <dt>Source snapshot hash</dt><dd>{item.source_hash || 'No source snapshot'}</dd>
               <dt>Content hash</dt><dd>{item.content_hash || 'Unavailable'}</dd>
               <dt>Recorded Git HEAD</dt><dd>{item.head || 'No Git HEAD recorded'}</dd>

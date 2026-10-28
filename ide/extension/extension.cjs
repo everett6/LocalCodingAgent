@@ -22,7 +22,7 @@ function keyID(provider){return `provider:${crypto.createHash('sha256').update(J
 function activate(context){
   const services=new Map();
   const changed=new vscode.EventEmitter();
-  const output=vscode.window.createOutputChannel('Local Coder Activity');
+  const output=vscode.window.createOutputChannel('Clin Activity');
   let disposed=false,refreshing=false;
   const documents=new Map();
   let documentID=0;
@@ -35,7 +35,7 @@ function activate(context){
     await vscode.window.showTextDocument(doc,{preview:true});
   }
   context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc=>documents.delete(doc.uri.toString())));
-  function trusted(){if(!vscode.workspace.isTrusted)throw new Error('Trust this workspace before starting the Local Coder engine');}
+  function trusted(){if(!vscode.workspace.isTrusted)throw new Error('Trust this workspace before starting the Clin engine');}
   async function chooseFolder(){
     trusted();
     const folders=(vscode.workspace.workspaceFolders||[]).filter(folder=>folder.uri.scheme==='file');
@@ -111,13 +111,13 @@ function activate(context){
       changed.fire();
     }finally{refreshing=false;}
   }
-  const register=(command,handler)=>context.subscriptions.push(vscode.commands.registerCommand(command,async(...args)=>{try{return await handler(...args);}catch(error){vscode.window.showErrorMessage(`Local Coder: ${error.message}`);}}));
+  const register=(command,handler)=>context.subscriptions.push(vscode.commands.registerCommand(command,async(...args)=>{try{return await handler(...args);}catch(error){vscode.window.showErrorMessage(`Clin: ${error.message}`);}}));
   async function startJob(mode,action){
     const folder=await chooseFolder();if(!folder)return;
     const entry=await service(folder);
     const configured=await entry.engine.request('/settings');
     if(!configured.provider){await configureProvider(folder);if(!(await entry.engine.request('/settings')).provider)return;}
-    const request=await vscode.window.showInputBox({title:`Local Coder · ${mode.replace('_',' ')}`,prompt:action==='review'?'What should the review focus on?':'Describe the task',value:action==='review'?'Review the current workspace changes for correctness, bugs, and security issues.':'',ignoreFocusOut:true});
+    const request=await vscode.window.showInputBox({title:`Clin · ${mode.replace('_',' ')}`,prompt:action==='review'?'What should the review focus on?':'Describe the task',value:action==='review'?'Review the current workspace changes for correctness, bugs, and security issues.':'',ignoreFocusOut:true});
     if(!request?.trim())return;
     if(mode==='red_team'){
       const listing=await entry.engine.request('/engagements');
@@ -188,7 +188,7 @@ function activate(context){
     await entry.engine.request('/settings','POST',{...provider,...(api_key?{api_key}:{})});
     if(api_key)await context.secrets.store(keyID(provider),api_key);
     await context.globalState.update(configKey(folder),provider);
-    vscode.window.showInformationMessage(`Local Coder connected to ${model_id} with the ${profile.value} harness.`);
+    vscode.window.showInformationMessage(`Clin connected to ${model_id} with the ${profile.value} harness.`);
     await refresh();
   }
   register('localCoder.run',()=>startJob('coding','run'));
@@ -220,11 +220,11 @@ function activate(context){
     try{
       const updater=require('./update.cjs');
       const release=await updater.latest();
-      if(!release){if(manual)vscode.window.showInformationMessage('No validated Local Coder IDE release is published yet.');return;}
-      if(manual&&await vscode.window.showInformationMessage('Install the latest validated Local Coder IDE fork? Restart the IDE after installation.', 'Install')!=='Install')return;
+      if(!release){if(manual)vscode.window.showInformationMessage('No validated Clin IDE release is published yet.');return;}
+      if(manual&&await vscode.window.showInformationMessage('Install the latest validated Clin IDE fork? Restart the IDE after installation.', 'Install')!=='Install')return;
       const installed=await updater.install(release);
-      if(installed)vscode.window.showInformationMessage('Local Coder IDE updated. Restart the IDE to use the new version. Your previous installation is retained beside the current app.');
-      else if(manual)vscode.window.showInformationMessage('Local Coder IDE is already up to date.');
+      if(installed)vscode.window.showInformationMessage('Clin IDE updated. Restart the IDE to use the new version. Your previous installation is retained beside the current app.');
+      else if(manual)vscode.window.showInformationMessage('Clin IDE is already up to date.');
     }catch(error){if(manual)vscode.window.showErrorMessage(error.message);else output.appendLine(`IDE update: ${error.message}`);}
     finally{updateBusy=false;}
   }

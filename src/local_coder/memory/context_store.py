@@ -5,7 +5,6 @@ embeddings. Retrieved text is untrusted evidence and never executable policy.
 """
 from __future__ import annotations
 
-import ast
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,9 +22,10 @@ import uuid
 
 from local_coder.context.code_index import SKIP_DIRS, SKIP_EXTENSIONS, tokenize, iter_tokens
 from local_coder.statedir import state_path
+from local_coder.memory.code_structure import module_names, structure_chunks
 
 _KINDS = {"conversation", "code", "tool", "finding", "decision", "evidence", "hypothesis", "failure"}
-_STATE_FIELDS = {"objective", "constraints", "hypotheses", "failed_attempts", "evidence", "unfinished_work"}
+_STATE_FIELDS = {"objective", "constraints", "hypotheses", "failed_attempts", "evidence", "unfinished_work", "counterevidence", "next_tests", "blockers", "budget_remaining"}
 _SENSITIVE_KEY = re.compile(r"(?:password|passwd|secret|token|api[_-]?key|authorization|credential|private[_-]?key)", re.I)
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", re.S),
@@ -44,7 +44,7 @@ _LOCKS_GUARD = threading.Lock()
 def _clean(value: Any) -> Any:
     if isinstance(value, str):
         for pattern in _SECRET_PATTERNS:
-            value = pattern.sub("[REDACTED]", value)
+            value = pattern.sub(lambda match: "[REDACTED]" + "\n" * match.group().count("\n"), value)
         return value
     if isinstance(value, dict):
         return {_clean(str(key)): "[REDACTED]" if _SENSITIVE_KEY.search(str(key)) else _clean(item) for key, item in value.items()}
@@ -97,6 +97,9 @@ class ContextMemory:
             with self._connection() as connection:
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.executescript("""
+                    CREATE TABLE IF NOT EXISTS retrieval_audits (
+                        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, record TEXT NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                     CREATE TABLE IF NOT EXISTS memories (
                         id TEXT PRIMARY KEY, kind TEXT NOT NULL, content TEXT NOT NULL,
@@ -122,11 +125,34 @@ class ContextMemory:
                     CREATE TABLE IF NOT EXISTS task_states (
                         task_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS code_symbols (
+                        memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                        source_path TEXT NOT NULL, qualified_name TEXT NOT NULL,
+                        anchor TEXT NOT NULL, symbol_anchor TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS code_anchor_lookup ON code_symbols(anchor);
+                    CREATE INDEX IF NOT EXISTS code_symbol_lookup ON code_symbols(source_path, qualified_name);
+                    CREATE TABLE IF NOT EXISTS code_calls (
+                        source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                        target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                        expression TEXT NOT NULL, line INTEGER NOT NULL, resolution TEXT NOT NULL,
+                        PRIMARY KEY(source_id, target_id, expression, line)
+                    );
                 """)
                 owner = connection.execute("SELECT value FROM settings WHERE key='project_root'").fetchone()
                 if owner and owner[0] != str(self.project_root):
                     raise ValueError("Memory database belongs to another project")
                 connection.execute("INSERT OR IGNORE INTO settings VALUES ('project_root', ?)", (str(self.project_root),))
+                # Older audit records stored short query previews. Diagnostics
+                # now retain only hashes; scrub the bounded existing ring too.
+                for audit in connection.execute("SELECT id,record FROM retrieval_audits ORDER BY created_at DESC LIMIT 100").fetchall():
+                    try:
+                        record = json.loads(audit['record'])
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(record, dict) and 'query_preview' in record:
+                        record.pop('query_preview')
+                        connection.execute("UPDATE retrieval_audits SET record=? WHERE id=?", (json.dumps(record), audit['id']))
 
     def _check_storage(self, *, create: bool = False) -> None:
         for directory in (self.db_path.parent.parent, self.db_path.parent):
@@ -205,7 +231,8 @@ class ContextMemory:
             chunks.append((start, max(start, len(content.splitlines())), "".join(current)))
         return chunks[:128]
 
-    def _prepare(self, kind: str, content: str, source_path: str | None, task_id: str | None, metadata: dict | None) -> list[dict]:
+    def _prepare(self, kind: str, content: str, source_path: str | None, task_id: str | None, metadata: dict | None,
+                 vector_cache: dict[str, list[float]] | None = None) -> list[dict]:
         if kind not in _KINDS:
             raise ValueError("Unsupported memory kind")
         if not isinstance(content, str) or len(content) > 200000:
@@ -229,36 +256,24 @@ class ContextMemory:
             raise ValueError("Memory links must be a list of memory IDs")
         head, timestamp = self._head(), _now()
         rows = []
-        spans = self._chunks(cleaned)
-        if kind == "code" and relative and relative.endswith(".py"):
-            try:
-                tree = ast.parse(cleaned)
-                lines = cleaned.splitlines(keepends=True)
-                # A top-level definition remains coherent where it fits; large ones
-                # retain line references through the ordinary bounded window splitter.
-                definitions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-                if definitions:
-                    spans = []
-                    cursor = 1
-                    for node in definitions:
-                        begin = min([node.lineno] + [decorator.lineno for decorator in node.decorator_list])
-                        end = node.end_lineno or node.lineno
-                        for offset, last in ((cursor, begin - 1), (begin, end)):
-                            block = "".join(lines[offset - 1:last])
-                            spans.extend((offset + first - 1, offset + final - 1, text) for first, final, text in self._chunks(block))
-                        cursor = end + 1
-                    spans.extend((cursor + first - 1, cursor + last - 1, text) for first, last, text in self._chunks("".join(lines[cursor - 1:])))
-                    spans = spans[:128]
-            except (SyntaxError, ValueError, RecursionError):
-                pass
-        for first, last, text in spans:
+        chunks = [{"content": text, "metadata": {"start_line": first, "end_line": last}}
+                  for first, last, text in self._chunks(cleaned)]
+        if kind == "code" and relative:
+            chunks = structure_chunks(relative, cleaned)
+        for chunk in chunks:
+            text = chunk["content"]
             if not text.strip():
                 continue
-            details = {**clean_metadata, "start_line": first, "end_line": last}
+            details = {**clean_metadata, **_clean(chunk["metadata"])}
+            content_hash = _digest(text.encode())
+            vector = vector_cache.get(content_hash) if vector_cache is not None else None
+            if vector is None:
+                vector = self._vector(text)
+            search_label = " ".join(str(details.get(key, "")) for key in ("anchor", "qualified_name"))
             rows.append({"id": uuid.uuid4().hex, "kind": kind, "content": text, "source_path": relative,
-                         "source_hash": source_hash, "content_hash": _digest(text.encode()), "head": head,
+                         "source_hash": source_hash, "content_hash": content_hash, "head": head,
                          "task_id": task_id, "metadata": details, "created_at": timestamp, "updated_at": timestamp,
-                         "_links": links, "_vector": self._vector(text), "_terms": Counter(tokenize(text + " " + (relative or "")))})
+                         "_links": links, "_vector": vector, "_terms": Counter(tokenize(text + " " + (relative or "") + " " + search_label))})
         return rows
 
     def _insert(self, connection: sqlite3.Connection, rows: list[dict]) -> None:
@@ -266,6 +281,9 @@ class ContextMemory:
             columns = ("id", "kind", "content", "source_path", "source_hash", "content_hash", "head", "task_id", "metadata", "created_at", "updated_at")
             connection.execute("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?)", tuple(json.dumps(row[key]) if key == "metadata" else row[key] for key in columns))
             self._indices(connection, row)
+            metadata = row["metadata"]
+            if row["kind"] == "code" and row["source_path"] and metadata.get("anchor"):
+                connection.execute("INSERT INTO code_symbols VALUES (?,?,?,?,?)", (row["id"], row["source_path"], metadata["qualified_name"], metadata["anchor"], metadata["symbol_anchor"]))
             for target in row["_links"]:
                 if connection.execute("SELECT 1 FROM memories WHERE id=?", (target,)).fetchone():
                     connection.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (row["id"], target, "references"))
@@ -273,34 +291,104 @@ class ContextMemory:
             if previous:
                 connection.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (row["id"], previous[0], "related"))
 
+    def _refresh_code_graph(self, connection: sqlite3.Connection) -> None:
+        """Resolve bounded static candidates against explicit indexed definitions.
+
+        These edges describe source references, not proof of runtime dispatch.
+        No source imports, execution, or external package inspection takes place.
+        """
+        connection.execute("DELETE FROM code_calls")
+        records = connection.execute("SELECT m.id,m.source_path,m.metadata FROM memories m JOIN code_symbols s ON s.memory_id=m.id ORDER BY m.updated_at DESC LIMIT 10000").fetchall()
+        by_symbol, modules, parsed = {}, {}, []
+        for record in records:
+            metadata = json.loads(record["metadata"])
+            parsed.append((record, metadata))
+            if metadata.get("syntax_provider") != "python_ast" or metadata.get("ambiguous_symbol"):
+                continue
+            key = (record["source_path"], metadata["qualified_name"])
+            by_symbol.setdefault(key, []).append(record["id"])
+            for module in module_names(record["source_path"]):
+                modules.setdefault(module, set()).add(record["source_path"])
+        edges = 0
+        for record, metadata in parsed:
+            for call in metadata.get("calls", [])[:32]:
+                if call.get("resolution") != "static_candidate":
+                    continue
+                matches = set()
+                for target in call.get("targets", [])[:2]:
+                    paths = {target["source_path"]} if target.get("source_path") else modules.get(target.get("module"), set())
+                    for path in paths:
+                        key = (path, target.get("qualified_name"))
+                        if key in by_symbol:
+                            matches.add(key)
+                if len(matches) != 1:
+                    continue
+                for target_id in by_symbol[next(iter(matches))][:8]:
+                    if record["id"] != target_id:
+                        connection.execute("INSERT OR IGNORE INTO code_calls VALUES (?,?,?,?,?)", (record["id"], target_id, call["expression"], call["line"], call["reason"]))
+                        edges += 1
+                        if edges >= 20000:
+                            return
+
     def _indices(self, connection: sqlite3.Connection, row: dict) -> None:
         connection.executemany("INSERT INTO terms VALUES (?,?,?)", [(row["id"], term, count) for term, count in row["_terms"].items()])
         connection.execute("INSERT INTO vectors VALUES (?,?,?)", (row["id"], self.embedding_name, json.dumps(row["_vector"])))
 
     def ingest(self, kind: str, content: str, source_path: str | None = None, task_id: str | None = None, metadata: dict | None = None) -> list[dict]:
         rows = self._prepare(kind, content, source_path, task_id, metadata)
+        reused = set()
         with self._connection() as connection:
-            self._insert(connection, rows)
-        return [self.get(row["id"]) for row in rows]
+            connection.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                existing = connection.execute(
+                    "SELECT id FROM memories WHERE kind=? AND content_hash=? AND source_path IS ? AND source_hash IS ? AND task_id IS ? AND head IS ? AND metadata=? ORDER BY created_at LIMIT 1",
+                    (kind, row["content_hash"], row["source_path"], row["source_hash"], task_id, row["head"], json.dumps(row["metadata"])),
+                ).fetchone()
+                if existing:
+                    row["id"] = existing[0]
+                    reused.add(existing[0])
+                    for target in row["_links"]:
+                        if connection.execute("SELECT 1 FROM memories WHERE id=?", (target,)).fetchone():
+                            connection.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (row["id"], target, "references"))
+                else:
+                    self._insert(connection, [row])
+            if kind == "code":
+                self._refresh_code_graph(connection)
+        return [{**self.get(row["id"]), "deduplicated": row["id"] in reused} for row in rows]
 
-    def _freshness(self, row: dict, head: str | None) -> str:
+    def _freshness(self, row: dict, head: str | None, source_hashes: dict[str, str | None] | None = None) -> str:
         if row["source_path"]:
-            try:
-                path = self._path(row["source_path"])
-                if not path.is_file():
-                    return "source_missing"
-                if path.stat().st_size > self.max_file_bytes or _digest(path.read_bytes()) != row["source_hash"]:
-                    return "source_changed"
-            except (OSError, ValueError):
+            # Share a source snapshot only within one retrieval. Each stored row
+            # still compares its own hash, and the next request reads anew.
+            source_hashes = {} if source_hashes is None else source_hashes
+            source = row["source_path"]
+            if source not in source_hashes:
+                try:
+                    path = self._path(source)
+                    source_hashes[source] = (None if not path.is_file() else "" if path.stat().st_size > self.max_file_bytes
+                                             else _digest(path.read_bytes()))
+                except (OSError, ValueError):
+                    source_hashes[source] = None
+            if source_hashes[source] is None:
                 return "source_missing"
+            if source_hashes[source] != row["source_hash"]:
+                return "source_changed"
+            if (row["metadata"].get("correction_status") == "human_corrected_unverified"
+                    or row["metadata"].get("structure_status") == "corrected_unverified"):
+                return "corrected_unverified"
+            # Source content is authoritative across branch/commit changes.
+            return "fresh"
         if row["head"] != head:
             return "head_changed"
         return "fresh"
 
-    def _view(self, connection: sqlite3.Connection, record: sqlite3.Row, head: str | None) -> dict:
+    def _view(self, connection: sqlite3.Connection, record: sqlite3.Row, head: str | None,
+              source_hashes: dict[str, str | None] | None = None) -> dict:
         row = dict(record)
         row["metadata"] = json.loads(row["metadata"])
-        row["freshness"] = self._freshness(row, head)
+        row["freshness"] = self._freshness(row, head, source_hashes)
+        row["head_changed"] = row["head"] != head
+        row["source_status"] = ("content_verified" if row["freshness"] == "fresh" else row["freshness"]) if row["source_path"] else "not_source_bound"
         stored = connection.execute("SELECT backend FROM vectors WHERE memory_id=?", (row["id"],)).fetchone()
         row["embedding_backend"] = stored[0] if stored else None
         row["untrusted"] = True
@@ -330,6 +418,15 @@ class ContextMemory:
             connection.execute("DELETE FROM terms WHERE memory_id=?", (memory_id,))
             connection.execute("DELETE FROM vectors WHERE memory_id=?", (memory_id,))
             connection.execute("DELETE FROM links WHERE source_id=? OR target_id=?", (memory_id, memory_id))
+            connection.execute("DELETE FROM code_symbols WHERE memory_id=?", (memory_id,))
+            connection.execute("DELETE FROM code_calls WHERE source_id=? OR target_id=?", (memory_id, memory_id))
+            metadata = json.loads(original["metadata"])
+            metadata["correction_status"] = "human_corrected_unverified"
+            if original["kind"] == "code":
+                for key in ("anchor", "symbol_anchor", "qualified_name", "symbol", "symbol_kind", "calls", "syntax_provider"):
+                    metadata.pop(key, None)
+                metadata["structure_status"] = "corrected_unverified"
+            connection.execute("UPDATE memories SET metadata=? WHERE id=?", (json.dumps(metadata), memory_id))
             self._indices(connection, derived)
         return self.get(memory_id)
 
@@ -348,46 +445,147 @@ class ContextMemory:
         query = _clean(str(query))[:4000]
         terms = list(dict.fromkeys(tokenize(query)))[:64]
         if not terms or budget == 0 or limit == 0 or query == "[REDACTED]":
+            with self._connection() as connection:
+                self._record_retrieval(connection, query, budget, limit, [], [], "empty query or zero budget/limit")
             return []
         vector, head = self._vector(query), self._head()
         placeholders = ",".join("?" for _ in terms)
         with self._connection() as connection:
             # Exact term postings bound the lexical candidate set. Vectors rerank
             # lexical candidates; a supplied neural backend may add vector-only hits.
-            records = connection.execute(f"SELECT m.*, v.value AS vector, v.backend AS vector_backend, count(t.term) AS lexical FROM memories m JOIN terms t ON t.memory_id=m.id JOIN vectors v ON v.memory_id=m.id WHERE t.term IN ({placeholders}) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) GROUP BY m.id ORDER BY lexical DESC, m.updated_at DESC LIMIT 1000", (*terms, task_id, task_id)).fetchall()
-            if self.embedding_backend is not None:
+            anchor_query = query.startswith('code:')
+            if anchor_query:
+                records = connection.execute("SELECT m.*,v.value AS vector,v.backend AS vector_backend,1 AS lexical FROM memories m JOIN vectors v ON v.memory_id=m.id JOIN code_symbols s ON s.memory_id=m.id WHERE (s.anchor=? OR s.symbol_anchor=?) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY m.updated_at DESC LIMIT 128", (query, query, task_id, task_id)).fetchall()
+            else:
+                records = connection.execute(f"SELECT m.*, v.value AS vector, v.backend AS vector_backend, count(t.term) AS lexical FROM memories m JOIN terms t ON t.memory_id=m.id JOIN vectors v ON v.memory_id=m.id WHERE t.term IN ({placeholders}) AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) GROUP BY m.id ORDER BY lexical DESC, m.updated_at DESC LIMIT 1000", (*terms, task_id, task_id)).fetchall()
+            if self.embedding_backend is not None and not anchor_query:
                 additional = connection.execute("SELECT m.*, v.value AS vector, v.backend AS vector_backend, 0 AS lexical FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE v.backend=? AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY m.updated_at DESC LIMIT 1000", (self.embedding_name, task_id, task_id)).fetchall()
                 seen = {record["id"] for record in records}
                 records = list(records) + [record for record in additional if record["id"] not in seen]
-            ranked = []
+            ranked, candidates = [], []
+            source_hashes: dict[str, str | None] = {}
             for record in records:
-                row = self._view(connection, record, head)
+                row = self._view(connection, record, head, source_hashes)
                 stored_vector = json.loads(row.pop("vector"))
                 backend = row.pop("vector_backend")
                 lexical = row.pop("lexical")
                 similarity = sum(a * b for a, b in zip(vector, stored_vector)) if backend == self.embedding_name and len(vector) == len(stored_vector) else 0
-                if row["kind"] == "code" and row["freshness"] != "fresh":
+                candidate = self._audit_candidate(row)
+                candidates.append(candidate)
+                candidate["lexical_terms"] = lexical
+                candidate["vector_similarity"] = round(similarity, 6)
+                if row["freshness"] not in {"fresh", "corrected_unverified"} and (row["kind"] == "code" or (row["source_path"] and row["kind"] != "decision") or row["kind"] in {"tool", "evidence", "finding", "hypothesis", "failure"}):
+                    candidate["exclusion"] = "stale observation: " + row["freshness"]
                     continue
                 if not lexical and similarity < 0.65:
+                    candidate["exclusion"] = "below vector relevance threshold"
                     continue
                 exact = query.casefold() in row["content"].casefold()
-                row["score"] = round(lexical / len(terms) * 3 + max(0, similarity) + (2 if exact else 0), 6)
+                symbol = row['metadata'].get('qualified_name', '')
+                symbol_match = bool(symbol) and (query.casefold() == symbol.casefold() or query.casefold() == row['metadata'].get('symbol', '').casefold())
+                row["score"] = round(lexical / len(terms) * 3 + max(0, similarity) + (2 if exact else 0) + (4 if symbol_match or anchor_query else 0), 6)
                 row["reasons"] = ([f"{lexical} matching lexical terms"] if lexical else []) + [f"{backend} vector similarity {similarity:.3f}"]
                 if exact:
                     row["reasons"].append("exact phrase")
-                if row["freshness"] != "fresh":
+                if anchor_query:
+                    row['reasons'].append('exact structural anchor')
+                elif symbol_match:
+                    row['reasons'].append('exact AST symbol')
+                if row["freshness"] == "corrected_unverified":
+                    row["reasons"].append("human-corrected memory; source does not verify this text")
+                elif row["freshness"] != "fresh":
                     row["reasons"].append("historical evidence: " + row["freshness"])
+                candidate.update(score=row["score"], reasons=row["reasons"])
                 ranked.append(row)
             ranked.sort(key=lambda row: (row["score"], row["updated_at"], row["id"]), reverse=True)
+            planned, seen_ids, seen_anchors = [], set(), set()
+            for root in ranked:
+                queue = [(root, 0)]
+                while queue and len(planned) < limit:
+                    row, depth = queue.pop(0)
+                    anchor = row['metadata'].get('anchor')
+                    if row['id'] in seen_ids or (anchor and anchor in seen_anchors):
+                        continue
+                    seen_ids.add(row['id'])
+                    if anchor:
+                        seen_anchors.add(anchor)
+                    planned.append(row)
+                    if row['kind'] != 'code' or depth >= 2 or anchor_query:
+                        continue
+                    dependencies = connection.execute("SELECT m.*,c.expression AS call_expression,c.line AS call_line,c.resolution AS call_resolution FROM code_calls c JOIN memories m ON m.id=c.target_id WHERE c.source_id=? AND (? IS NULL OR m.task_id=? OR m.task_id IS NULL) ORDER BY c.line,c.target_id LIMIT 4", (row['id'], task_id, task_id)).fetchall()
+                    for record in dependencies:
+                        helper = self._view(connection, record, head, source_hashes)
+                        expression, line = helper.pop('call_expression'), helper.pop('call_line')
+                        resolution = helper.pop('call_resolution')
+                        if helper['freshness'] != 'fresh':
+                            candidates.append({**self._audit_candidate(helper), "exclusion": "stale static dependency: " + helper['freshness']})
+                            continue
+                        helper['score'] = row['score'] * .8
+                        helper['dependency_of'] = row['id']
+                        helper['dependency_depth'] = depth + 1
+                        helper['call_site'] = {'source_ref': f"{row['source_path']}:{line}", 'expression': expression, 'resolution': resolution}
+                        helper['reasons'] = [f"static call {expression} from {row['source_ref']}", 'indexed static target; runtime dispatch unproven']
+                        queue.append((helper, depth + 1))
+                if len(planned) >= limit:
+                    break
             hits = []
-            for row in ranked[:limit]:
+            for index, row in enumerate(planned):
                 if budget <= 0:
                     break
-                row["truncated"] = len(row["content"]) > budget
-                row["content"] = row["content"][:budget]
+                # Reserve room for every planned helper under the SAME budget.
+                allowance = max(1, budget // (len(planned) - index))
+                row["truncated"] = len(row["content"]) > allowance
+                row["content"] = row["content"][:allowance]
                 budget -= len(row["content"])
                 hits.append(row)
+            audit_id = self._record_retrieval(connection, query, char_budget, limit, candidates, hits)
+            for row in hits:
+                row["retrieval_id"] = audit_id
             return hits
+
+    @staticmethod
+    def _audit_candidate(row: dict) -> dict:
+        # Provenance only: never persist retrieved content or arbitrary metadata.
+        return {key: row.get(key) for key in ("id", "kind", "source_ref", "source_hash", "content_hash", "head", "freshness", "source_status", "head_changed", "score", "reasons")}
+
+    def _record_retrieval(self, connection: sqlite3.Connection, query: str, budget: int, limit: int,
+                          candidates: list[dict], hits: list[dict], reason: str | None = None) -> str:
+        audit_id = uuid.uuid4().hex
+        selected = {row["id"]: row for row in hits}
+        seen = {row["id"] for row in candidates}
+        candidates += [self._audit_candidate(row) for row in hits if row["id"] not in seen]
+        # Keep selected rows visible even when many candidates were considered.
+        candidates.sort(key=lambda row: row["id"] not in selected)
+        summaries = []
+        for candidate in candidates[:128]:
+            item = dict(candidate)
+            hit = selected.get(item["id"])
+            item["selected"] = hit is not None
+            if hit:
+                item.update(score=hit["score"], reasons=hit["reasons"], characters=len(hit["content"]), truncated=hit["truncated"])
+            else:
+                item.setdefault("exclusion", "rank, duplicate anchor, result limit or character budget")
+            summaries.append(item)
+        record = _clean({"id": audit_id, "created_at": _now(), "query_hash": _digest(query.encode()),
+                         "char_budget": max(0, min(int(budget), 50000)),
+                         "limit": limit, "used_characters": sum(len(row["content"]) for row in hits),
+                         "candidate_count": len(candidates), "omitted_candidates": max(0, len(candidates) - 128),
+                         "candidates": summaries, "empty_reason": reason, "untrusted": True})
+        connection.execute("INSERT INTO retrieval_audits VALUES (?,?,?)", (audit_id, record["created_at"], json.dumps(record)))
+        connection.execute("DELETE FROM retrieval_audits WHERE id NOT IN (SELECT id FROM retrieval_audits ORDER BY created_at DESC, id DESC LIMIT 100)")
+        return audit_id
+
+    def retrievals(self, limit: int = 20) -> list[dict]:
+        with self._connection() as connection:
+            return [json.loads(row[0]) for row in connection.execute(
+                "SELECT record FROM retrieval_audits ORDER BY created_at DESC, id DESC LIMIT ?", (max(0, min(int(limit), 100)),))]
+
+    def retrieval(self, audit_id: str) -> dict | None:
+        if not re.fullmatch(r"[a-f0-9]{32}", audit_id):
+            raise ValueError("Invalid retrieval identifier")
+        with self._connection() as connection:
+            row = connection.execute("SELECT record FROM retrieval_audits WHERE id=?", (audit_id,)).fetchone()
+            return json.loads(row[0]) if row else None
 
     def task_state(self, task_id: str, updates: dict | None = None) -> dict:
         if not task_id:
@@ -395,18 +593,28 @@ class ContextMemory:
         _identifier(task_id)
         if updates is not None and (not isinstance(updates, dict) or set(updates) - _STATE_FIELDS):
             raise ValueError("Unknown task state fields")
+        raw_budget = (updates or {}).get('budget_remaining')
+        if raw_budget is not None and (not isinstance(raw_budget, dict) or set(raw_budget) - {'requests', 'tokens', 'cost_usd'} or any(value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0) for value in raw_budget.values())):
+            raise ValueError("Remaining budget must contain bounded numeric requests/tokens/cost_usd")
         cleaned = _clean(updates or {})
+        if raw_budget is not None:
+            # Validated numeric token counts are accounting, never credentials.
+            cleaned['budget_remaining'] = dict(raw_budget)
         for key, value in cleaned.items():
             if key == "objective" and not isinstance(value, str):
                 raise ValueError("Task objective must be text")
-            if key != "objective" and (not isinstance(value, list) or not all(isinstance(item, str) for item in value)):
-                raise ValueError("Task state collections must be lists of text")
+            if key not in {"objective", "budget_remaining"} and (not isinstance(value, list) or len(value) > 100 or not all(isinstance(item, str) and len(item) <= 4000 for item in value)):
+                raise ValueError("Task state collections must be bounded lists of text")
+            if key == 'budget_remaining' and not isinstance(value, dict):
+                raise ValueError("Remaining budget must be a numeric object")
         if len(json.dumps(cleaned)) > 32000:
             raise ValueError("Task state updates exceed 32000 characters")
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT state FROM task_states WHERE task_id=?", (task_id,)).fetchone()
-            state = json.loads(row[0]) if row else {key: "" if key == "objective" else [] for key in sorted(_STATE_FIELDS)}
+            state = {key: "" if key == "objective" else {} if key == 'budget_remaining' else [] for key in sorted(_STATE_FIELDS)}
+            if row:
+                state.update(json.loads(row[0]))
             state.update(cleaned)
             if len(json.dumps(state)) > 32000:
                 raise ValueError("Task state exceeds 32000 characters")
@@ -414,20 +622,107 @@ class ContextMemory:
                 connection.execute("INSERT INTO task_states VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at", (task_id, json.dumps(state), _now()))
             return {"task_id": task_id, **state}
 
-    def context(self, query: str, char_budget: int = 4000, task_id: str | None = None, *, limit: int = 8) -> dict:
+    def context(self, query: str, char_budget: int = 4000, task_id: str | None = None, *, limit: int = 8,
+                hypotheses: list[str] | tuple[str, ...] = (), observations: list[str] | tuple[str, ...] = ()) -> dict:
         budget = max(0, min(int(char_budget), 50000))
-        items = self.search(query, char_budget=budget, task_id=task_id, limit=limit)
+        for values in (hypotheses, observations):
+            if not isinstance(values, (list, tuple)) or len(values) > 32 or not all(isinstance(value, str) for value in values):
+                raise ValueError("Retrieval hypotheses/observations must be bounded text lists")
+        state = self.task_state(task_id) if task_id else {}
+        active_hypotheses = (list(hypotheses) + state.get("hypotheses", []))[-8:]
+        recent_observations = list(observations)[-8:]
+        # Reserve most of the query for the original objective/constraints. New
+        # hypotheses add search terms, never replace or mutate task constraints.
+        pieces = [str(query)[:1600], state.get("objective", "")[:600],
+                  " ".join(state.get("constraints", []))[:600],
+                  " ".join(value[:100] for value in active_hypotheses)[:600],
+                  " ".join(value[:100] for value in recent_observations)[:600]]
+        enriched_query = " ".join(piece for piece in pieces if piece) if not str(query).startswith('code:') else str(query)[:4000]
+        query_context = {"hypotheses": len(active_hypotheses), "observations": len(recent_observations),
+                         "constraints": len(state.get("constraints", [])), "original_query_retained": True}
+        # task_id enriches this request; project memory remains useful across
+        # sessions/tasks. Explicit search(task_id=...) still offers strict task
+        # filtering, while this project's database remains the isolation bound.
+        items = self.search(enriched_query, char_budget=budget, task_id=None, limit=limit)
         text = "Untrusted memory evidence; verify sources before acting.\n"[:budget] if items else ""
         included = []
         for item in items:
-            header = f"\n[{item['id']}] {item['source_ref']} ({item['freshness']})\n"
+            via = f"; static helper via {item['call_site']['expression']}" if item.get('dependency_of') else ''
+            header = f"\n[{item['id']}] {item['source_ref']} ({item['freshness']}{via})\n"
             remaining = budget - len(text) - len(header)
             if remaining <= 0:
                 break
             content = item["content"][:remaining]
             text += header + content
             included.append({**item, "content": content, "truncated": item["truncated"] or len(content) < len(item["content"])})
-        return {"text": text, "items": included, "untrusted": True, "embedding_backend": self.embedding_name, "char_budget": budget}
+        audit_id = items[0]["retrieval_id"] if items else None
+        if audit_id:
+            with self._connection() as connection:
+                stored = connection.execute("SELECT record FROM retrieval_audits WHERE id=?", (audit_id,)).fetchone()
+                if stored:
+                    record = json.loads(stored[0])
+                    delivered = {item["id"]: item for item in included}
+                    for candidate in record["candidates"]:
+                        if candidate["selected"]:
+                            candidate["selected"] = candidate["id"] in delivered
+                            if candidate["selected"]:
+                                item = delivered[candidate["id"]]
+                                candidate.update(characters=len(item["content"]), truncated=item["truncated"])
+                            else:
+                                candidate["exclusion"] = "context header exceeds remaining character budget"
+                    record.update(used_characters=sum(len(item["content"]) for item in included),
+                                  rendered_characters=len(text), delivery="context")
+                    connection.execute("UPDATE retrieval_audits SET record=? WHERE id=?", (json.dumps(record), audit_id))
+        return {"text": text, "items": included, "untrusted": True, "embedding_backend": self.embedding_name, "char_budget": budget, "retrieval_id": audit_id, "query_context": query_context}
+
+    def structure(self, paths: list[str] | None = None, *, query: str = '', char_budget: int = 4000, limit: int = 100) -> dict:
+        """Browse an indexed directory/symbol tree using stable metadata anchors.
+
+        This is bounded source navigation; anchors are not hidden source edits.
+        Missing or stale code never appears as a fresh structural definition.
+        """
+        if paths is not None and (not isinstance(paths, list) or len(paths) > self.max_index_files):
+            raise ValueError('Structure paths must be a bounded list')
+        roots = [self._path(path) for path in paths] if paths is not None else [self.project_root]
+        budget, limit = max(0, min(int(char_budget), 50000)), max(0, min(int(limit), 500))
+        query = _clean(str(query))[:4000].casefold()
+        head, items, lines, seen, truncated = self._head(), [], [], set(), False
+        with self._connection() as connection:
+            records = connection.execute('SELECT m.* FROM memories m JOIN code_symbols s ON s.memory_id=m.id ORDER BY m.source_path,s.qualified_name,m.updated_at DESC LIMIT 10000').fetchall()
+            for record in records:
+                row = self._view(connection, record, head)
+                metadata = row['metadata']
+                anchor = metadata.get('anchor')
+                if not anchor or anchor in seen or row['freshness'] != 'fresh':
+                    continue
+                path = self._path(row['source_path'])
+                if not any(path == root or path.is_relative_to(root) for root in roots):
+                    continue
+                if query and query not in (' '.join([row['source_path'], metadata.get('qualified_name', ''), anchor])).casefold():
+                    continue
+                seen.add(anchor)
+                parts = Path(row['source_path']).parts
+                labels = []
+                for depth, part in enumerate(parts):
+                    key = '/'.join(parts[:depth + 1])
+                    if key not in seen:
+                        labels.append('  ' * depth + part + ('/' if depth < len(parts) - 1 else '') + '\n')
+                        seen.add(key)
+                labels.append('  ' * len(parts) + f"{metadata['symbol_kind']} {metadata['qualified_name']} [{anchor}] {row['source_ref']}\n")
+                text = ''.join(labels)
+                remaining = budget - sum(len(line) for line in lines)
+                if len(items) >= limit or len(text) > remaining:
+                    if remaining > 0:
+                        lines.append(text[:remaining])
+                    truncated = True
+                    break
+                lines.append(text)
+                items.append({'id': row['id'], 'source_path': row['source_path'], 'source_ref': row['source_ref'],
+                              'anchor': anchor, 'qualified_name': metadata['qualified_name'], 'symbol_kind': metadata['symbol_kind'],
+                              'start_line': metadata['start_line'], 'end_line': metadata['end_line'],
+                              'syntax_provider': metadata['syntax_provider'], 'freshness': row['freshness'], 'untrusted': True})
+        return {'text': ''.join(lines), 'items': items, 'truncated': truncated, 'untrusted': True,
+                'char_budget': budget, 'graph_limits': {'max_depth': 2, 'fanout': 4, 'max_nodes': 10000, 'max_edges': 20000}}
 
     @staticmethod
     def _indexable(path: Path, root: Path) -> bool:
@@ -452,6 +747,11 @@ class ContextMemory:
                     if len(candidates) >= self.max_index_files * 5:
                         break
         prepared, indexed_paths, skipped = [], set(), 0
+        unchanged, removed, updated_paths = 0, set(), set()
+        with self._connection() as connection:
+            existing = {}
+            for row in connection.execute("SELECT m.source_path,m.source_hash,v.backend FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE m.kind='code'"):
+                existing.setdefault(row["source_path"], set()).add((row["source_hash"], row["backend"]))
         for path in sorted(set(candidates)):
             if len(indexed_paths) >= self.max_index_files:
                 break
@@ -469,31 +769,63 @@ class ContextMemory:
                     continue
                 content = raw.decode("utf-8")
                 relative = str(path.relative_to(self.project_root))
-                rows = self._prepare("code", content, relative, None, {"indexed": True})
+                indexed_paths.add(relative)
+                if existing.get(relative) == {(_digest(raw), self.embedding_name)}:
+                    unchanged += 1
+                    continue
+                updated_paths.add(relative)
+                with self._connection() as connection:
+                    cached = connection.execute("SELECT m.content_hash,v.value FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE m.kind='code' AND m.source_path=? AND v.backend=? LIMIT 128", (relative, self.embedding_name)).fetchall()
+                vector_cache = {row["content_hash"]: json.loads(row["value"]) for row in cached}
+                rows = self._prepare("code", content, relative, None, {"indexed": True}, vector_cache)
                 for row in rows:
                     row["source_hash"] = _digest(raw)
                 prepared.extend(rows)
                 indexed_paths.add(relative)
             except (OSError, UnicodeError, ValueError):
                 skipped += 1
+        reused_chunks = 0
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for relative in indexed_paths:
-                connection.execute("DELETE FROM memories WHERE kind='code' AND source_path=?", (relative,))
+            pending = []
+            for relative in updated_paths:
+                previous = connection.execute("SELECT * FROM memories WHERE kind='code' AND source_path=?", (relative,)).fetchall()
+                reusable = {(row['content_hash'], json.loads(row['metadata']).get('anchor')): row for row in previous}
+                retained = set()
+                for row in (item for item in prepared if item['source_path'] == relative):
+                    old = reusable.get((row['content_hash'], row['metadata'].get('anchor')))
+                    if old is None or old['id'] in retained:
+                        pending.append(row)
+                        continue
+                    retained.add(old['id'])
+                    row['id'] = old['id']
+                    connection.execute("UPDATE memories SET source_hash=?,head=?,metadata=?,updated_at=? WHERE id=?",
+                                       (row['source_hash'], row['head'], json.dumps(row['metadata']), row['updated_at'], row['id']))
+                    connection.execute("DELETE FROM terms WHERE memory_id=?", (row['id'],))
+                    connection.execute("DELETE FROM vectors WHERE memory_id=?", (row['id'],))
+                    self._indices(connection, row)
+                    reused_chunks += 1
+                for old in previous:
+                    if old['id'] not in retained:
+                        connection.execute("DELETE FROM memories WHERE id=?", (old['id'],))
             # Only remove missing files in the requested scope. File changes are
             # independently invalidated at retrieval time, including partial runs.
             for row in connection.execute("SELECT id, source_path FROM memories WHERE kind='code'").fetchall():
                 source = self._path(row["source_path"]) if row["source_path"] else None
                 if source and not source.exists() and any(source == root or source.is_relative_to(root) for root in roots):
                     connection.execute("DELETE FROM memories WHERE id=?", (row["id"],))
-            self._insert(connection, prepared)
-        return {"files": len(indexed_paths), "chunks": len(prepared), "skipped": skipped, "max_files": self.max_index_files, "embedding_backend": self.embedding_name}
+                    removed.add(row["source_path"])
+            self._insert(connection, pending)
+            self._refresh_code_graph(connection)
+        return {"files": len(indexed_paths), "updated": len(indexed_paths) - unchanged, "unchanged": unchanged,
+                "removed": len(removed), "reused_chunks": reused_chunks, "chunks": len(prepared), "skipped": skipped, "max_files": self.max_index_files, "embedding_backend": self.embedding_name}
 
     def status(self) -> dict:
         with self._connection() as connection:
             return {"memories": connection.execute("SELECT count(*) FROM memories").fetchone()[0],
                     "tasks": connection.execute("SELECT count(*) FROM task_states").fetchone()[0],
                     "links": connection.execute("SELECT count(*) FROM links").fetchone()[0],
+                    "code_call_edges": connection.execute("SELECT count(*) FROM code_calls").fetchone()[0],
                     "embedding_backend": self.embedding_name,
                     "embedding_kind": "supplied_local_backend" if self.embedding_backend is not None else "lexical_subword_hash",
                     "neural_embeddings": bool(getattr(self.embedding_backend, "is_neural", False)),

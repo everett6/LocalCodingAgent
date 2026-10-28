@@ -59,6 +59,18 @@ def message_chars(messages: list[Message]) -> int:
     return sum(len(message.content) for message in messages)
 
 
+def sliding_tool_output_budget(max_chars: int, max_lines: int, depth: float) -> tuple[int, int]:
+    """Shrink new output as context fills; configured ceilings never increase.
+
+    Depth is a conservative observation from provider usage or serialized
+    history size, not a claim to possess the model's exact tokenizer.
+    """
+    depth = max(0.0, min(1.0, depth))
+    factor = 1.0 - .8 * depth
+    return (min(max_chars, max(64, int(max_chars * factor))),
+            min(max_lines, max(2, int(max_lines * factor))))
+
+
 def truncate_tool_output(
     text: str,
     max_chars: int,
@@ -219,7 +231,31 @@ def compress_messages(messages: list[Message], max_chars: int,
             group = compacted
         selected.append(group)
         remaining -= sum(message_size(m) for m in group)
-    return preserved + [summary] + [m for group in reversed(selected) for m in group]
+    compacted = preserved + [summary] + [m for group in reversed(selected) for m in group]
+    if compaction_fidelity(messages, "\n".join(m.content for m in compacted))["passed"]:
+        return compacted
+    # A deterministic fallback must preserve the same explicit facts that gate
+    # model summaries. A budget too small for those facts cannot be compacted
+    # honestly: retain originals so admission/CompactionGuard can stop safely.
+    facts = []
+    for message in messages:
+        for line in message.content.splitlines():
+            if _DURABLE_LINE.match(line):
+                facts.append(line)
+        facts.extend(match.group() for match in _SOURCE_REFERENCE.finditer(message.content))
+    pin = Message(role="user", content="Preserved untrusted history facts; verify sources:\n" + "\n".join(dict.fromkeys(facts)))
+    fixed = preserved + [summary, pin]
+    remaining = max_chars - sum(message_size(m) for m in fixed)
+    if remaining < 0:
+        return messages
+    retained = []
+    for group in selected:
+        size = sum(message_size(m) for m in group)
+        if size > remaining:
+            break
+        retained.append(group)
+        remaining -= size
+    return fixed + [m for group in reversed(retained) for m in group]
 
 
 def _tool_call_signatures(messages: list[Message]) -> dict[str, str]:
@@ -232,41 +268,66 @@ def _tool_call_signatures(messages: list[Message]) -> dict[str, str]:
     return signatures
 
 
-def prune_tool_outputs(messages: list[Message], protect_chars: int) -> tuple[list[Message], int]:
+def prune_tool_outputs(messages: list[Message], protect_chars: int,
+                       outcomes: dict[str, bool] | None = None,
+                       target_chars: int | None = None,
+                       prune_recent_successes: bool = False) -> tuple[list[Message], int]:
     """Clear old tool results in place. Returns (messages, chars freed).
 
-    First, results of an idempotent call that was repeated identically
-    later are cleared anywhere in the history. Then, walking back from the
-    newest message, tool results beyond the first protect_chars of tool
-    output are cleared too. Message count, roles and tool_call ids are
-    untouched so the history stays well-formed.
+    Duplicate successful/unknown idempotent calls are replaced with a pointer
+    to the newer result; a failed repeat never supersedes prior evidence.
+    Older confirmed successes are then cleared before unknown or failed
+    outputs. If a target is supplied, stop once it fits. The engine may also
+    release recent confirmed successes before requesting a lossy summary.
+    Message count, assistant reasoning, arguments, roles and tool_call IDs
+    remain untouched so every tool batch stays well-formed.
     """
     signatures = _tool_call_signatures(messages)
+    outcomes = outcomes or {}
     seen_later: set[str] = set()
     protected = 0
     freed = 0
     result = list(messages)
+    candidates = []
     for index in range(len(result) - 1, -1, -1):
         message = result[index]
         if message.role != "tool" or message.content in {PRUNED_TOOL_OUTPUT, SUPERSEDED_TOOL_OUTPUT}:
             continue
         signature = signatures.get(message.tool_call_id or "")
+        outcome = outcomes.get(message.tool_call_id or "")
         replacement = None
-        if signature is not None and signature in seen_later:
+        if signature is not None and signature in seen_later and outcome is not False:
             replacement = SUPERSEDED_TOOL_OUTPUT
         elif protected + len(message.content) <= protect_chars:
             protected += len(message.content)
+            if prune_recent_successes and outcome is True:
+                candidates.append(index)
         else:
             # Once one result falls outside the window, everything older
             # does too, so later small ones can't sneak back in and leave
             # a patchwork the model has to reason around.
             protected = protect_chars + 1
-            replacement = PRUNED_TOOL_OUTPUT
-        if signature is not None:
+            candidates.append(index)
+        if signature is not None and outcome is not False:
             seen_later.add(signature)
         if replacement is not None and len(replacement) < len(message.content):
             freed += len(message.content) - len(replacement)
             result[index] = message.model_copy(update={"content": replacement})
+    # With a target, stop as soon as enough cheap evidence has been removed.
+    # Confirmed successes precede unknown results, failures last. Assistant
+    # reasoning, call arguments and every tool envelope stay byte-exact.
+    size = sum(message_size(message) for message in result)
+    priority = lambda index: (0 if outcomes.get(result[index].tool_call_id or "") is True
+                              else 2 if outcomes.get(result[index].tool_call_id or "") is False else 1, index)
+    for index in sorted(candidates, key=priority):
+        if target_chars is not None and size <= target_chars:
+            break
+        message = result[index]
+        if len(PRUNED_TOOL_OUTPUT) < len(message.content):
+            replacement = message.model_copy(update={"content": PRUNED_TOOL_OUTPUT})
+            freed += len(message.content) - len(replacement.content)
+            size -= message_size(message) - message_size(replacement)
+            result[index] = replacement
     return result, freed
 
 
@@ -335,6 +396,48 @@ async def summarize_history(
         max_tokens=max_summary_tokens,
     )
     summary = _strip_think(response.content or "")
-    if not summary:
+    if not summary or not compaction_fidelity(middle, summary)["passed"]:
         return None
     return head + [Message(role="user", content=SUMMARY_PREFIX + summary)] + messages[tail_start:], response
+
+
+class CompactionGuard:
+    """Stop repeated lossy/no-progress compaction; never relax admission bounds."""
+
+    def __init__(self, *, minimum_yield: float = .10):
+        self.minimum_yield = max(.01, min(float(minimum_yield), .5))
+        self.low_yield_count = 0
+
+    def observe(self, before: int, after: int) -> dict:
+        before, after = max(0, int(before)), max(0, int(after))
+        saved = max(0, before - after)
+        fraction = saved / before if before else 0.0
+        self.low_yield_count = self.low_yield_count + 1 if fraction < self.minimum_yield else 0
+        action = 'stop' if self.low_yield_count >= 3 else 'contract' if self.low_yield_count >= 2 else 'continue'
+        return {'action': action, 'saved_characters': saved, 'yield_fraction': fraction,
+                'low_yield_count': self.low_yield_count,
+                'working_set_factor': .5 if action == 'contract' else 1.,
+                'reason': 'Repeated low-yield compaction; narrow task/context or use a larger admitted window' if action == 'stop' else None}
+
+
+_DURABLE_LINE = re.compile(r'^\s*(?:[-*]\s*)?(constraint|decision|failure|next|source)\s*:\s*(.+)', re.I)
+_SOURCE_REFERENCE = re.compile(r'\b[\w./-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|md|json|toml|yaml|yml):\d+(?:-\d+)?\b')
+
+
+def compaction_fidelity(original: list[Message], summary: str) -> dict:
+    """Deterministic fidelity gate for explicit durable records and source anchors.
+
+    This checks literal facts, not an unverifiable semantic-equivalence claim.
+    Free prose should use task-state pins; explicit records get a strict gate.
+    """
+    required = []
+    for message in original:
+        for line in message.content.splitlines():
+            match = _DURABLE_LINE.match(line)
+            if match:
+                required.append((match.group(1).lower(), match.group(2).strip()))
+        required.extend(('source', match.group()) for match in _SOURCE_REFERENCE.finditer(message.content))
+    required = list(dict.fromkeys(required))
+    missing = [{'category': category, 'reason': 'explicit durable fact omitted'} for category, fact in required if fact not in summary]
+    return {'passed': not missing, 'required_facts': len(required), 'missing': missing[:64],
+            'omitted_diagnostics': max(0, len(missing) - 64), 'method': 'explicit-facts-and-source-anchors'}

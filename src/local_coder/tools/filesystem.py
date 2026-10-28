@@ -365,6 +365,8 @@ class ApplyPatchTool(Tool):
         
     async def execute(self, patch: str, working_dir: str | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
+        process_started = False
+        potential_targets = []
         try:
             if self.safety_harness:
                 allowed, _ = self.safety_harness.can_modify_files()
@@ -373,16 +375,18 @@ class ApplyPatchTool(Tool):
                         success=False,
                         output="Operation blocked: Current Safety Tier does not allow file modifications (Read-Only Mode).",
                         error="Blocked by Safety Tier 1 (Paranoia)",
+                        data={"execution_outcome": "not_started", "potential_targets": []},
                         duration_ms=int((time.time() - start_t) * 1000),
                     )
 
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
-            patch_targets(self.project_root, patch, working_dir)
+            potential_targets = patch_targets(self.project_root, patch, working_dir)
             proc = await asyncio.create_subprocess_exec(
                 "patch", "--batch", "--forward", "--no-backup-if-mismatch", "--reject-file=-", "-p1",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=cwd
             )
+            process_started = True
             stdout, stderr = await proc.communicate(patch.encode())
             success = proc.returncode == 0
             res_str = stdout.decode()
@@ -400,7 +404,14 @@ class ApplyPatchTool(Tool):
                 success=success,
                 output=res_str.strip(),
                 files_changed=files_changed,
+                # A nonzero exit may follow successfully applied earlier hunks.
+                # Headers identify possible effects, not observed file changes.
+                data={"execution_outcome": "completed" if success else "unknown",
+                      "potential_targets": potential_targets},
                 duration_ms=int((time.time()-start_t)*1000),
             )
         except Exception as e:
-            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+            return ToolResult(success=False, output=f"Error: {str(e)}",
+                              data={"execution_outcome": "unknown" if process_started else "not_started",
+                                    "potential_targets": potential_targets},
+                              duration_ms=int((time.time()-start_t)*1000))

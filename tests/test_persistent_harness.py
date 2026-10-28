@@ -23,14 +23,16 @@ def test_surrender_retries_with_alternate_strategy_and_bounded_budget():
     assert 'different tool' in strategies[1]
 
 
-@pytest.mark.parametrize('reason', ['I cannot complete this task: authorization is missing.',
-                                    'I cannot help with this harmful request under safety policy.',
-                                    'I cannot continue: user cancelled the task.'])
-def test_protected_stops_do_not_trigger_recovery(reason):
+@pytest.mark.parametrize('reason,expected_status', [
+    ('I cannot complete this task: authorization is missing.', TaskStatus.FAILED),
+    ('I cannot help with this harmful request under safety policy.', TaskStatus.BLOCKED),
+    ('I cannot continue: user cancelled the task.', TaskStatus.FAILED),
+])
+def test_protected_stops_do_not_trigger_recovery(reason, expected_status):
     model = FakeModel([ModelResponse(content=reason)])
     agent = LoopAgent(model, FakeRegistry([]))
     result = asyncio.run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Inspect")))
-    assert result.status == TaskStatus.FAILED
+    assert result.status == expected_status
     assert len(model.calls) == 1
 
 
@@ -40,7 +42,7 @@ def test_failed_verification_recovers_and_observes_a_passing_test():
                        ModelResponse(tool_calls=[ToolCall(name='run_tests')]),
                        ModelResponse(content='Verified.')])
     agent = LoopAgent(model, FakeRegistry([ToolResult(success=False, output='assertion failed'),
-                                          ToolResult(success=True, output='passed')]))
+                                          ToolResult(success=True, output='passed')], tool_names=('run_tests',)))
     result = asyncio.run(agent.execute(AgentTask(role=AgentRole.CODER, objective='Fix')))
     assert result.status == TaskStatus.COMPLETED
     assert agent._strategy_attempts == 1

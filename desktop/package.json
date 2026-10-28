@@ -2,8 +2,8 @@
   "name": "local-coder-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Local Coder agent workspace",
-  "author": "Local Coder contributors",
+  "description": "Clin agent workspace",
+  "author": "Clin contributors",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
@@ -13,7 +13,7 @@
   },
   "build": {
     "appId": "dev.localcoder.desktop",
-    "productName": "Local Coder",
+    "productName": "Clin",
     "directories": {
       "output": "release"
     },
@@ -22,7 +22,8 @@
       "preload.cjs",
       "sidecar.cjs",
       "package.json",
-      "discovery.cjs"
+      "discovery.cjs",
+      "native-storage.cjs"
     ],
     "extraResources": [
       {
@@ -32,6 +33,10 @@
           "local-coder-engine",
           "local-coder-engine.exe"
         ]
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icons/icon.png"
       }
     ],
     "mac": {
@@ -40,23 +45,27 @@
         "zip"
       ],
       "category": "public.app-category.developer-tools",
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "icon": "build/icon.icns"
     },
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "linux": {
       "target": [
         "AppImage"
       ],
-      "category": "Development"
+      "category": "Development",
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    }
+    },
+    "executableName": "local-coder-desktop"
   },
   "devDependencies": {
     "electron": "^45.0.0",

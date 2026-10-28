@@ -8,12 +8,14 @@ Supports:
 - Type-safe accessors
 """
 
+import copy
 import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, get_type_hints
 
 import yaml
+from pydantic import BaseModel
 
 
 class ConfigError(Exception):
@@ -33,7 +35,7 @@ class ConfigSchema:
         import jsonschema
         
         # Merge with defaults first
-        merged = self._merge_with_defaults(config)
+        merged = self._merge_with_defaults(config) if isinstance(config, dict) else config
         
         # Validate
         try:
@@ -45,35 +47,18 @@ class ConfigSchema:
     
     def _merge_with_defaults(self, config: dict) -> dict:
         """Merge config with defaults, recursively."""
-        result = {}
-        for key, schema_def in self.schema.items():
-            # Get default value
-            default = self.defaults.get(key)
-            if default is None and "default" in schema_def:
-                default = schema_def["default"]
-            
-            if key in config:
-                value = config[key]
-            elif default is not None:
-                value = default
-            else:
+        result = copy.deepcopy(self.defaults)
+        result.update(copy.deepcopy(config))
+        for key, schema_def in self.schema.get("properties", {}).items():
+            if not isinstance(schema_def, dict):
                 continue
-            
-            # Handle nested schemas
-            if isinstance(schema_def, dict) and "properties" in schema_def:
-                if isinstance(value, dict):
-                    nested_schema = ConfigSchema(schema_def["properties"], 
-                                                 self.defaults.get(key, {}))
-                    value = nested_schema._merge_with_defaults(value)
-                # If not dict and schema expects dict, use default
-            
-            result[key] = value
-        
-        # Include any extra keys from config that have defaults
-        for key in config:
-            if key not in result:
-                result[key] = config[key]
-        
+            if key not in result and "default" in schema_def:
+                result[key] = copy.deepcopy(schema_def["default"])
+            if key in result and isinstance(result[key], dict) and "properties" in schema_def:
+                defaults = self.defaults.get(key, {})
+                nested_schema = ConfigSchema(schema_def, defaults if isinstance(defaults, dict) else {})
+                result[key] = nested_schema._merge_with_defaults(result[key])
+
         return result
 
 
@@ -263,13 +248,14 @@ class ConfigManager:
         
         parts = key.split(".")
         value = self._config
+        missing = object()
         for part in parts:
-            if hasattr(value, '__getitem__'):
-                value = value[part]
+            if isinstance(value, dict):
+                value = value.get(part, missing)
             else:
-                value = getattr(value, part, default)
-                if value is None or value == default:
-                    break
+                value = getattr(value, part, missing)
+            if value is missing or value is None:
+                return default
         return value if value is not None else default
     
     def get_section(self, section: str) -> dict:

@@ -56,8 +56,17 @@ _EXCLUDED_DIRS = {".git", ".local-coder", ".venv", "venv", "node_modules", "__py
 _SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "credentials*", "*secret*", "*.p12", "*.pfx", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519")
 
 
+def _secure_read_flags() -> int:
+    """Require both no-follow and nonblocking reads; never substitute zero."""
+    flags = [getattr(os, name, None) for name in ("O_NOFOLLOW", "O_NONBLOCK")]
+    if any(type(flag) is not int or flag == 0 for flag in flags):
+        raise ValueError("isolated regression requires POSIX O_NOFOLLOW and O_NONBLOCK support")
+    return os.O_RDONLY | flags[0] | flags[1]
+
+
 def _snapshot(root: Path, destination: Path) -> list[str]:
     """Copy bounded readable source, excluding symlinks and private state."""
+    read_flags = _secure_read_flags()
     excluded = []
     count = total = visited = 0
     destination.mkdir(mode=0o755)
@@ -84,7 +93,7 @@ def _snapshot(root: Path, destination: Path) -> list[str]:
                 if len(excluded) < 2000:
                     excluded.append(relative.as_posix())
                 continue
-            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(source, read_flags)
             with os.fdopen(fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode):
@@ -129,7 +138,7 @@ async def run_regression(
     """
     result = dict(status="error", passed=0, failed=0, errors=0, skipped=0,
                   tests=0, exit_code=None, output="", error="", backend=backend,
-                  isolation="container", test_ids=[], image_id="", failure_kind="",
+                  isolation="container", test_ids=[], passed_test_ids=[], image_id="", failure_kind="",
                   snapshot_exclusions=[])
     if backend not in {"docker", "podman"}:
         result["error"] = "backend must be docker or podman"
@@ -151,6 +160,11 @@ async def run_regression(
             raise ValueError("an existing trusted image is required")
     except (OSError, ValueError, IndexError) as exc:
         result["error"] = str(exc)[:1000]
+        return result
+    try:
+        read_flags = _secure_read_flags()
+    except ValueError as exc:
+        result.update(status="unavailable", error=str(exc))
         return result
     runtime = shutil.which(backend)
     if runtime is None:
@@ -198,7 +212,7 @@ async def run_regression(
             report = Path(report_dir) / "result.xml"
             # Open without following a container-created symlink; bound the read
             # even if an untrusted writer changes the file after fstat.
-            fd = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(report, read_flags)
             with os.fdopen(fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > _REPORT_LIMIT:
@@ -229,6 +243,8 @@ async def run_regression(
                         result["error"] = "invalid, duplicate, or excessive test identifiers"
                         return result
                     result["test_ids"].append(identifier)
+                    if key == "passed":
+                        result["passed_test_ids"].append(identifier)
             result["test_ids"].sort()
             result["failure_kind"] = ("assertion" if failure_kinds and all(k == "assertion" for k in failure_kinds) else "other" if failure_kinds else "")
             if result["errors"] or code not in (0, 1):

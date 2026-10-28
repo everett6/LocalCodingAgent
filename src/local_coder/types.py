@@ -93,6 +93,8 @@ class ToolName(str, enum.Enum):
     RUN_SAST = "run_sast"
     AUDIT_DEPENDENCIES = "audit_dependencies"
     AUDIT_CONFIG = "audit_config"
+    ADVANCED_AUDIT = "advanced_audit"
+    DEPENDENCY_INTELLIGENCE = "dependency_intelligence"
     RUN_BUG_SCAN = "run_bug_scan"
     REDTEAM_WORKSPACE = "redteam_workspace"
     REDTEAM_HTTP = "redteam_http_check"
@@ -114,6 +116,8 @@ class ToolName(str, enum.Enum):
     DELEGATE_TASK = "delegate_task"
     GENERATED_TOOL = "generated_tool"
     MCP_CALL = "mcp_call"
+    WEB_SEARCH = "web_search"
+    TOOL_CATALOG = "tool_catalog"
     SKILL_LIBRARY = "skill_library"
 
 
@@ -393,6 +397,11 @@ class RoutingConfig(BaseModel):
     """
     escalate_to: str | None = None
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+    auto_enabled: bool = Field(default=True, strict=True)
+    economy_model: str | None = Field(default=None, max_length=100)
+    local_classifier: str | None = Field(default=None, max_length=100)
+    classifier_timeout_seconds: float = Field(default=2, ge=0.25, le=5, strict=True)
+    allow_cross_provider: bool = Field(default=False, strict=True)
 
 
 class ToolSettings(BaseModel):

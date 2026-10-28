@@ -137,6 +137,29 @@ def test_runtime_unavailable(tmp_path, monkeypatch):
     assert run(tmp_path)["status"] == "unavailable"
 
 
+@pytest.mark.parametrize("flag", ["O_NOFOLLOW", "O_NONBLOCK"])
+def test_missing_secure_file_primitives_fail_before_commands(tmp_path, monkeypatch, flag):
+    calls = setup_run(tmp_path, monkeypatch, None)
+    monkeypatch.delattr(regression.os, flag, raising=False)
+    result = run(tmp_path)
+    assert result["status"] == "unavailable"
+    assert "POSIX" in result["error"]
+    assert calls == []
+    assert result["snapshot_exclusions"] == []
+
+
+@pytest.mark.parametrize("flag", ["O_NOFOLLOW", "O_NONBLOCK"])
+def test_snapshot_missing_secure_file_primitives_has_no_side_effects(tmp_path, monkeypatch, flag):
+    source = tmp_path / "original"
+    source.mkdir()
+    (source / "app.py").write_text("pass")
+    target = tmp_path / "snapshot"
+    monkeypatch.delattr(regression.os, flag, raising=False)
+    with pytest.raises(ValueError, match="POSIX"):
+        regression._snapshot(source, target)
+    assert not target.exists()
+
+
 def test_report_read_is_bounded(tmp_path, monkeypatch):
     setup_run(tmp_path, monkeypatch, "x" * (regression._REPORT_LIMIT + 1))
     result = run(tmp_path)

@@ -1,6 +1,9 @@
 """Shared request admission and conservative token/cost accounting."""
 from __future__ import annotations
 import asyncio
+import copy
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 import json
 import math
 import os
@@ -10,6 +13,34 @@ import time
 import uuid
 from types import SimpleNamespace
 
+from local_coder.context.token_count import request_accounting
+from local_coder.context.telemetry import ContextTelemetry
+
+_REQUEST_TELEMETRY: ContextVar[tuple[ContextTelemetry, str, tuple[str, ...]] | None] = ContextVar('request_telemetry', default=None)
+
+
+def bind_request_telemetry(telemetry: ContextTelemetry, task_id: str, retrieval_ids=()) -> Token:
+    return _REQUEST_TELEMETRY.set((telemetry, task_id, tuple(retrieval_ids)[:16]))
+
+
+def reset_request_telemetry(token: Token) -> None:
+    _REQUEST_TELEMETRY.reset(token)
+
+
+def update_request_retrievals(retrieval_ids=()) -> None:
+    current = _REQUEST_TELEMETRY.get()
+    if current is not None:
+        _REQUEST_TELEMETRY.set((current[0], current[1], tuple(retrieval_ids)[:16]))
+
+
+@contextmanager
+def request_telemetry(telemetry: ContextTelemetry, task_id: str, retrieval_ids=()):
+    token = bind_request_telemetry(telemetry, task_id, retrieval_ids)
+    try:
+        yield
+    finally:
+        reset_request_telemetry(token)
+
 
 class BudgetExceeded(RuntimeError):
     pass
@@ -17,13 +48,14 @@ class BudgetExceeded(RuntimeError):
 
 class BudgetLedger:
     def __init__(self, *, max_requests=200, max_tokens=1_000_000, max_request_tokens=131072,
-                 max_cost_usd=None, state_path=None):
+                 max_cost_usd=None, state_path=None, token_counter=None):
         if min(max_requests,max_tokens,max_request_tokens)<=0:
             raise ValueError('Budget limits must be positive')
         if max_cost_usd is not None and (not math.isfinite(max_cost_usd) or max_cost_usd<0):
             raise ValueError('Cost limit must be finite and nonnegative')
         self.limits=dict(max_requests=max_requests,max_tokens=max_tokens,max_request_tokens=max_request_tokens,max_cost_usd=max_cost_usd)
         self.path=Path(state_path) if state_path else None
+        self.token_counter = token_counter
         self._lock=threading.RLock();self.entries=[]
         if self.path:
             self.path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -47,10 +79,9 @@ class BudgetLedger:
                     'entries':[e.copy() for e in self.entries]}
 
     def reserve(self,config,messages,max_tokens,tools=None):
-        payload=[m.model_dump(mode='json') if hasattr(m,'model_dump') else m for m in messages]
-        # UTF-8 bytes are intentionally conservative; this is not a tokenizer.
-        prompt_bound=len(json.dumps({'messages':payload,'tools':tools},ensure_ascii=False,default=str).encode())+512
-        output=max(1,int(max_tokens));tokens=prompt_bound+output
+        output=max(1,int(max_tokens))
+        accounting = request_accounting(messages, tools, output, config, self.token_counter)
+        prompt_bound=accounting['prompt_reserved'];tokens=prompt_bound+output
         input_price=getattr(config,'input_cost_per_million',None)
         output_price=getattr(config,'output_cost_per_million',None)
         request_price=getattr(config,'request_cost_usd',0)
@@ -67,7 +98,8 @@ class BudgetLedger:
                 if status['cost_usd']+cost>self.limits['max_cost_usd']+1e-12:raise BudgetExceeded('Shared cost budget exhausted')
             entry={'id':uuid.uuid4().hex,'model':str(getattr(config,'model_id','unknown'))[:256],
                    'created_at':time.time(),'status':'reserved','tokens':tokens,'prompt_bound':prompt_bound,
-                   'output_reserved':output,'cost_usd':cost,'usage':'conservative_reservation'}
+                   'output_reserved':output,'cost_usd':cost,'usage':'conservative_reservation',
+                   'accounting':accounting,'tokens_reserved':tokens}
             self.entries.append(entry);self._save();return entry['id']
 
     def settle(self,identity,response=None,error=False,config=None):
@@ -78,11 +110,22 @@ class BudgetLedger:
             prompt=getattr(response,'prompt_tokens',0);completion=getattr(response,'completion_tokens',0)
             if response is not None and type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and prompt+completion>0:
                 entry.update(tokens=prompt+completion,prompt_tokens=prompt,completion_tokens=completion,usage='provider_reported')
+                entry['provider_actual'] = {'prompt_tokens':prompt,'completion_tokens':completion,
+                                            'total_tokens':prompt+completion,'source':'provider_reported'}
                 ip=getattr(config,'input_cost_per_million',None);op=getattr(config,'output_cost_per_million',None)
                 request_price=getattr(config,'request_cost_usd',0)
                 if ip is not None and op is not None and request_price is not None:entry['cost_usd']=(prompt*ip+completion*op)/1_000_000+request_price
             # Failed/unknown requests retain the reservation; do not treat retries as free.
             self._save()
+
+    def accounting_status(self, limit=50):
+        """Bounded numeric telemetry only: no prompts, schemas, paths or model IDs."""
+        with self._lock:
+            entries = self.entries[-max(0, min(100, limit)):] if limit else []
+            return copy.deepcopy({'requests':len(self.entries), 'entries':[
+                {key:entry[key] for key in ('id','created_at','status','tokens','tokens_reserved',
+                 'prompt_bound','output_reserved','accounting','provider_actual') if key in entry}
+                for entry in entries]})
 
     def release_unattempted(self, identity):
         """Release admission rejected before invoking a backend, never HTTP failures."""
@@ -114,17 +157,48 @@ class BudgetedModel:
             if identity is not None:self.ledger.release_unattempted(identity)
             raise
         return identity
+    def _record_request(self, messages, kwargs):
+        current = _REQUEST_TELEMETRY.get()
+        if current is None:
+            return None
+        telemetry, task_id, retrieval_ids = current
+        try:
+            record = telemetry.record_request(messages, kwargs.get('tools'),
+                kwargs.get('max_tokens') or getattr(self.config, 'max_tokens', 4096),
+                task_id=task_id, retrieval_ids=retrieval_ids)
+            return telemetry, record['id']
+        except (OSError, ValueError, TypeError):
+            # Diagnostics are best effort and cannot weaken or bypass admission.
+            return None
+
+    def _record_usage(self, record, response):
+        if record is None:
+            return
+        telemetry, identity = record
+        prompt = getattr(response, 'prompt_tokens', None)
+        completion = getattr(response, 'completion_tokens', None)
+        reported = type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and (prompt + completion > 0 or getattr(response, 'usage_reported', False) is True)
+        usage = {'prompt_tokens': prompt, 'completion_tokens': completion} if reported else None
+        pricing = {key: getattr(self.config, key, None) for key in ('input_cost_per_million', 'output_cost_per_million', 'request_cost_usd')}
+        try:
+            telemetry.record_usage(identity, usage, pricing=pricing)
+        except (OSError, ValueError, TypeError):
+            pass
+
     async def generate(self,messages,**kwargs):
         identity=await self._admit(messages,kwargs)
+        diagnostic = self._record_request(messages, kwargs)
         try:
             result=await self.model.generate(messages,**kwargs)
         except BaseException:
             if identity is not None:self.ledger.settle(identity,error=True,config=self.config)
             raise
         if identity is not None:self.ledger.settle(identity,result,config=self.config)
+        self._record_usage(diagnostic, result)
         return result
     async def stream(self,messages,**kwargs):
         identity=await self._admit(messages,kwargs)
+        self._record_request(messages, kwargs)
         failed=True
         try:
             async for text in self.model.stream(messages,**kwargs):yield text

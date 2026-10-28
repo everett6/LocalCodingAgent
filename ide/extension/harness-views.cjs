@@ -76,7 +76,7 @@ function registerHarnessViews(vscode, context, getService) {
   function register(name, handler) {
     context.subscriptions.push(vscode.commands.registerCommand(name, async () => {
       try { trust(); return await handler(); }
-      catch (error) { await vscode.window.showErrorMessage(`Local Coder: ${String(error.message || error).slice(0, 400)}`); }
+      catch (error) { await vscode.window.showErrorMessage(`Clin: ${String(error.message || error).slice(0, 400)}`); }
     }));
   }
   function locations(root, raw) {

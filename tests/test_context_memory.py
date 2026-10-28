@@ -148,7 +148,7 @@ def test_redacts_metadata_keys_and_ignores_state_in_git(tmp_path):
     assert (tmp_path / ".local-coder" / ".gitignore").read_text().splitlines()[-1] == "*"
 
 
-def test_head_change_invalidates_code_but_retains_decisions(tmp_path, monkeypatch):
+def test_head_change_retains_content_verified_code_and_decisions(tmp_path, monkeypatch):
     path = tmp_path / "example.py"
     path.write_text("def parse_configuration():\n    return 1\n")
     memory = ContextMemory(tmp_path)
@@ -157,8 +157,9 @@ def test_head_change_invalidates_code_but_retains_decisions(tmp_path, monkeypatc
     memory.ingest("decision", "Configuration stays strict")
     monkeypatch.setattr(memory, "_head", lambda: "second-head")
     hits = memory.search("configuration")
-    assert hits and all(hit["kind"] == "decision" for hit in hits)
-    assert hits[0]["freshness"] == "head_changed"
+    assert {hit["kind"] for hit in hits} == {"code", "decision"}
+    assert next(hit for hit in hits if hit["kind"] == "code")["freshness"] == "fresh"
+    assert next(hit for hit in hits if hit["kind"] == "decision")["freshness"] == "head_changed"
 
 
 def test_correction_removes_old_graph_provenance(tmp_path):

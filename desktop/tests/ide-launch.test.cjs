@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const originalLoad = Module._load;
 Module._load = function(id, ...args) {
-  if (id === 'electron') return { app: { whenReady: () => new Promise(() => {}), on: () => {} } };
+  if (id === 'electron') return { app: { getPath: () => '/legacy-profile', setPath() {}, setName() {}, whenReady: () => new Promise(() => {}), on: () => {} } };
   return originalLoad.call(this, id, ...args);
 };
 const { installedIDE, spawnIDE } = require('../main.cjs');

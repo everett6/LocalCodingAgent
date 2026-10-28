@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import tempfile
+from pathlib import Path
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
@@ -11,6 +13,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from local_coder.redteam import EngagementStore, PHASES, addresses
+from local_coder.memory.context_store import _clean
 from local_coder.tools.base import Tool
 from local_coder.tools.scan_scope import scan_files
 from local_coder.tools.security import RunSASTTool
@@ -37,12 +40,9 @@ class RedTeamWorkspaceTool(EngagementTool):
     async def run(self, action, path=None):
         record = self.store.load(self.engagement_id)
         if action == 'read':
-            file = self.store.resolve_source(record, path)
-            if not file.is_file() or file.stat().st_size > 64000:
-                raise ValueError('Choose an in-scope text file smaller than 64 KB')
-            raw = file.read_bytes()
-            content = raw.decode('utf-8')
-            evidence_id = self.store.evidence(self.engagement_id, 'source_read', {'path': file.relative_to(self.store.workspace.root).as_posix(), 'sha256': hashlib.sha256(raw).hexdigest()})
+            file, raw, digest = self.store.source_bytes(record, path)
+            content = _clean(raw.decode('utf-8'))
+            evidence_id = self.store.evidence(self.engagement_id, 'source_read', {'path': file.relative_to(self.store.workspace.root).as_posix(), 'sha256': digest})
             return ToolResult(success=True, output=f'Evidence ID: {evidence_id}\nUntrusted source:\n' + '\n'.join(f'{i}: {line}' for i, line in enumerate(content.splitlines(), 1)), data={'evidence_id': evidence_id})
         if action not in {'inventory', 'scan'}:
             raise ValueError('Unknown workspace action')
@@ -59,25 +59,58 @@ class RedTeamWorkspaceTool(EngagementTool):
                 except ValueError:
                     continue
         files = sorted(files)
-        total, bounded = 0, []
+        total, bounded, source_hashes, source_contents = 0, [], {}, {}
         for file in files:
-            size = file.stat().st_size
-            if len(bounded) >= 1000 or total + size > 20_000_000:
+            if len(bounded) >= 1000 or total >= 20_000_000:
+                skipped.append('Combined engagement scan budget reached')
+                break
+            try:
+                file, raw, digest = self.store.source_bytes(record, file)
+            except (OSError, ValueError):
+                skipped.append('Unreadable, linked, nonregular or over-64KB source skipped')
+                continue
+            if total + len(raw) > 20_000_000:
                 skipped.append('Combined engagement scan budget reached')
                 break
             bounded.append(file)
-            total += size
+            relative = file.relative_to(root).as_posix()
+            source_hashes[relative], source_contents[relative] = digest, raw
+            total += len(raw)
         files = bounded
         coverage = {'files_considered': len(files), 'bytes': total, 'skipped': skipped, 'status': 'partial' if skipped else 'complete', 'exclusions_applied': record['scope']['excluded_paths']}
         findings = []
         if action == 'scan':
-            scanner = RunSASTTool(str(root))
-            findings = await asyncio.to_thread(scanner._run_builtin_sast, root, files, coverage)
+            # Scan private snapshots of the bytes safely read above. Reopening
+            # live paths inside a scanner would reintroduce symlink/FIFO races.
+            with tempfile.TemporaryDirectory(prefix='local-coder-static-') as temporary:
+                staging = Path(temporary)
+                staged = []
+                for relative, raw in source_contents.items():
+                    target = staging / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(raw)
+                    staged.append(target)
+                scanner = RunSASTTool(str(staging))
+                findings = await asyncio.to_thread(scanner._run_builtin_sast, staging, staged, coverage)
             findings = [dict(item, file=item['file'].replace('\\', '/'), confidence='heuristic', verification='unverified') for item in findings]
+        changed = []
+        for relative, digest in source_hashes.items():
+            try:
+                if self.store.source_hash(record, relative) != digest:
+                    changed.append(relative)
+            except (OSError, ValueError):
+                changed.append(relative)
+        coverage['changed_sources'] = changed
+        if changed:
+            coverage['skipped'].append('Source changed during observation; re-scan affected files')
         coverage['status'] = 'partial' if coverage['skipped'] else 'complete'
-        result = {'files': [file.relative_to(root).as_posix() for file in files], 'findings': findings[:200], 'coverage': coverage}
+        result = {'files': [file.relative_to(root).as_posix() for file in files], 'source_hashes': source_hashes,
+                  'scan_targets': [self.store.resolve_source(record, target).relative_to(root).as_posix() for target in targets],
+                  'findings': _clean(findings[:200]), 'coverage': coverage}
         evidence_id = self.store.evidence(self.engagement_id, 'static_scan' if action == 'scan' else 'inventory', result)
-        return ToolResult(success=True, output=json.dumps({**result, 'evidence_id': evidence_id}, ensure_ascii=False), data={**result, 'evidence_id': evidence_id})
+        # Keep the stable recovery handle at the head of bounded prompt output;
+        # large scanner metadata can otherwise crowd its trailing ID out.
+        return ToolResult(success=True, output=json.dumps({'evidence_id': evidence_id, **result}, ensure_ascii=False), data={**result, 'evidence_id': evidence_id})
 
 
 class RedTeamHTTPTool(EngagementTool):
@@ -182,8 +215,10 @@ class RedTeamWorkflowTool(EngagementTool):
             if phase or steps is not None:
                 self.store.append(record, 'workflow_updated', {'phase': record['phase'], 'steps': record['steps']})
             return record
-        result = self.store.update(self.engagement_id, mutate)
-        return ToolResult(success=True, output=json.dumps(result), data={'phase': result['phase'], 'steps': result['steps']})
+        if phase or steps is not None:
+            self.store.update(self.engagement_id, mutate)
+        result = self.store.investigation_snapshot(self.engagement_id)
+        return ToolResult(success=True, output=json.dumps(result), data=result)
 
 
 class RedTeamImportTool(EngagementTool):
@@ -193,10 +228,8 @@ class RedTeamImportTool(EngagementTool):
 
     async def run(self, path, format):
         record = self.store.load(self.engagement_id)
-        file = self.store.resolve_source(record, path)
-        if not file.is_file() or file.stat().st_size > 1_000_000:
-            raise ValueError('Import requires a scoped file smaller than 1 MB')
-        content = file.read_text(encoding='utf-8')
+        file, raw, import_digest = self.store.source_bytes(record, path, max_bytes=1_000_000)
+        content = raw.decode('utf-8')
         candidates = []
         if format in {'har','burp_xml'}:
             from local_coder.proxy_history import proxy_observations
@@ -204,7 +237,7 @@ class RedTeamImportTool(EngagementTool):
             for observation in observations:
                 self.store.check_url(record, observation['url'])
             evidence = self.store.evidence(self.engagement_id, 'proxy_history', {'file':path,'format':format,
-                'sha256':hashlib.sha256(content.encode()).hexdigest(),'observations':observations,
+                'sha256':import_digest,'observations':observations,
                 'credentials_and_bodies_retained':False})
             result = {'imported':len(observations),'evidence_id':evidence,'observations':observations}
             return ToolResult(success=True,output=json.dumps(result),data=result)
@@ -236,8 +269,18 @@ class RedTeamImportTool(EngagementTool):
             raise ValueError('Unsupported scanner format')
         if len(candidates) > 100:
             raise ValueError('Import is limited to 100 candidate locations; narrow the scanner report')
+        assets = sorted({candidate['asset'] for candidate in candidates})
+        source_hashes = {}
+        for asset in assets:
+            if '://' not in asset:
+                relative = self.store.resolve_source(record, asset).relative_to(self.store.workspace.root).as_posix()
+                try:
+                    source_hashes[relative] = self.store.source_hash(record, relative)
+                except (OSError, ValueError):
+                    pass  # Legacy/imported unknown provenance is never called current.
         def save(loaded):
-            evidence = self.store.append(loaded, 'scanner_import', {'file': path, 'format': format, 'sha256': hashlib.sha256(file.read_bytes()).hexdigest(), 'candidate_count': len(candidates)})
+            evidence = self.store.append(loaded, 'scanner_import', {'file': path, 'format': format, 'sha256': import_digest,
+                'candidate_count': len(candidates), 'assets': assets, 'source_hashes': source_hashes})
             for candidate in candidates:
                 finding = {**candidate, 'evidence_ids': [evidence], 'verification': 'unverified', 'severity': 'info', 'detection_outcome': 'not_tested'}
                 identity = 'finding-' + hashlib.sha256((finding['asset'] + '\n' + finding['title'].strip().casefold()).encode()).hexdigest()[:16]
@@ -265,4 +308,4 @@ def bind_engagement(registry, project_root, engagement_id):
     for cls in generated:
         registry.register(cls(project_root, safety_harness=getattr(registry, "safety_harness", None),
                               approval_callback=getattr(registry, "approval_callback", None), engagement_id=engagement_id))
-    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY}
+    registry._permissions[AgentRole.RED_TEAM] = {cls.name for cls in classes + generated} | {ToolName.TOOL_CATALOG, ToolName.SECURITY_PLAYBOOK, ToolName.RECOVER_CONTEXT, ToolName.MEMORY_TASK_STATE, ToolName.SKILL_LIBRARY, ToolName.WEB_SEARCH}

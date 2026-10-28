@@ -38,6 +38,6 @@ class LanguageContextTool(Tool):
         start = time.monotonic()
         try:
             context = await self.service.context(path, line, character, query, char_budget)
-            return ToolResult(success=True, output=context["text"], duration_ms=int((time.monotonic() - start) * 1000))
+            return ToolResult(success=True, output=context["text"], data=context, duration_ms=int((time.monotonic() - start) * 1000))
         except (ValueError, OSError, UnicodeError) as exc:
             return ToolResult(success=False, output=f"Language context unavailable: {exc}", duration_ms=int((time.monotonic() - start) * 1000))

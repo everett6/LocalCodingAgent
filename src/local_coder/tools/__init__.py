@@ -50,6 +50,7 @@ def create_tool_registry(
     from local_coder.core.snapshots import FileSnapshots
     from local_coder.integrations.mcp import MCPManager
     from local_coder.tools.mcp import MCPTool
+    from local_coder.tools.web_search import WebSearchTool
     from local_coder.skills import SkillLibrary, SkillLibraryTool
     from local_coder.types import AgentRole, ToolName
     registry.context_memory = ContextMemory(project_root)
@@ -73,7 +74,7 @@ def create_tool_registry(
     for cls in (GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool):
         registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
     for tool in (MemorySearchTool(registry.context_memory), MemoryWriteTool(registry.context_memory), TaskMemoryTool(registry.context_memory),
-                 LanguageContextTool(registry.language_service), MCPTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
+                 LanguageContextTool(registry.language_service), MCPTool(registry.mcp), WebSearchTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
                  HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision,
                                    improvement_evaluator=improvement_evaluator),
                  DelegateTaskTool(), GeneratedToolTool(registry.evolution, runner=registry.sandbox.run)):
@@ -89,7 +90,9 @@ def create_tool_registry(
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
     from local_coder.tools.context_archive import RecoverContextTool
+    from local_coder.tools.tool_catalog import ToolCatalogTool
     registry.register(RecoverContextTool(registry))
+    registry.register(ToolCatalogTool(registry))
     for allowed in registry._permissions.values():
         allowed.add(RecoverContextTool.name)
 
@@ -122,6 +125,12 @@ def create_tool_registry(
     registry.register(BuildTool(project_root))
 
     # Security & Audit tools
+    from local_coder.tools.advanced_audit import AdvancedAuditTool
+    from local_coder.tools.dependency_intelligence import DependencyIntelligenceTool
+    registry.register(AdvancedAuditTool(project_root))
+    registry.register(DependencyIntelligenceTool(project_root))
+    for role in (AgentRole.SECURITY, AgentRole.BUG_HUNTER, AgentRole.REVIEWER, AgentRole.EXPLORER):
+        registry._permissions[role].update({ToolName.ADVANCED_AUDIT, ToolName.DEPENDENCY_INTELLIGENCE})
     registry.register(RunSASTTool(project_root))
     registry.register(AuditDependenciesTool(project_root))
     registry.register(AuditConfigTool(project_root))

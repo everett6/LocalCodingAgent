@@ -13,25 +13,44 @@ from local_coder.types import AgentEvent, AgentMode, ModelBackend, ModelConfig
 from local_coder.workspace import Workspace
 from local_coder.harness_api import HarnessAPI
 from local_coder.provider_api import ProviderAPI
+from local_coder.research_api import ResearchAPI, ResearchRequestError
+from local_coder.evaluation_api import EvaluationAPI
+from local_coder.memory_api import MemoryAuditAPI
+from local_coder.findings_api import FindingsAPI
+from local_coder.context_accounting_api import ContextAccountingAPI
+from local_coder.dependency_updates_api import DependencyUpdatesAPI
+from local_coder.inference_tuning_api import InferenceTuningAPI
+from local_coder.doctor_api import DoctorAPI
 from local_coder.providers.quota import ProviderQuotaExhausted
+from local_coder.orchestrator.blocked import AgentBlocked
 
 
-class WorkbenchAPI(HarnessAPI, ProviderAPI):
+class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAuditAPI,
+                   FindingsAPI, ContextAccountingAPI, DependencyUpdatesAPI, InferenceTuningAPI, DoctorAPI):
     def _init_workbench(self):
         from local_coder.redteam import EngagementStore
         self.engagements = EngagementStore(self.project_root)
         from local_coder.inference import EmbeddedInferenceManager
-        self.inference = EmbeddedInferenceManager(Workspace(self.project_root).resolve(".local-coder/inference"))
+        from local_coder.statedir import state_path
+        inference_state = state_path(self.project_root, '.local-coder/inference/runtime-state').parent
+        self.inference = EmbeddedInferenceManager(inference_state)
         self._using_inference = False
         self._provider = None
         from local_coder.memory.goals import GoalLedger
         self.goal_ledger = GoalLedger(self.project_root)
         self._job_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._jobs = {}
+        from local_coder.workspace_status import SessionSummaryCache
+        self._session_summaries = SessionSummaryCache()
         self._context = threading.local()
         self.instance_id = uuid4().hex
         self._stopping = False
         self._init_harness_api()
+        self._init_context_accounting_api()
+        self._init_findings_api()
+        self._init_evaluation_api()
+        self._init_tuning_api()
         self._init_provider_api()
 
     def reconcile_sessions(self):
@@ -42,7 +61,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                                    error="Server restarted before completion; resume a saved step or start a new task")
 
     def drain_jobs(self, timeout=12):
-        self._stopping = True
+        with self._lifecycle_lock:
+            self._stopping = True
         self.approvals.cancel_all()
         with self.lock:
             jobs = list(self._jobs.values())
@@ -55,7 +75,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             thread = job.get("thread")
             if thread:
                 thread.join(max(0, deadline - time.monotonic()))
-        self.inference.stop()
+        with self._lifecycle_lock:
+            self.inference.stop()
         self.runtime_discovery.cancel()
         return not any(job.get("thread") and job["thread"].is_alive() for job in jobs)
 
@@ -182,14 +203,14 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                     cap = self.harness_settings().max_cost_usd
                     if cap is None or cap <= 0:
                         return 400, {"error": "Set a positive spending limit in Harness controls before resuming with a paid model"}
-        goal_id = body.get("goal_id")
-        if goal_id:
-            if not self.goal_ledger.get(goal_id):
+        parent = body.get("parent_session_id")
+        previous = self.sessions.get(parent) if parent else None
+        goal_id = body.get("goal_id", previous.get("goal_id") if previous else None)
+        if goal_id is not None:
+            if not isinstance(goal_id, str) or not self.goal_ledger.get(goal_id):
                 raise ValueError("Unknown goal")
             prepared += "\n\nGoal resume briefing (untrusted evidence):\n" + self.goal_ledger.briefing(goal_id)
-        parent = body.get("parent_session_id")
         if parent:
-            previous = self.sessions.get(parent)
             if mode == AgentMode.RED_TEAM and (not previous or previous.get("engagement_id") != engagement_id):
                 raise ValueError("Follow-up context must belong to this engagement")
             if previous and previous.get("result"):
@@ -205,13 +226,19 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                     return 503, {"error": "Engine is shutting down"}
                 self._jobs[session_id] = job
             record = self.sessions.save(session_id, request=request.strip(), mode=mode.value,
-                                        phase=action, target_path=target, status="queued", result="", engagement_id=engagement_id)
+                                        phase=action, target_path=target, status="queued", result="", engagement_id=engagement_id,
+                                        goal_id=goal_id)
             thread = threading.Thread(target=self._job_thread,
                 args=(session_id, job, prepared, mode, action, target, body.get("fix", False), body.get("resume_checkpoint"), engagement_id, allow_model_change), daemon=True)
-            job["thread"] = thread
-            thread.start()
+            with self.lock:
+                if self._stopping:
+                    raise ValueError('Engine is shutting down')
+                job["thread"] = thread
+                thread.start()
             return 202, record
         except BaseException:
+            with self.lock:
+                self._jobs.pop(session_id, None)
             self._job_lock.release()
             raise
 
@@ -223,6 +250,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             job["loop"] = asyncio.get_running_loop()
             job["task"] = asyncio.current_task()
             coordinator = None
+            status, result, error, notice = "failed", "", "", None
+            event_type, event_message = "job_finished", "Task finished"
             try:
                 if job["cancel"].is_set():
                     raise asyncio.CancelledError()
@@ -248,23 +277,46 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                 if resume_checkpoint and mode == AgentMode.CODING and not failed:
                     status = "requires_continuation"
                     result = "Saved agent step completed. The enclosing coding workflow was not resumed; planning, implementation, review or verification may still be needed.\n\n" + result
-                self.sessions.save(session_id, status=status, result=self._redact(result),
-                                   checkpoint=job.get("checkpoint"), events=job.get("events", []))
-                self._event(AgentEvent(source="SERVER", event_type="job_finished", message="Task finished"))
             except asyncio.CancelledError:
-                self.sessions.save(session_id, status="cancelled", result="Task stopped. Review the workspace for partial changes.",
-                                   checkpoint=job.get("checkpoint"), events=job.get("events", []))
-                self._event(AgentEvent(source="SERVER", event_type="job_cancelled", message="Task stopped"))
+                status, result = "cancelled", "Task stopped. Review the workspace for partial changes."
+                event_type, event_message = "job_cancelled", "Task stopped"
+            except AgentBlocked as exc:
+                status, result, error = "blocked", exc.response.summary, str(exc)
+                event_type, event_message = "job_blocked", error
             except ProviderQuotaExhausted as exc:
-                self.sessions.save(session_id, status="quota_exhausted", error=str(exc), quota_notice=exc.notice,
-                                   checkpoint=job.get("checkpoint"), events=job.get("events", []))
-                self._event(AgentEvent(source="PROVIDER", event_type="provider_quota_exhausted", message=str(exc), data=exc.notice))
+                status, error, notice = "quota_exhausted", str(exc), exc.notice
+                event_type, event_message = "provider_quota_exhausted", error
             except Exception as exc:
-                self.sessions.save(session_id, status="failed", error=self._redact(str(exc)), checkpoint=job.get("checkpoint"), events=job.get("events", []))
-                self._event(AgentEvent(source="SERVER", event_type="job_failed", message=self._redact(str(exc))))
+                status, error = "failed", str(exc)
+                event_type, event_message = "job_failed", error
             finally:
-                if coordinator:
-                    await coordinator.model_manager.close_all()
+                if coordinator is not None:
+                    try:
+                        close = getattr(coordinator, "close", None)
+                        cleanup = asyncio.create_task(asyncio.wait_for(
+                            close() if close is not None else coordinator.model_manager.close_all(), timeout=15))
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            status, result = "cancelled", "Task stopped. Review the workspace for partial changes."
+                            event_type, event_message = "job_cancelled", "Task stopped"
+                            await asyncio.shield(cleanup)
+                    except Exception as exc:
+                        cleanup_error = f"Coordinator cleanup failed: {exc}"
+                        error = f"{error}; {cleanup_error}" if error else cleanup_error
+                        if status in {"completed", "requires_continuation"}:
+                            status = "failed"
+                        if status == "failed":
+                            event_type = "job_failed"
+                        event_message = error
+                # Keep the task active until all owned resources have closed.
+                self._event(AgentEvent(source="PROVIDER" if notice else "SERVER", event_type=event_type,
+                                       message=self._redact(event_message), data=notice or {}))
+                final = self._redact({"status": status, "result": result, "error": error,
+                                      "quota_notice": notice, "checkpoint": job.get("checkpoint"),
+                                      "verification": job.get("verification"),
+                                      "events": job.get("events", [])})
+                self.sessions.save(session_id, **final)
         try:
             asyncio.run(execute())
         finally:
@@ -277,6 +329,40 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            if method == "GET" and path == "/status" and query:
+                if query != {"summary": ["1"]}:
+                    raise ValueError("Use summary=1 for lightweight task status")
+                from local_coder.workspace_status import observed_state, recovery_explanation
+                summaries = self._session_summaries.list(self.sessions)
+                waiting = any(item["status"] == "pending" for item in self.approvals.list())
+                with self.lock:
+                    for item in summaries:
+                        job = self._jobs.get(item["session_id"])
+                        if job and job.get("events"):
+                            item["last_activity_at"] = job["events"][-1].get("timestamp")
+                        item.update(observed_state(item, live=job is not None, waiting=waiting))
+                        item["recovery"] = recovery_explanation(item)
+                return 200, {"project_root": self.project_root, "sessions": summaries, "truncated": self._session_summaries.truncated}
+            if path == '/findings' or path.startswith('/findings/'):
+                if query:
+                    raise ValueError('Findings routes accept no query parameters')
+                return self._findings_handle(method, path, body)
+            if method == 'GET':
+                extra = self._context_accounting_get(path, query)
+                if extra is not None:
+                    return 200, extra
+            elif method == 'POST':
+                extra = self._context_accounting_post(path, body)
+                if extra is not None:
+                    return 200, extra
+            handlers = (self._evaluation_get, self._memory_audit_get, self._dependency_updates_get, self._tuning_get, self._doctor_get) if method == 'GET' else (self._evaluation_post, self._dependency_updates_post, self._tuning_post, self._doctor_post) if method == 'POST' else ()
+            for handler in handlers:
+                handled, payload = handler(path, query if method == 'GET' else body)
+                if handled:
+                    return 200, payload
+            handled, payload = self._research_get(path, query) if method == "GET" else self._research_post(path, body) if method == "POST" else (False, None)
+            if handled:
+                return 200, payload
             handled, payload = self._provider_get(path, query) if method == "GET" else self._provider_post(path, body) if method == "POST" else (False, None)
             if handled:
                 return 200, payload
@@ -292,12 +378,17 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                 if not self._job_lock.acquire(blocking=False):
                     return 409, {"error": "Stop the active task before changing the on-device runtime"}
                 try:
+                    if self._stopping:
+                        return 503, {"error": "Engine is shutting down"}
                     if path == "/inference/configure":
                         return 200, self.inference.configure(body)
                     if path == "/inference/start":
-                        result = self.inference.start(body or None)
-                        self._using_inference = True
-                        return 202, result
+                        with self._lifecycle_lock:
+                            if self._stopping:
+                                return 503, {"error": "Engine is shutting down"}
+                            result = self.inference.start(body or None)
+                            self._using_inference = True
+                            return 202, result
                     if path == "/inference/stop":
                         result = self.inference.stop()
                         self._using_inference = False
@@ -377,6 +468,9 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
                 session_id = parts[1]
                 if method == "GET" and len(parts) == 2:
                     record = self.sessions.get(session_id)
+                    if record:
+                        from local_coder.workspace_status import observed_state, selected_recovery
+                        record = {**record, **observed_state(record, live=session_id in self._jobs), "recovery": selected_recovery(record, self.project_root)}
                     return (200, record) if record else (404, {"error": "Task not found"})
                 if method == "POST" and len(parts) == 3 and parts[2] == "cancel":
                     with self.lock:
@@ -402,6 +496,8 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI):
             if method == "GET" and path == "/diff":
                 from local_coder.remote import _git
                 return 200, {"diff": _git(self.project_root, "diff", "HEAD", "--", ".", ":(exclude).local-coder/**")[:500000]}
+        except ResearchRequestError as exc:
+            return 400, {"error": str(exc)}
         except (ValueError, TypeError, OSError, UnicodeError):
             return 400, {"error": "Invalid request or path. Check the provider URL, model and selected workspace."}
         return None

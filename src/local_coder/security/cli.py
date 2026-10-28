@@ -66,11 +66,14 @@ def prepare(ctx, identity):
 @click.option("--image", required=True, help="Already-installed trusted image containing Python, pytest and project dependencies")
 @click.option("--backend", type=click.Choice(["docker", "podman"]), default="docker")
 @click.option("--timeout", "timeout_seconds", type=click.IntRange(1, 600), default=60)
+@click.option("--negative-control", "negative_control_ids", multiple=True, required=True,
+              help="Exact pytest node ID of a safe control in the same regression file (repeatable)")
 @click.pass_context
 def verify(ctx, identity, **options):
     """Run one regression in an isolated container and record host-derived evidence."""
     try:
-        result = asyncio.run(EvidenceStore(ctx.obj["project_root"]).verify(identity, **options))
+        options["negative_control_ids"] = list(options["negative_control_ids"])
+        result = asyncio.run(EvidenceStore(ctx.obj["project_root"]).verify_controlled(identity, **options))
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     emit(result)
@@ -108,3 +111,14 @@ def metrics(dataset):
         emit(evaluate_findings(data["predicted_ids"], data["expected_ids"]))
     except (ValueError, KeyError, TypeError) as exc:
         raise click.ClickException("Dataset requires predicted_ids and expected_ids string lists") from exc
+
+
+@security_findings.command(name="export")
+@click.argument("identity")
+@click.pass_context
+def export_package(ctx, identity):
+    """Export revision-bound evidence with explicit missing-control disposition."""
+    try:
+        emit(EvidenceStore(ctx.obj["project_root"]).export_package(identity))
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc

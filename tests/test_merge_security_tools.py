@@ -77,23 +77,30 @@ def test_cancelled_structured_test_runner_cleans_process_tree(tmp_path, monkeypa
     process = AsyncMock()
     process.pid = 1234
     entered = asyncio.Event()
+    reaped = asyncio.Event()
 
-    async def blocked_output():
+    async def blocked_output(size):
+        assert size == 8192
         entered.set()
-        await asyncio.Event().wait()
+        await reaped.wait()
+        return b""
 
-    process.communicate.side_effect = blocked_output
+    process.stdin = None
+    process.stderr = None
+    process.stdout = SimpleNamespace(read=AsyncMock(side_effect=blocked_output))
     spawn = AsyncMock(return_value=process)
-    cleanup = AsyncMock()
+    cleanup = AsyncMock(side_effect=lambda proc: reaped.set())
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr("local_coder.processes.terminate_tree", cleanup)
 
     async def scenario():
         task = asyncio.create_task(test_runner.run_tests(tmp_path, framework="pytest"))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(scenario())
     cleanup.assert_awaited_once_with(process)
+    process.stdout.read.assert_awaited_once_with(8192)
+    process.communicate.assert_not_awaited()

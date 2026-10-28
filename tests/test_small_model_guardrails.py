@@ -176,7 +176,10 @@ class CoderLoop(BaseAgent):
 
 def _run(tmp_path: Path, responses):
     model = ScriptedModel(responses)
-    agent = CoderLoop(model, create_tool_registry(str(tmp_path)))
+    registry = create_tool_registry(str(tmp_path))
+    # Exercise edit guards independently from bounded schema discovery.
+    registry.profile_overrides = {'tool_allowlist': ['read_file', 'write_file']}
+    agent = CoderLoop(model, registry)
     response = asyncio.run(agent.execute(AgentTask(role=AgentRole.CODER, objective="work")))
     tool_messages = [m for messages in model.calls for m in messages if m.role == "tool"]
     # Each model call re-sends history; keep the unique tool results in order.
