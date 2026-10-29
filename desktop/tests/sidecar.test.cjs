@@ -16,6 +16,34 @@ test('startup timeout kills a stuck sidecar', async () => {
   const sidecar = new Sidecar({ command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], timeout: 50 });
   await assert.rejects(sidecar.start(), /timed out/); await sidecar.stop(); assert.equal(sidecar.child, null);
 });
+test('startup parsing stops after readiness and later stdout cannot retarget or stop the engine', async () => {
+  const script = `console.log('{"port":12345}');
+    setTimeout(() => { console.log('{"port":54321}'); process.stdout.write('x'.repeat(100000)); }, 30);
+    setInterval(() => {}, 1000);`;
+  const sidecar = new Sidecar({command: process.execPath, args: ['-e', script], timeout: 2000});
+  try {
+    assert.equal(await sidecar.start(), 'http://127.0.0.1:12345');
+    const child = sidecar.child;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(sidecar.origin, 'http://127.0.0.1:12345');
+    assert.equal(sidecar.child, child);
+    assert.equal(child.exitCode, null);
+    assert.equal(child.stdout.listenerCount('data'), 0);
+  } finally { await sidecar.stop(); }
+});
+test('startup errors classify a missing dependency without returning stderr secrets', async () => {
+  const secret = 'private-fixture-api-token';
+  const sidecar = new Sidecar({command: process.execPath,
+    args: ['-e', `console.error("ModuleNotFoundError: ${secret}"); process.exit(1)`], timeout: 2000});
+  try {
+    await assert.rejects(sidecar.start(), error => {
+      assert.equal(error.code, 'engine_dependency_missing');
+      assert.equal(error.retryable, false);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      return true;
+    });
+  } finally { await sidecar.stop(); }
+});
 test('bridge only permits known relative API operations', () => {
   assert.ok(isAllowedApiRequest('/settings', 'POST'));
   assert.ok(isAllowedApiRequest('/engagements', 'POST'));
