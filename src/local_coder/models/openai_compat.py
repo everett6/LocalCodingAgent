@@ -1,7 +1,6 @@
 """OpenAI-compatible backend implementation."""
 from __future__ import annotations
 import asyncio
-import json
 import time
 from typing import AsyncIterator
 
@@ -9,6 +8,10 @@ import httpx
 
 from local_coder.types import MAX_REPORTED_TOKENS, Message, ModelResponse, ModelConfig, ToolCall
 from local_coder.models.base import BaseModelBackend, decode_tool_arguments
+from local_coder.providers.http_response import (
+    IDENTITY_HEADERS, MAX_ERROR_BYTES, MAX_METADATA_BYTES, bounded_body,
+    bounded_json, json_object, sse_data,
+)
 
 
 class OpenAICompatibleBackend(BaseModelBackend):
@@ -48,15 +51,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def _observe_response_quota(self, response):
         if self.quota_guard is None or response.status_code != 429:
             return
-        if response.is_stream_consumed:
-            body = response.content[:128000]
-        else:
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                if len(body) + len(chunk) > 128000:
-                    return
-                body.extend(chunk)
-            body = bytes(body)
+        body = await bounded_body(response, MAX_ERROR_BYTES)
         await self._observe_quota(response.status_code, body, response.headers)
 
     async def _observe_embedded_quota(self, data, headers=None):
@@ -116,10 +111,11 @@ class OpenAICompatibleBackend(BaseModelBackend):
             if payload["stream"]:
                 data = await self._collect_stream(payload)
             else:
-                response = await self.client.post("/chat/completions", json=payload)
-                await self._observe_response_quota(response)
-                response.raise_for_status()
-                data = response.json()
+                async with self.client.stream("POST", "/chat/completions", json=payload,
+                                               headers=IDENTITY_HEADERS) as response:
+                    await self._observe_response_quota(response)
+                    response.raise_for_status()
+                    data = await bounded_json(response)
         except httpx.HTTPError as e:
             raise RuntimeError(f"Provider request failed (HTTP {e.response.status_code})" if isinstance(e, httpx.HTTPStatusError) else "Provider connection failed") from None
 
@@ -181,16 +177,14 @@ class OpenAICompatibleBackend(BaseModelBackend):
         """Assemble indexed tool deltas before any tool may execute."""
         content, reasoning, calls, usage, details = [], [], {}, {}, []
         finish, model = None, self.config.model_id
-        async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+        async with self.client.stream("POST", "/chat/completions", json=payload,
+                                      headers=IDENTITY_HEADERS) as response:
             await self._observe_response_quota(response)
             response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].lstrip(" ")
+            async for raw in sse_data(response):
                 if raw.strip() == "[DONE]":
                     break
-                data = json.loads(raw)
+                data = json_object(raw)
                 if data.get("error"):
                     await self._observe_embedded_quota(data, response.headers)
                     raise RuntimeError("Provider stream failed; check model access and quota")
@@ -203,16 +197,19 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
                     details.extend(delta.get("reasoning_details") or [])
                     for call in delta.get("tool_calls") or []:
-                        assembled = calls.setdefault(call["index"], {"id": "", "function": {"name": "", "arguments": ""}})
-                        assembled["id"] += call.get("id") or ""
+                        assembled = calls.setdefault(call["index"], {"id": [], "function": {"name": [], "arguments": []}})
+                        assembled["id"].append(call.get("id") or "")
                         for key in ("name", "arguments"):
-                            assembled["function"][key] += call.get("function", {}).get(key) or ""
+                            assembled["function"][key].append(call.get("function", {}).get(key) or "")
         if finish is None:
             # EOF (or a bare [DONE]) does not establish that all tool deltas
             # arrived. Never execute a syntactically valid but partial call.
             raise RuntimeError("Provider returned an incomplete completion stream")
+        assembled_calls = [{"id": "".join(calls[index]["id"]), "function": {
+            key: "".join(fragments) for key, fragments in calls[index]["function"].items()}}
+            for index in sorted(calls)]
         return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning) or None,
-                                          "tool_calls": [calls[i] for i in sorted(calls)], "reasoning_details": details or None}, "finish_reason": finish}],
+                                          "tool_calls": assembled_calls, "reasoning_details": details or None}, "finish_reason": finish}],
                 "usage": usage, "model": model}
 
     async def stream(
@@ -236,35 +233,29 @@ class OpenAICompatibleBackend(BaseModelBackend):
         self._profile_payload(payload)
         completed = False
         try:
-            async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+            async with self.client.stream("POST", "/chat/completions", json=payload,
+                                          headers=IDENTITY_HEADERS) as response:
                 await self._observe_response_quota(response)
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    
-                    data_str = line[5:].lstrip(" ")
+                async for data_str in sse_data(response):
                     if data_str.strip() == "[DONE]":
                         completed = True
                         break
                         
-                    try:
-                        data = json.loads(data_str)
-                        if data.get('error'):
-                            await self._observe_embedded_quota(data, response.headers)
-                            raise RuntimeError('Provider stream failed; check model access and quota')
-                        choices = self._single_choice(data)
-                        if choices:
-                            finish_reason = choices[0].get("finish_reason")
-                            if finish_reason in {"length", "max_tokens", "content_filter"}:
-                                raise RuntimeError("Provider stream output was truncated or filtered")
-                            if finish_reason:
-                                completed = True
-                            delta = choices[0].get("delta", {})
-                            if "content" in delta and delta["content"]:
-                                yield delta["content"]
-                    except json.JSONDecodeError:
-                        raise RuntimeError("Provider returned an invalid stream event") from None
+                    data = json_object(data_str)
+                    if data.get('error'):
+                        await self._observe_embedded_quota(data, response.headers)
+                        raise RuntimeError('Provider stream failed; check model access and quota')
+                    choices = self._single_choice(data)
+                    if choices:
+                        finish_reason = choices[0].get("finish_reason")
+                        if finish_reason in {"length", "max_tokens", "content_filter"}:
+                            raise RuntimeError("Provider stream output was truncated or filtered")
+                        if finish_reason:
+                            completed = True
+                        delta = choices[0].get("delta", {})
+                        if "content" in delta and delta["content"]:
+                            yield delta["content"]
         except httpx.HTTPError as e:
             raise RuntimeError("Provider stream failed; check endpoint, model access and quota") from None
         if not completed:
@@ -273,26 +264,28 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def is_available(self) -> bool:
         """Check if the server is reachable and model exists."""
         try:
-            response = await self.client.get("/models", timeout=5.0)
-            if response.status_code == 200:
-                return True
-            return False
+            async with self.client.stream("GET", "/models", timeout=5.0,
+                                          headers=IDENTITY_HEADERS) as response:
+                return response.status_code == 200
         except httpx.HTTPError:
             return False
 
     async def get_model_info(self) -> dict:
         """Get model details from /v1/models."""
         try:
-            response = await self.client.get(f"/models/{self.config.model_id}", timeout=5.0)
-            if response.status_code == 200:
-                data = response.json()
-                info = await super().get_model_info()
-                info.update({
-                    "owner": data.get("owned_by"),
-                    "created": data.get("created"),
-                })
-                return info
-        except httpx.HTTPError:
+            async with self.client.stream("GET", f"/models/{self.config.model_id}", timeout=5.0,
+                                          headers=IDENTITY_HEADERS) as response:
+                if response.status_code == 200:
+                    data = await bounded_json(response, MAX_METADATA_BYTES)
+                    info = await super().get_model_info()
+                    info.update({
+                        "owner": data.get("owned_by"),
+                        "created": data.get("created"),
+                    })
+                    return info
+        except (httpx.HTTPError, RuntimeError):
+            # Optional metadata must not prevent a configured model from
+            # running when a server returns an oversized or unsupported body.
             pass
             
         return await super().get_model_info()
@@ -319,13 +312,14 @@ class OpenAICompatibleBackend(BaseModelBackend):
         prefill, and its absence must never break a run.
         """
         try:
-            response = await self.client.post(
+            async with self.client.stream("POST",
                 f"{self._server_root_url()}/slots/{slot_id}",
                 params={"action": "save"},
                 json={"filename": filename},
                 timeout=120.0,
-            )
-            return response.status_code == 200
+                headers=IDENTITY_HEADERS,
+            ) as response:
+                return response.status_code == 200
         except httpx.HTTPError:
             return False
 
@@ -336,12 +330,13 @@ class OpenAICompatibleBackend(BaseModelBackend):
         longest-common-prefix prompt-cache matching, enabled by default).
         Best-effort, see save_slot()."""
         try:
-            response = await self.client.post(
+            async with self.client.stream("POST",
                 f"{self._server_root_url()}/slots/{slot_id}",
                 params={"action": "restore"},
                 json={"filename": filename},
                 timeout=120.0,
-            )
-            return response.status_code == 200
+                headers=IDENTITY_HEADERS,
+            ) as response:
+                return response.status_code == 200
         except httpx.HTTPError:
             return False

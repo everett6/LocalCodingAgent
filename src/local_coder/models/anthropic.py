@@ -1,13 +1,13 @@
 """Anthropic Messages API adapter using the existing httpx dependency."""
 from __future__ import annotations
 
-import json
 import time
 from typing import AsyncIterator
 
 import httpx
 
 from local_coder.models.base import BaseModelBackend
+from local_coder.providers.http_response import IDENTITY_HEADERS, bounded_json, json_object, sse_data
 from local_coder.types import MAX_REPORTED_TOKENS, Message, ModelConfig, ModelResponse, ToolCall
 
 
@@ -62,9 +62,10 @@ class AnthropicBackend(BaseModelBackend):
                        tools=None, stop=None) -> ModelResponse:
         start = time.monotonic()
         try:
-            response = await self.client.post("/messages", json=self._payload(messages, temperature, max_tokens, tools, stop))
-            response.raise_for_status()
-            data = response.json()
+            async with self.client.stream("POST", "/messages", headers=IDENTITY_HEADERS,
+                                          json=self._payload(messages, temperature, max_tokens, tools, stop)) as response:
+                response.raise_for_status()
+                data = await bounded_json(response)
         except httpx.HTTPStatusError as exc:
             raise RuntimeError(f"Anthropic request failed (HTTP {exc.response.status_code}); check key, model and quota") from None
         except httpx.HTTPError:
@@ -104,15 +105,10 @@ class AnthropicBackend(BaseModelBackend):
         payload["stream"] = True
         completed = False
         try:
-            async with self.client.stream("POST", "/messages", json=payload) as response:
+            async with self.client.stream("POST", "/messages", json=payload, headers=IDENTITY_HEADERS) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    try:
-                        data = json.loads(line[5:].lstrip(" "))
-                    except json.JSONDecodeError:
-                        raise RuntimeError("Anthropic returned an invalid stream event") from None
+                async for raw in sse_data(response):
+                    data = json_object(raw)
                     if data.get("type") == "error":
                         raise RuntimeError("Anthropic stream failed; check the task state before continuing")
                     if data.get("type") == "message_stop":
@@ -130,8 +126,8 @@ class AnthropicBackend(BaseModelBackend):
 
     async def is_available(self) -> bool:
         try:
-            response = await self.client.get("/models", timeout=5)
-            return response.is_success
+            async with self.client.stream("GET", "/models", timeout=5, headers=IDENTITY_HEADERS) as response:
+                return response.is_success
         except httpx.HTTPError:
             return False
 
