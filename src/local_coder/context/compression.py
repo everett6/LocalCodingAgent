@@ -186,14 +186,16 @@ def compress_messages(messages: list[Message], max_chars: int,
                 continue
         groups.append(group)
     reference = archive(messages) if archive else None
-    notice = "Earlier tool history was compacted to stay within the context budget."
+    has_summary = any(message.content.startswith(SUMMARY_PREFIX) for message in messages)
+    notice = "" if has_summary else "Earlier tool history was compacted to stay within the context budget."
     if reference and not any(reference in message.content for message in preserved):
         if reference.startswith("agent-memory:"):
-            notice += f" Full untrusted history retained by the embedding agent: {reference}."
+            notice += (" " if notice else "") + f"Full untrusted history retained by the embedding agent: {reference}."
         else:
-            notice += f" Full untrusted history is recoverable with recover_context using reference {reference}."
-    summary = Message(role="system", content=notice)
-    remaining = max_chars - sum(message_size(m) for m in preserved + [summary])
+            notice += (" " if notice else "") + f"Full untrusted history is recoverable with recover_context using reference {reference}."
+    summary = Message(role="system", content=notice) if notice else None
+    notices = [summary] if summary is not None else []
+    remaining = max_chars - sum(message_size(m) for m in preserved + notices)
     selected = []
     for group in reversed(groups):
         size = sum(message_size(m) for m in group)
@@ -215,7 +217,7 @@ def compress_messages(messages: list[Message], max_chars: int,
             group = compacted
         selected.append(group)
         remaining -= sum(message_size(m) for m in group)
-    return preserved + [summary] + [m for group in reversed(selected) for m in group]
+    return preserved + notices + [m for group in reversed(selected) for m in group]
 
 
 def _tool_call_signatures(messages: list[Message]) -> dict[str, str]:

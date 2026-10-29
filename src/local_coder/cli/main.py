@@ -496,6 +496,9 @@ def show_config(ctx):
             "tools": {
                 "disabled": list(config.tools.disabled),
                 "command_timeout": config.tools.command_timeout,
+                "command_sandbox": config.tools.command_sandbox,
+                "sandbox_runtime": config.tools.sandbox_runtime,
+                "sandbox_image": config.tools.sandbox_image,
                 "role_overrides": dict(config.tools.roles),
             },
             "problems": validate_config(config),
@@ -531,6 +534,8 @@ def show_config(ctx):
     console.print(
         f"[bold]Tools:[/bold] disabled={', '.join(tools.disabled) or 'none'}; "
         f"command_timeout={tools.command_timeout or 'default (60s)'}; "
+        f"command_sandbox={'on' if tools.command_sandbox else 'off'} "
+        f"({tools.sandbox_runtime}, {tools.sandbox_image}); "
         f"role overrides={', '.join(tools.roles) or 'none'}"
     )
 

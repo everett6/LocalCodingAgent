@@ -256,7 +256,10 @@ class TestReadFilePaging:
 
     def test_small_file_has_no_footer(self, tmp_path):
         (tmp_path / "a.py").write_text("print(1)\n")
-        assert run(ReadFileTool(str(tmp_path)).execute(path="a.py")).output == "print(1)\n"
+
+        result = run(ReadFileTool(str(tmp_path)).execute(path="a.py"))
+        assert result.output == "print(1)\n"
+        assert result.data["files_read"] == ["a.py"]
 
     def test_long_lines_are_clipped(self, tmp_path):
         (tmp_path / "min.js").write_text("a" * 50_000 + "\nend\n")

@@ -102,7 +102,19 @@ class GrepTool(Tool):
             res_str = "\n".join(out_lines)
             if len(lines) > max_results:
                 res_str += f"\n... (Showing {max_results} of {len(lines)} matches)"
-                
-            return ToolResult(success=True, output=res_str, duration_ms=int((time.time()-start_t)*1000))
+            matched_paths = set()
+            workspace = Workspace(self.project_root)
+            for line in lines[:max_results]:
+                candidate = line.rsplit(":", 2)[0]
+                try:
+                    matched_paths.add(workspace.relative_path(candidate))
+                except ValueError:
+                    continue
+            return ToolResult(
+                success=True,
+                output=res_str,
+                data={"files_read": sorted(matched_paths)},
+                duration_ms=int((time.time()-start_t)*1000),
+            )
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))

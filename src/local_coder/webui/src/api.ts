@@ -1,8 +1,8 @@
 export type Mode = 'coding' | 'cybersecurity' | 'bug_hunting' | 'red_team'
-export interface Session { session_id: string; request: string; status?: string; phase: string; result?: string; error?: string; mode?: Mode; checkpoint?: string; engagement_id?: string }
+export interface Session { session_id: string; request: string; status?: string; phase: string; result?: string; error?: string; mode?: Mode; checkpoint?: string; pre_run_checkpoint_id?: string; undo_applied?: boolean; engagement_id?: string; started_at?: number }
 export interface AgentEvent { seq: number; source: string; event_type: string; message: string; data: Record<string, unknown> }
 export interface Provider { name?: string; backend: string; model_id: string; base_url: string; profile: string; api_key_env?: string; key_set?: boolean; max_tokens?: number; context_length?: number; strategy_attempt_limit?: number }
-export interface Workspace { branch: string; files: { path: string; additions: number; deletions: number }[]; total_additions: number; total_deletions: number }
+export interface Workspace { branch: string; files: { path: string; additions: number; deletions: number; untracked?: boolean }[]; total_additions: number; total_deletions: number }
 declare global { interface Window { localCoder?: { request: (path: string, method: string, body?: unknown) => Promise<{ status: number; data: unknown }>; chooseInferenceFile?: (purpose: 'runtime' | 'model' | 'draft') => Promise<string | null>; chooseProject: () => Promise<void>; openIDE: () => Promise<void> } } }
 let token = ''
 export function setToken(value: string) { token = value }

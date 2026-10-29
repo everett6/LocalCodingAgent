@@ -325,6 +325,20 @@ def test_session_cache_filename_is_stable_and_project_specific(tmp_path):
     assert coordinator_a._session_cache_filename().endswith(".bin")
 
 
+def test_session_cache_filename_changes_when_indexed_source_changes(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("def first_state():\n    return 1\n")
+    config = ProjectConfig(project_root=str(tmp_path))
+    coordinator = Coordinator(config=config, project_root=str(tmp_path))
+    index = coordinator.repo_context._code_index()
+    index.refresh()
+    original = coordinator._session_cache_filename()
+    source.write_text("def second_state():\n    return 2\n")
+    index.update_paths({source})
+
+    assert coordinator._session_cache_filename() != original
+
+
 def test_get_drafter_returns_none_without_a_configured_drafter_model(tmp_path):
     coordinator = make_coordinator(tmp_path)  # default config has no "drafter" model entry
 

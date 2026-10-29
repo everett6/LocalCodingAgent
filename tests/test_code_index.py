@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import time
 
 import pytest
 
@@ -182,12 +183,93 @@ class TestIncremental:
         index = CodeIndex(str(project))
         assert index.search("backoff")[0].path == "src/retry.py"
 
+    def test_interactive_refresh_is_throttled_but_explicit_refresh_is_fresh(self, project, monkeypatch):
+        index = CodeIndex(str(project), persist=False)
+        index.refresh()
+        target = project / "src" / "retry.py"
+        target.write_text("def circuit_breaker():\n    return 'open'\n")
+        monkeypatch.setattr(time, "monotonic", lambda: index._last_refresh_at + 0.5)
+
+        assert index.refresh_if_due() == {"updated": 0, "removed": 0, "unchanged": 0}
+        assert index.search("circuit breaker", refresh=False) == []
+        index.refresh()
+        assert index.search("circuit breaker", refresh=False)[0].path == "src/retry.py"
+
+    def test_event_update_handles_same_size_same_mtime_edits(self, project):
+        index = CodeIndex(str(project), persist=False)
+        index.refresh()
+        original_generation = index.generation
+        target = project / "src" / "retry.py"
+        previous_stat = target.stat()
+        target.write_text(target.read_text().replace("time.sleep", "time.pause"))
+        assert target.stat().st_size == previous_stat.st_size
+        os.utime(target, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
+
+        result = index.update_paths({target})
+
+        assert result["updated"] == 1
+        assert index.generation != original_generation
+        assert index.search("sleep", refresh=False) == []
+        assert index.search("pause", refresh=False)[0].symbol == "retry_with_backoff"
+
+    def test_event_update_removes_deleted_and_unsupported_files(self, project):
+        index = CodeIndex(str(project), persist=False)
+        index.refresh()
+        target = project / "src" / "retry.py"
+        target.unlink()
+
+        result = index.update_paths({target})
+
+        assert result["removed"] == 1
+        assert not index.search("backoff", refresh=False)
+
+    def test_generation_changes_for_edits_with_identical_search_tokens(self, project):
+        index = CodeIndex(str(project), persist=False)
+        index.refresh()
+        original_generation = index.generation
+        target = project / "src" / "retry.py"
+        previous_stat = target.stat()
+        target.write_text(target.read_text().replace("2 ** i", "3 ** i"))
+        os.utime(target, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
+
+        index.update_paths({target})
+
+        assert index.generation != original_generation
+
+    def test_native_watcher_tracks_add_edit_and_delete_and_stops(self, project):
+        index = CodeIndex(str(project), persist=False)
+        index.start_watching()
+        try:
+            added = project / "src" / "watch_target.py"
+            added.write_text("def watcher_marker():\n    return 'first'\n")
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and not index.search("watcher marker", refresh=False):
+                time.sleep(0.05)
+            assert index.search("watcher marker", refresh=False)
+
+            added.write_text("def watcher_marker():\n    return 'second'\n")
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and index.search("first", refresh=False):
+                time.sleep(0.05)
+            assert not index.search("first", refresh=False)
+
+            added.unlink()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and index.search("watcher marker", refresh=False):
+                time.sleep(0.05)
+            assert not index.search("watcher marker", refresh=False)
+            assert index.watcher_error is None
+        finally:
+            index.stop_watching()
+        assert index._watch_thread is None
+
 
 class TestCodeSearchTool:
     def test_output_format(self, project):
         tool = CodeSearchTool(str(project))
         result = asyncio.run(tool.execute(query="load yaml config", max_results=3))
         assert result.success
+        assert "src/config_loader.py" in result.data["files_read"]
         first = result.output.splitlines()[0]
         assert first.startswith("src/config_loader.py:")
         assert "[function " in first and "score=" in first

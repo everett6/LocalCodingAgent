@@ -16,6 +16,7 @@ from local_coder.tools.repo_map import RepoMapTool
 from local_coder.types import ApprovalConfig
 from typing import Any
 from local_coder.tools.bugs import RunBugScanTool
+from local_coder.context.code_index import CodeIndex
 
 
 def create_tool_registry(
@@ -23,6 +24,7 @@ def create_tool_registry(
     approval: ApprovalConfig | None = None,
     approval_callback: ApprovalCallback | None = None,
     safety_harness: Any = None,
+    code_index: CodeIndex | None = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry and register all available tools.
 
@@ -53,7 +55,7 @@ def create_tool_registry(
     # Search tools
     registry.register(SearchFilesTool(project_root))
     registry.register(GrepTool(project_root))
-    code_search = CodeSearchTool(project_root)
+    code_search = CodeSearchTool(project_root, index=code_index)
     registry.register(code_search)
     registry.register(RepoMapTool(project_root, index=code_search.index))
 

@@ -142,10 +142,18 @@ class RemoteControlServer(WorkbenchAPI):
                 job["events"] = job["events"][-600:]
                 if event.event_type == "checkpoint_saved":
                     job["checkpoint"] = event.data.get("path")
+                if event.event_type == "checkpoint_created":
+                    job["pre_run_checkpoint_id"] = event.data.get("checkpoint_id")
             self.events.append(payload)
         if job is not None and event.event_type == "checkpoint_saved":
             # Make Resume available even when the process dies before the job finalizer.
             self.sessions.save(payload["session_id"], checkpoint=job["checkpoint"], events=list(job["events"]))
+        elif job is not None and event.event_type == "checkpoint_created":
+            self.sessions.save(
+                payload["session_id"],
+                pre_run_checkpoint_id=job["pre_run_checkpoint_id"],
+                events=list(job["events"]),
+            )
 
     def _coordinator(self) -> Coordinator:
         config = load_config(
@@ -166,7 +174,11 @@ class RemoteControlServer(WorkbenchAPI):
         if self.yolo:
             config.approval.require_approval_for_commands = False
             config.approval.require_approval_for_commits = False
-        coordinator = Coordinator(config=config, project_root=self.project_root)
+        coordinator = Coordinator(
+            config=config,
+            project_root=self.project_root,
+            code_index=self.code_index,
+        )
         coordinator.on_event(self._event)
         return coordinator
 
@@ -420,6 +432,7 @@ class RemoteControlServer(WorkbenchAPI):
             self._lease_file = self._lease = None
             raise ValueError("Workspace already has an engine. Share its connection or close the other app first") from None
         try:
+            self.code_index.start_watching()
             server = WorkspaceHTTPServer((host, port), Handler)
             self.reconcile_sessions()
             from local_coder.engine_discovery import publish_connection
@@ -432,6 +445,11 @@ class RemoteControlServer(WorkbenchAPI):
             raise
 
     def release_workspace(self):
+        try:
+            self.code_index.stop_watching()
+        except RuntimeError as exc:
+            import logging
+            logging.getLogger(__name__).error("Could not stop code index watcher cleanly: %s", exc)
         if self._connection_file is not None:
             self._connection_file.unlink(missing_ok=True)
             self._connection_file = None

@@ -192,6 +192,11 @@ class ToolRegistry:
             for tool in self._tools.values():
                 if hasattr(tool, "default_timeout"):
                     tool.default_timeout = settings.command_timeout
+        command_tool = self._tools.get(ToolName.RUN_COMMAND)
+        if command_tool is not None:
+            command_tool.sandbox_enabled = settings.command_sandbox
+            command_tool.sandbox_runtime = settings.sandbox_runtime
+            command_tool.sandbox_image = settings.sandbox_image
 
     async def execute_tool(
         self, role: AgentRole, tool_name: str, arguments: dict[str, Any]

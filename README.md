@@ -678,12 +678,20 @@ step first (`context/compression.py`):
    stay verbatim. The cut never leaves a tool result without its tool call.
    If summarization fails, the old character-budget trimming is the fallback.
 
+Context reads now reject paths that escape the workspace, symlinks outside it,
+credential/state files, binary files and oversized sources. Initial context
+loading is capped across files instead of allowing ten maximum-size reads to
+crowd out the task. Repository text and tool output are explicitly treated as
+untrusted data, not instructions.
+
 Compaction triggers when history passes `context_window_chars`, **or** when
 the prompt size the server reported last turn passes 85% of the model's
 `context_length` minus `max_tokens`. Chars per token varies a lot between
 code and prose, so the real count is the reliable signal. History is only
 rewritten when a trigger fires. Between compactions the prompt is
 append-only, so llama-server's prefix cache is reused on every turn.
+Generation output is capped at half of the configured context window to reserve
+room for the prompt, tool schemas and the ongoing conversation.
 
 Past tool calls are now sent back as real JSON (compact separators) instead
 of a Python `repr`, so the model sees its own calls in the shape it wrote
@@ -707,11 +715,18 @@ PYTHONPATH=src pytest -q
 ### Red team mode
 
 The manager and Code OSS IDE include a dedicated **Red Team** engagement workflow:
-saved scope/exclusions, phased checklists, bounded opt-in HTTP observations,
+saved local scope/exclusions, bounded opt-in loopback-only HTTP observations,
 SARIF/Nuclei artifact import, attack-path hypotheses, and persistent evidence.
 Use `lc redteam --target src 'Review trust boundaries'` for local source review.
 See [engagement setup and limits](docs/harness.md#red-team-engagements) and the
 [upstream methodology reference](docs/references/pentest-harness.md).
+
+Red Team mode is for evidence-led review of the selected local repository.
+Optional HTTP observations are restricted to localhost/loopback; remote hosts
+are rejected. It does not generate or run exploits, payloads, fuzzing campaigns,
+or arbitrary commands. Security and bug-hunting investigations remain read-only
+unless remediation is explicitly enabled; remediation uses bounded file and
+test tools, not arbitrary shell commands or Git mutations.
 
 **Small-model guardrails:** three more checks in the same loop, for mistakes
 local models make far more often than frontier ones.

@@ -47,6 +47,18 @@ def test_http_is_opt_in_and_scope_cannot_be_expanded_by_tool(tmp_path):
     assert not result.success
     with pytest.raises(ValueError):
         EngagementScope(name='x', objective='x', active_http=True, origins=['https://example.test'])
+    with pytest.raises(ValueError, match='loopback'):
+        EngagementScope(name='x', objective='x', active_http=True,
+                        authorization='local lab', origins=['https://192.0.2.10'])
+
+
+def test_active_http_rejects_dns_results_outside_loopback(monkeypatch):
+    from local_coder.redteam import addresses
+    monkeypatch.setattr('local_coder.redteam.socket.getaddrinfo',
+                        lambda *args, **kwargs: [(None, None, None, None, ('203.0.113.10', 443))])
+
+    with pytest.raises(ValueError, match='loopback'):
+        addresses('localhost', 443)
 
 
 def test_findings_require_existing_evidence_and_deduplicate(tmp_path):
@@ -283,7 +295,7 @@ def test_http_uses_pinned_ip_original_host_and_tls_sni(tmp_path,monkeypatch):
     seen=[]
     monkeypatch.setattr('local_coder.redteam.addresses',lambda *args:['127.0.0.1'])
     monkeypatch.setattr('local_coder.tools.redteam.addresses',lambda *args:['127.0.0.1'])
-    record=create(tmp_path,origins=['https://app.example.test'],active_http=True,authorization='Synthetic transport test')
+    record=create(tmp_path,origins=['https://localhost'],active_http=True,authorization='Synthetic transport test')
     original=httpx.AsyncClient
     def respond(request):
         seen.append(request)
@@ -293,11 +305,11 @@ def test_http_uses_pinned_ip_original_host_and_tls_sni(tmp_path,monkeypatch):
         assert kwargs.get('verify',True) is True
         return original(**kwargs,transport=httpx.MockTransport(respond))
     monkeypatch.setattr('local_coder.tools.redteam.httpx.AsyncClient',client)
-    result=asyncio.run(RedTeamHTTPTool(EngagementStore(str(tmp_path)),record['id']).execute(url='https://app.example.test/'))
+    result=asyncio.run(RedTeamHTTPTool(EngagementStore(str(tmp_path)),record['id']).execute(url='https://localhost/'))
     assert result.success,result.error
     assert seen[0].url.host=='127.0.0.1'
-    assert seen[0].headers['host']=='app.example.test:443'
-    assert seen[0].extensions['sni_hostname']=='app.example.test'
+    assert seen[0].headers['host']=='localhost:443'
+    assert seen[0].extensions['sni_hostname']=='localhost'
 
 
 def test_http_cancellation_is_journaled_and_attempt_not_refunded(tmp_path,monkeypatch):

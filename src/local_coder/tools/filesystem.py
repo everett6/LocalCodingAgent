@@ -1,5 +1,7 @@
 """Filesystem tools for the coding agent."""
 import asyncio
+import hashlib
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -8,6 +10,7 @@ from typing import Any
 from local_coder.workspace import Workspace
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
+from local_coder.context.source_snapshot import read_source_snapshot
 
 
 def _resolve_and_check_path(project_root: str, path: str) -> Path:
@@ -45,14 +48,14 @@ class ReadFileTool(Tool):
             if not target.is_file():
                 return ToolResult(success=False, output=f"File not found: {path}")
                 
-            def _read() -> str:
-                with open(target, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+            def _read() -> tuple[str, str]:
+                snapshot = read_source_snapshot(self.project_root, path, max_bytes=2 * 1024 * 1024)
+                lines = snapshot.data.decode("utf-8").splitlines(keepends=True)
                 total = len(lines)
                 first = max(1, start_line or 1)
                 last = min(end_line or total, total)
                 if total and first > total:
-                    return f"[start_line {first} is past the end of {path} ({total} lines)]"
+                    return f"[start_line {first} is past the end of {path} ({total} lines)]", snapshot.sha256
                 page: list[str] = []
                 used = 0
                 for line in lines[first - 1:last]:
@@ -71,10 +74,17 @@ class ReadFileTool(Tool):
                         f"[Showing lines {first}-{shown_last} of {total}. "
                         f"Call read_file with start_line={shown_last + 1} to continue.]"
                     )
-                return content
+                return content, snapshot.sha256
                 
-            content = await asyncio.to_thread(_read)
-            return ToolResult(success=True, output=content, duration_ms=int((time.time()-start_t)*1000))
+            content, source_hash = await asyncio.to_thread(_read)
+            return ToolResult(
+                success=True,
+                output=content,
+                files_changed=[],
+                data={"files_read": [Workspace(self.project_root).relative_path(target)],
+                      "source_hashes": {Workspace(self.project_root).relative_path(target): source_hash}},
+                duration_ms=int((time.time()-start_t)*1000),
+            )
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
 
@@ -127,7 +137,7 @@ class WriteFileTool(Tool):
             
             def _write() -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with open(target, "w", encoding="utf-8") as f:
+                with open(target, "w", encoding="utf-8", newline="") as f:
                     f.write(content)
                     
             await asyncio.to_thread(_write)
@@ -135,6 +145,7 @@ class WriteFileTool(Tool):
                 success=True,
                 output=f"Wrote to {path}",
                 files_changed=[path],
+                data={"source_hashes": {Workspace(self.project_root).relative_path(target): hashlib.sha256(content.encode("utf-8")).hexdigest()}},
                 duration_ms=int((time.time()-start_t)*1000),
             )
         except Exception as e:
@@ -251,6 +262,7 @@ class EditFileTool(Tool):
                     success=True,
                     output=f"Edited {path}: replaced {replaced} (first at line {first_line})",
                     files_changed=[path],
+                    data={"source_hashes": {Workspace(self.project_root).relative_path(target): hashlib.sha256(updated.encode("utf-8")).hexdigest()}},
                     duration_ms=int((time.time()-start_t)*1000),
                 )
 
@@ -322,7 +334,10 @@ def _patched_files(patch: str) -> list[str]:
 
 class ApplyPatchTool(Tool):
     name = ToolName.APPLY_PATCH
-    description = "Apply a unified diff patch."
+    description = (
+        "Apply a unified diff patch atomically: all file paths are checked first, "
+        "and affected files are restored if application fails."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -350,24 +365,78 @@ class ApplyPatchTool(Tool):
                     )
 
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
+            workspace = Workspace(self.project_root)
+            rel_paths = _patched_files(patch)
+            if not rel_paths:
+                return ToolResult(
+                    success=False,
+                    output="Patch contains no supported file paths.",
+                    duration_ms=int((time.time() - start_t) * 1000),
+                )
+
+            targets: dict[str, Path] = {}
+            for rel in rel_paths:
+                target = workspace.resolve(cwd / rel)
+                if target.exists() and not target.is_file():
+                    raise ValueError(f"Patch target is not a regular file: {rel}")
+                targets[workspace.relative_path(target)] = target
+
+            backups: dict[str, tuple[bytes, int] | None] = {}
+            for rel, target in targets.items():
+                if target.is_file():
+                    stat = target.stat()
+                    backups[rel] = (target.read_bytes(), stat.st_mode)
+                else:
+                    backups[rel] = None
+
+            proc = await asyncio.create_subprocess_exec(
+                "patch", "--dry-run", "-p1",
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=cwd,
+            )
+            stdout, stderr = await proc.communicate(patch.encode())
+            if proc.returncode != 0:
+                output = stdout.decode(errors="replace")
+                if stderr:
+                    output += f"\nStderr:\n{stderr.decode(errors='replace')}"
+                return ToolResult(
+                    success=False,
+                    output=(output.strip() + "\nPatch validation failed; no files were changed.").strip(),
+                    duration_ms=int((time.time() - start_t) * 1000),
+                )
+
             proc = await asyncio.create_subprocess_exec(
                 "patch", "-p1",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=cwd
+                cwd=cwd,
             )
             stdout, stderr = await proc.communicate(patch.encode())
             success = proc.returncode == 0
-            res_str = stdout.decode()
+            res_str = stdout.decode(errors="replace")
             if stderr:
-                res_str += f"\nStderr:\n{stderr.decode()}"
-            files_changed = []
-            if success:
-                workspace = Workspace(self.project_root)
-                for rel in _patched_files(patch):
+                res_str += f"\nStderr:\n{stderr.decode(errors='replace')}"
+            if not success:
+                rollback_errors = []
+                for rel, target in targets.items():
                     try:
-                        files_changed.append(workspace.relative_path(cwd / rel))
-                    except ValueError:
-                        continue
+                        backup = backups[rel]
+                        if backup is None:
+                            if target.is_file():
+                                target.unlink()
+                        else:
+                            content, mode = backup
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(content)
+                            os.chmod(target, mode)
+                    except OSError as error:
+                        rollback_errors.append(f"{rel}: {error}")
+                if rollback_errors:
+                    res_str += "\nRollback failed for: " + "; ".join(rollback_errors)
+                else:
+                    res_str += "\nPatch failed; all affected files were restored."
+            files_changed = [
+                workspace.relative_path(target) for target in targets.values()
+            ] if success else []
             return ToolResult(
                 success=success,
                 output=res_str.strip(),

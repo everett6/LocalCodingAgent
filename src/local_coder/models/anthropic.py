@@ -46,7 +46,7 @@ class AnthropicBackend(BaseModelBackend):
             else:
                 converted.append({"role": role, "content": blocks})
         payload = {"model": self.config.model_id, "messages": converted,
-                   "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
+                   "max_tokens": self.config.output_budget(max_tokens),
                    "temperature": temperature if temperature is not None else self.config.temperature}
         if system:
             payload["system"] = "\n\n".join(system)

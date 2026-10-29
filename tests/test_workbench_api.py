@@ -1,9 +1,13 @@
 import asyncio
+import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
+from local_coder.git.checkpoints import CheckpointManager
 from local_coder.remote import RemoteControlServer
 from local_coder.types import AgentEvent
+from local_coder.workbench import workspace_fingerprint
 
 
 def test_settings_never_return_provider_secrets(tmp_path):
@@ -77,6 +81,49 @@ def test_workspace_file_reads_are_bounded_to_project(tmp_path):
     assert server.handle("GET", "/file?path=../outside")[0] == 400
 
 
+def test_undo_endpoint_restores_latest_saved_checkpoint(tmp_path):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True
+        )
+
+    git("init", "-q")
+    git("config", "user.name", "Test User")
+    git("config", "user.email", "test@example.com")
+    tracked = tmp_path / "app.py"
+    tracked.write_text("before\n", encoding="utf-8")
+    git("add", "app.py")
+    git("commit", "-qm", "initial")
+    manager = CheckpointManager(str(tmp_path))
+    checkpoint = manager.create()
+    tracked.write_text("after\n", encoding="utf-8")
+    server = RemoteControlServer(str(tmp_path))
+    server.sessions.save(
+        "session-1",
+        status="completed",
+        pre_run_checkpoint_id=checkpoint.checkpoint_id,
+        workspace_fingerprint=workspace_fingerprint(str(tmp_path)),
+    )
+
+    status, result = server.handle("POST", "/undo", {"session_id": "session-1"})
+
+    assert status == 200
+    assert result["checkpoint_id"] == checkpoint.checkpoint_id
+    assert tracked.read_text(encoding="utf-8") == "before\n"
+
+
+def test_undo_endpoint_refuses_when_a_job_is_running(tmp_path):
+    server = RemoteControlServer(str(tmp_path))
+    assert server._job_lock.acquire(blocking=False)
+    try:
+        status, result = server.handle("POST", "/undo", {"session_id": "session-1"})
+    finally:
+        server._job_lock.release()
+
+    assert status == 409
+    assert "active task" in result["error"]
+
+
 def test_job_failure_is_persisted(tmp_path, monkeypatch):
     server = RemoteControlServer(str(tmp_path))
     def fail():
@@ -90,6 +137,59 @@ def test_job_failure_is_persisted(tmp_path, monkeypatch):
         time.sleep(.01)
     assert record["status"] == "failed"
     assert "configuration" in record["error"]
+
+
+def test_failed_coding_job_can_opt_into_checkpoint_rollback(tmp_path, monkeypatch):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True
+        )
+
+    git("init", "-q")
+    git("config", "user.name", "Test User")
+    git("config", "user.email", "test@example.com")
+    target = tmp_path / "app.py"
+    target.write_text("before\n", encoding="utf-8")
+    git("add", "app.py")
+    git("commit", "-qm", "initial")
+    server = RemoteControlServer(str(tmp_path))
+
+    class FakeCoordinator:
+        config = SimpleNamespace(verification=SimpleNamespace(rollback_on_failure=True))
+
+        async def run(self, request, **kwargs):
+            checkpoint = CheckpointManager(str(tmp_path)).create()
+            server._event(AgentEvent(
+                source="ORCHESTRATOR", event_type="checkpoint_created",
+                message="checkpoint", data={"checkpoint_id": checkpoint.checkpoint_id},
+            ))
+            target.write_text("partial work\n", encoding="utf-8")
+            server._event(AgentEvent(
+                source="ORCHESTRATOR", event_type="task_status",
+                message="failed", data={"status": "failed"},
+            ))
+            return "Verification failed"
+
+        class Manager:
+            async def close_all(self):
+                pass
+
+        model_manager = Manager()
+
+    monkeypatch.setattr(server, "_coordinator", lambda: FakeCoordinator())
+    _, job = server.handle("POST", "/jobs", {"request": "Fix app", "mode": "coding"})
+    record = None
+    for _ in range(100):
+        record = server.sessions.get(job["session_id"])
+        if record and record["status"] not in {"queued", "running"}:
+            break
+        time.sleep(.01)
+
+    assert record is not None
+    assert record["status"] == "failed"
+    assert record["rollback_applied"] is True
+    assert "restored to the pre-run checkpoint" in record["result"]
+    assert target.read_text(encoding="utf-8") == "before\n"
 
 
 def test_failure_status_survives_event_buffer_eviction(tmp_path, monkeypatch):
@@ -140,6 +240,18 @@ def test_workspace_engine_lease_rejects_second_server(tmp_path):
         first.server_close()
     next_server = second.make_http_server('127.0.0.1', 0)
     next_server.server_close()
+
+
+def test_engine_owns_and_stops_native_index_watcher(tmp_path):
+    server = RemoteControlServer(str(tmp_path))
+    http_server = server.make_http_server("127.0.0.1", 0)
+    try:
+        assert server.code_index._watch_thread is not None
+        assert server.code_index._watch_thread.is_alive()
+    finally:
+        http_server.server_close()
+
+    assert server.code_index._watch_thread is None
 
 
 def test_shutdown_cancels_and_awaits_job_cleanup(tmp_path, monkeypatch):

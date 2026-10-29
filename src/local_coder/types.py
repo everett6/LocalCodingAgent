@@ -86,6 +86,8 @@ class ToolName(str, enum.Enum):
     GIT_COMMIT = "git_commit"
     GIT_CHECKOUT = "git_checkout"
     RUN_COMMAND = "run_command"
+    TEAM_MESSAGE = "team_message"
+    VERIFY_UI = "verify_ui"
     RUN_TESTS = "run_tests"
     BUILD = "build"
     LINT = "lint"
@@ -178,6 +180,12 @@ class ModelConfig(BaseModel):
         if env is None and self.backend == ModelBackend.ANTHROPIC:
             env = "ANTHROPIC_API_KEY"
         return os.environ.get(env) if env else None
+
+    def output_budget(self, requested: int | None = None) -> int:
+        """Keep generation within the model's context while reserving prompt space."""
+        limit = max(1, self.context_length // 2)
+        desired = self.max_tokens if requested is None else requested
+        return max(1, min(int(desired), limit))
 
 
 # === Agent Protocol ===
@@ -347,6 +355,7 @@ class VerificationConfig(BaseModel):
     max_fix_iterations: int = 3
     run_tests_after_changes: bool = True
     require_review: bool = True
+    rollback_on_failure: bool = False
 
 
 class AgenticConfig(BaseModel):
@@ -386,6 +395,9 @@ class ToolSettings(BaseModel):
     """
     disabled: list[str] = Field(default_factory=list)
     command_timeout: int | None = None
+    command_sandbox: bool = False
+    sandbox_runtime: Literal["auto", "docker", "podman"] = "auto"
+    sandbox_image: str = Field(default="python:3.12-slim", min_length=1)
     # role -> the complete list of tools that role may use (replaces the
     # built-in default for that role).
     roles: dict[str, list[str]] = Field(default_factory=dict)

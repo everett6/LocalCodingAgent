@@ -62,8 +62,8 @@ def addresses(host: str, port: int) -> list[str]:
         raise ValueError('Host has no addresses')
     for value in resolved:
         address = ipaddress.ip_address(value)
-        if address.is_link_local or address.is_multicast or address.is_unspecified or (address.is_reserved and not address.is_loopback):
-            raise ValueError('Link-local, reserved, multicast and unspecified destinations are not supported')
+        if not address.is_loopback:
+            raise ValueError('Active HTTP observations are restricted to loopback addresses')
     return resolved
 
 
@@ -86,6 +86,15 @@ class EngagementScope(BaseModel):
             url_asset(value)
         if self.active_http and (not self.origins or not self.authorization.strip()):
             raise ValueError('Active HTTP checks require exact allowed origins and an authorization reference')
+        if self.active_http:
+            for value in self.origins:
+                host = urlsplit(value).hostname or ""
+                try:
+                    loopback = ipaddress.ip_address(host).is_loopback
+                except ValueError:
+                    loopback = host == "localhost"
+                if not loopback:
+                    raise ValueError('Active HTTP observations are restricted to localhost and loopback IPs')
         return self
 
 

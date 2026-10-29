@@ -131,6 +131,14 @@ def test_root_level_dotfile_is_found(tmp_path):
     assert load_config(project_root=str(tmp_path)).verification.max_fix_iterations == 4
 
 
+def test_failed_task_rollback_is_opt_in(tmp_path):
+    assert load_config(project_root=str(tmp_path)).verification.rollback_on_failure is False
+    (tmp_path / ".local-coder.yaml").write_text(
+        "verification:\n  rollback_on_failure: true\n"
+    )
+    assert load_config(project_root=str(tmp_path)).verification.rollback_on_failure is True
+
+
 def test_model_defaults_apply_to_every_model(tmp_path):
     write_config(tmp_path, """
 model_defaults:

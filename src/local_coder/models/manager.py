@@ -67,10 +67,15 @@ class ModelManager:
         chain = fallback_chain(self.config, selected)
         if len(chain) == 1:
             return self._models[selected]
+        unavailable = []
         for name in chain:
             if await self._is_reachable(name):
                 return self._models[name]
-        return self._models[selected]
+            unavailable.append(name)
+        raise RuntimeError(
+            "No reachable model in the configured routing chain "
+            f"({', '.join(unavailable)}). Check the local model server, model ID, and fallback configuration."
+        )
 
     async def _is_reachable(self, name: str) -> bool:
         async with self._lock:

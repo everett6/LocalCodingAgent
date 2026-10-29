@@ -127,3 +127,65 @@ def test_apply_patch_reports_files_changed(tmp_path):
     assert result.success, result.output
     assert result.files_changed == ["pkg/app.py"]
     assert (tmp_path / "pkg" / "app.py").read_text() == "x = 2\n"
+
+
+@pytest.mark.skipif(shutil.which("patch") is None, reason="patch binary not installed")
+def test_apply_patch_rejects_partial_multifile_patch_without_changes(tmp_path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("x = 1\n")
+    second.write_text("y = 1\n")
+    patch = (
+        "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+        "--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-y = 0\n+y = 2\n"
+    )
+
+    result = asyncio.run(ApplyPatchTool(str(tmp_path)).execute(patch=patch))
+
+    assert not result.success
+    assert "no files were changed" in result.output.lower()
+    assert first.read_text() == "x = 1\n"
+    assert second.read_text() == "y = 1\n"
+
+
+@pytest.mark.skipif(shutil.which("patch") is None, reason="patch binary not installed")
+def test_apply_patch_rejects_paths_outside_workspace(tmp_path):
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("safe\n")
+    patch = "--- a/../../outside.txt\n+++ b/../../outside.txt\n@@ -1 +1 @@\n-safe\n+changed\n"
+
+    result = asyncio.run(ApplyPatchTool(str(tmp_path)).execute(patch=patch))
+
+    assert not result.success
+    assert outside.read_text() == "safe\n"
+
+
+def test_apply_patch_restores_files_if_application_fails_after_validation(tmp_path, monkeypatch):
+    target = tmp_path / "app.py"
+    target.write_text("before\n")
+    patch = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-before\n+after\n"
+    calls = 0
+
+    class Process:
+        def __init__(self, returncode, output):
+            self.returncode = returncode
+            self.output = output
+
+        async def communicate(self, _input):
+            return self.output, b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return Process(0, b"checking file app.py")
+        target.write_text("partially applied\n")
+        return Process(1, b"hunk failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    result = asyncio.run(ApplyPatchTool(str(tmp_path)).execute(patch=patch))
+
+    assert calls == 2
+    assert not result.success
+    assert "all affected files were restored" in result.output
+    assert target.read_text() == "before\n"

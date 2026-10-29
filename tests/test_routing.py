@@ -82,6 +82,18 @@ def test_manager_uses_fallback_when_primary_is_unreachable():
     assert strong.probes == 1, "reachability is probed once, then cached"
 
 
+def test_manager_reports_when_every_configured_model_is_unreachable():
+    config = make_config(fallbacks={"strong": ["fast"]})
+    manager = ModelManager(config)
+    manager._models = {
+        "strong": StubModel("strong", available=False),
+        "fast": StubModel("fast", available=False),
+    }
+
+    with pytest.raises(RuntimeError, match="No reachable model.*strong, fast"):
+        asyncio.run(manager.get_model(AgentRole.PLANNER))
+
+
 def test_manager_does_not_probe_models_without_fallbacks():
     manager = ModelManager(make_config())
     fast = StubModel("fast", available=False)

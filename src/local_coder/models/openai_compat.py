@@ -51,7 +51,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
             "model": self.config.model_id,
             "messages": api_messages,
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
+            "max_tokens": self.config.output_budget(max_tokens),
             "stream": False,
         }
         
@@ -168,7 +168,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
             "model": self.config.model_id,
             "messages": api_messages,
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
+            "max_tokens": self.config.output_budget(max_tokens),
             "stream": True,
         }
 
