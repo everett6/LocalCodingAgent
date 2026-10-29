@@ -1,0 +1,10 @@
+/* Compact observed activity; technical evidence opens on demand. */
+.studio .activity-timeline{border-color:#353a43;padding-top:17px;margin-top:25px}
+.activity-timeline>summary{font-size:12px;font-weight:500;color:#c2cad9;cursor:pointer;line-height:1.6}.activity-timeline>summary>span{font-weight:400;font-size:10px;color:#929eaf;margin-left:10px}
+.activity-timeline>ol{list-style:none;padding:5px 0 0;margin:9px 0 0}.activity-step{display:flex;align-items:flex-start;gap:11px;padding:8px 0;min-width:0}
+.activity-step-icon{display:flex;align-items:center;justify-content:center;width:18px;min-height:22px;flex-shrink:0;color:#8d9bb1}.activity-step.success .activity-step-icon{color:#9cbca9}.activity-step.error .activity-step-icon{color:#dc9d9d}.activity-step.warning .activity-step-icon{color:#d2b88d}
+.activity-step>details{flex:1;min-width:0}.activity-step>details>summary{color:#b9c3d4;font-size:12px;font-weight:400;line-height:1.75;list-style:none;cursor:pointer;overflow-wrap:anywhere;border-radius:3px}.activity-step>details>summary::-webkit-details-marker{display:none}
+.activity-detail-hint{font-size:9px;color:#8c9cb7;margin-left:12px;opacity:0}.activity-step>details:hover .activity-detail-hint,.activity-step>details:focus-within .activity-detail-hint,.activity-step>details[open] .activity-detail-hint{opacity:1}
+.activity-step.error>details>summary{color:#dfb3b3}.activity-step.warning>details>summary{color:#d2c0a1}
+.activity-event-detail{margin:9px 0 5px;padding:10px 12px;border-left:1px solid #53617a;background:#1d222b;max-width:72ch}.activity-event-detail>div+div{border-top:1px solid #343d4d;padding-top:9px;margin-top:9px}.activity-event-detail>div>span{display:flex;flex-wrap:wrap;gap:10px;font-size:9px;color:#a7b7d0}.activity-event-detail>div>span>span{color:#8493ab}.studio .activity-event-detail p{margin:5px 0 0;color:#adb9cc;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.7}
+.activity-expand{font-size:10px;color:#a8b8d5;border:1px solid #3b465a;border-radius:5px;padding:6px 9px;margin:12px 0 4px}.activity-empty{font-size:11px!important;color:#97a6bd;margin:14px 0}

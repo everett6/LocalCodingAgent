@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Box, Check, Cpu, Gauge, HardDrive, Play, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Square } from 'lucide-react'
 import { modelName, modelQuantization, modelSize, runtimePresentation } from '../localModels'
 import { api } from '../api'
+import { startSerialPolling } from '../polling'
 import { InferenceTuningPanel } from './InferenceTuningPanel'
 import type { Provider } from '../api'
 
@@ -14,20 +15,30 @@ type Selection = Partial<Settings> & { settings?: Partial<Settings>; selection?:
 export function LocalInferenceSettings({ saved }: { saved: (provider: Provider) => void }) {
   const [status, setStatus] = useState<Status | null>(null), [form, setForm] = useState<Settings | null>(null)
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [discovery, setDiscovery] = useState<Discovery | null>(null)
+  const [pollError, setPollError] = useState('')
+  const revision = useRef(0), commandPending = useRef(false), mounted = useRef(false)
   const [showUnsupported, setShowUnsupported] = useState(false)
   const [search, setSearch] = useState(''), [tab, setTab] = useState<'models' | 'runtime' | 'performance'>('models'), [page, setPage] = useState(0), [automaticContext, setAutomaticContext] = useState(true)
   useEffect(() => {
     let active = true, requestedScan = false
-    const load = () => {
-      void api<Status>('/inference').then(result => { if (active) { setStatus(result); setForm(previous => previous ? { ...previous, runtime_path: previous.runtime_path || result.settings.runtime_path } : result.settings) } }).catch(problem => { if (active) setError(String(problem)) })
-      void api<Discovery>('/inference/discovery').then(async result => {
-        if (!active) return
-        setDiscovery(result)
-        if (!result.started && !requestedScan) { requestedScan = true; const started = await api<Discovery>('/inference/discover', 'POST', {}); if (active) setDiscovery(started) }
-      }).catch(problem => { if (active) setError(String(problem)) })
-    }
-    load(); const timer = setInterval(load, 1500)
-    return () => { active = false; clearInterval(timer) }
+    mounted.current = true
+    const stop = startSerialPolling(async signal => {
+      if (commandPending.current) return
+      const version = revision.current
+      const errors: string[] = []
+      await Promise.all([
+        api<Status>('/inference', 'GET', undefined, signal).then(result => {
+          if (active && version === revision.current) { setStatus(result); setForm(previous => previous ? { ...previous, runtime_path: previous.runtime_path || result.settings.runtime_path } : result.settings) }
+        }).catch(problem => { errors.push(String(problem)) }),
+        api<Discovery>('/inference/discovery', 'GET', undefined, signal).then(async result => {
+          if (!active || version !== revision.current) return
+          setDiscovery(result)
+          if (!result.started && !requestedScan) { requestedScan = true; const started = await api<Discovery>('/inference/discover', 'POST', {}, signal); if (active && version === revision.current) setDiscovery(started) }
+        }).catch(problem => { errors.push(String(problem)) }),
+      ])
+      if (active && version === revision.current) setPollError(errors.join(' · '))
+    }, 1500, problem => { if (active) setPollError(String(problem)) })
+    return () => { active = false; mounted.current = false; stop() }
   }, [])
   async function browse(purpose: 'runtime' | 'model' | 'draft') {
     try { const path = await window.localCoder?.chooseInferenceFile?.(purpose); if (path && form) setForm({ ...form, [purpose === 'runtime' ? 'runtime_path' : purpose === 'draft' ? 'draft_model_path' : 'model_path']: path }) } catch (problem) { setError(String(problem)) }
@@ -45,14 +56,17 @@ export function LocalInferenceSettings({ saved }: { saved: (provider: Provider) 
     } catch (problem) { setError(String(problem)) } finally { setBusy(false) }
   }
   async function command(action: string) {
+    commandPending.current = true; revision.current += 1
     setBusy(true); setError('')
     try {
       const result = await api<Status>(`/inference/${action}`, 'POST', action === 'configure' || action === 'start' ? form : {})
+      if (!mounted.current) return
       setStatus(result); if (action === 'install-runtime' || action === 'stop') setForm(result.settings)
-      if (result.ready) { const settings = await api<{ provider: Provider }>('/settings'); if (settings.provider) saved(settings.provider) }
-    } catch (problem) { setError(problem instanceof Error ? problem.message : String(problem)) } finally { setBusy(false) }
+      if (result.ready) { const settings = await api<{ provider: Provider }>('/settings'); if (mounted.current && settings.provider) saved(settings.provider) }
+    } catch (problem) { if (mounted.current) setError(problem instanceof Error ? problem.message : String(problem)) }
+    finally { commandPending.current = false; if (mounted.current) setBusy(false) }
   }
-  if (!form || !status) return <p className="hint" role="status">{error || 'Opening your local model library…'}</p>
+  if (!form || !status) return <p className="hint" role={error || pollError ? 'alert' : 'status'}>{error || pollError || 'Opening your local model library…'}</p>
   const running = ['running', 'starting', 'stopping', 'installing'].includes(status.state)
   const scanning = discovery?.state === 'scanning', kind = tab === 'runtime' ? 'runtime' : 'model'
   const candidates = (kind === 'runtime' ? discovery?.runtimes : discovery?.models || []) || []
@@ -69,7 +83,7 @@ export function LocalInferenceSettings({ saved }: { saved: (provider: Provider) 
         ? <button type="button" disabled={busy || status.state === 'stopping'} onClick={() => { void command('stop') }}><Square size={13}/>{status.state === 'stopping' ? 'Unloading…' : 'Unload'}</button>
         : <button type="button" className="primary" disabled={locked || !form.model_path} onClick={() => { if (!form.runtime_path) { setTab('runtime'); setSearch(''); setPage(0) } else void command('start') }}><Play size={13}/>{form.runtime_path ? 'Load model' : 'Choose runtime'}</button>}
     </section>
-    {(error || status.error) && <p className="error-text model-studio-error" role="alert">{error || status.error}</p>}
+    {(error || status.error || pollError) && <p className="error-text model-studio-error" role="alert">{error || status.error || pollError}</p>}
     <nav className="model-studio-tabs" aria-label="Local model views">{([['models', 'My models', HardDrive], ['runtime', 'Runtime', Cpu], ['performance', 'Performance', Gauge]] as const).map(([id, label, Icon]) => <button type="button" aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => { setTab(id); setSearch(''); setPage(0) }}><Icon size={14}/>{label}{id === 'models' && <span>{discovery?.models.filter(item => item.valid).length || 0}</span>}</button>)}</nav>
     {tab === 'performance' ? <InferenceTuningPanel /> : <div className="local-model-workspace">
       <section className="local-model-library" aria-label={kind === 'model' ? 'Model library' : 'Runtime library'}>
