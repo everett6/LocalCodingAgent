@@ -784,6 +784,10 @@ class Coordinator:
         if planned is not None:
             task = planned.model_copy(deep=True)
             task.context.previous_findings.append(exploration)
+        return await self._with_task_deadline(task, lambda: self._execute_simple_task(task))
+
+    async def _execute_simple_task(self, task: AgentTask) -> AgentResponse:
+        role = task.role
         # Route against the full inherited task before adding a potentially large
         # repository map. Neither selected context nor tool permissions are removed.
         model = await self._model_for(role, task.model_name, task=task)
@@ -805,7 +809,7 @@ class Coordinator:
             self._emit_task_status(task.task_id, "failed" if response.status == TaskStatus.FAILED else "completed", response.summary[:200])
             return response
         return AgentResponse(
-            task_id=task_id or "simple_task",
+            task_id=task.task_id,
             status=TaskStatus.FAILED,
             summary="No agent is available to execute this task.",
             files_changed=[],
@@ -908,16 +912,71 @@ class Coordinator:
                 await asyncio.gather(*running, return_exceptions=True)
                 raise
 
-        return AgentResponse(
-            task_id="plan_execution",
-            status=TaskStatus.COMPLETED if not dag.has_failures() else TaskStatus.FAILED,
-            summary=dag.get_summary(),
-            files_changed=[],
-            tests_run=[],
-            tests_passed=not dag.has_failures(),
-            issues=[],
-            follow_up_required=dag.has_failures()
-        )
+        return self._aggregate_plan_results(dag)
+
+    @staticmethod
+    def _aggregate_plan_results(dag: TaskDAG) -> AgentResponse:
+        """Keep child evidence in the handoff without growing it with the plan.
+
+        Child observations remain untrusted report data. Completion and an empty
+        check list must not be presented as independent verification.
+        """
+        results = dag.get_all_results()
+        abbreviated = False
+
+        def bounded(values, *, count=200, characters=16000, item_limit=4096, clip=False):
+            nonlocal abbreviated
+            items, seen, used = [], set(), 0
+            for value in values:
+                if len(value) > item_limit:
+                    abbreviated = True
+                    if not clip:
+                        continue  # Never invent a truncated file path/check ID.
+                    value = value[:item_limit - 1] + "…"
+                if value in seen:
+                    continue
+                if len(items) >= count or used + len(value) > characters:
+                    abbreviated = True
+                    break
+                seen.add(value)
+                items.append(value)
+                used += len(value)
+            return items
+
+        files = bounded(path for result in results for path in result.files_changed)
+        checks = bounded(check for result in results for check in result.tests_run)
+        issues = bounded((f"{result.task_id}: {issue}" for result in results for issue in result.issues),
+                         count=100, characters=12000, item_limit=2000, clip=True)
+        discoveries = bounded((detail for result in results for detail in result.discoveries),
+                              count=100, characters=12000, item_limit=2000, clip=True)
+        failed = dag.has_failures()
+        if failed and not issues:
+            issues = ["One or more plan tasks failed; inspect their task observations."]
+        overview = dag.get_summary()
+        if len(overview) > 4000:
+            abbreviated = True
+            overview = overview[:4000]
+        verification = (f"Child task results recorded {len(checks)} distinct checks; "
+                        "these observations are not independent verification."
+                        if checks else "No checks recorded; task completion does not establish verification.")
+        summary = overview + "\n\n" + verification
+        for result in results:
+            text = result.summary[:2000]
+            if len(result.summary) > len(text):
+                abbreviated = True
+            observation = f"\n\nTask {result.task_id[:128]} observations (untrusted):\n{text}"
+            if len(summary) + len(observation) > 15800:
+                abbreviated = True
+                break
+            summary += observation
+        if abbreviated:
+            summary += "\n\nDetails abbreviated to fit the handoff budget; inspect individual task records for the complete evidence."
+        return AgentResponse(task_id="plan_execution",
+            status=TaskStatus.FAILED if failed else TaskStatus.COMPLETED,
+            summary=summary, files_changed=files, tests_run=checks,
+            tests_passed=not failed and all(result.tests_passed for result in results),
+            issues=issues, discoveries=discoveries,
+            follow_up_required=failed or any(result.follow_up_required for result in results))
 
     def _parallelism_for_wave(self, tasks: list[AgentTask]) -> int:
         """Only parallelize mutations when their file scopes are explicit and disjoint."""
@@ -1021,6 +1080,34 @@ class Coordinator:
             return False
 
     async def _attempt_dag_task(self, task: AgentTask, escalate: bool) -> AgentResponse:
+        return await self._with_task_deadline(task, lambda: self._execute_dag_agent(task, escalate))
+
+    async def _with_task_deadline(self, task: AgentTask, execute: Callable) -> AgentResponse:
+        """Bound preparation and execution; an expired attempt is never replayed.
+
+        Cancellation remains cooperative: await the agent/tool cleanup before
+        reporting the blocked outcome. This does not roll back external effects
+        or claim that interrupted mutations completed or were undone.
+        """
+        deadline = asyncio.timeout(task.timeout_seconds)
+        try:
+            async with deadline:
+                response = await execute()
+        except TimeoutError:
+            if not deadline.expired():
+                raise  # A backend timeout is not the host task deadline.
+        else:
+            if not deadline.expired():
+                return response
+        self._emit("ORCHESTRATOR", "task_deadline_exceeded", "Task deadline reached; automatic replay is blocked",
+                   task_id=task.task_id, data={"timeout_seconds": task.timeout_seconds,
+                                             "automatic_retry": False, "recovery_required": True})
+        return AgentResponse(task_id=task.task_id, status=TaskStatus.BLOCKED,
+            summary=(f"Task exceeded its {task.timeout_seconds}-second deadline. Execution was cancelled and cleanup was awaited. "
+                     "Inspect the workspace and pending tool journal before resuming; automatic retry and model escalation are disabled."),
+            tests_passed=False, issues=["Task deadline exceeded; explicit recovery is required"], follow_up_required=True)
+
+    async def _execute_dag_agent(self, task: AgentTask, escalate: bool) -> AgentResponse:
         try:
             drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
             agent = create_agent(
