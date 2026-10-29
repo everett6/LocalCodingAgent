@@ -1,4 +1,4 @@
-# Local Coder desktop manager
+# Clin desktop manager
 
 The main Electron window is the conversation/project manager. The IDE is the
 separate Code OSS source fork in `../ide`; the workspace viewer in the manager
@@ -63,7 +63,7 @@ publisher's own certificates and credentials; no signed release is claimed.
 
 ## This checkout's verified build
 
-The Linux AppImage is `release/Local Coder-0.1.0.AppImage`; the unpacked
+The Linux AppImage is `release/Clin-0.1.0.AppImage`; the unpacked
 application is `release/linux-unpacked/local-coder-desktop`. The bundled engine
 passed authenticated API, built JavaScript asset, and graceful shutdown checks.
 Five desktop bridge/lifecycle tests pass. Windows/macOS packages remain subject

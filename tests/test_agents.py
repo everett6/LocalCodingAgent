@@ -26,13 +26,27 @@ class FakeModel:
         return next(self.responses)
 
 
+def fake_schemas(*tool_names):
+    """Advertise only the capabilities a synthetic registry implements."""
+    properties = {
+        "read_file": {"path": {"type": "string"}},
+        "write_file": {"path": {"type": "string"}, "content": {"type": "string"}},
+        "run_tests": {"test_path": {"type": "string"}},
+        "delegate_task": {},
+    }
+    return [{"type": "function", "function": {
+        "name": name, "parameters": {"type": "object", "properties": properties[name]},
+    }} for name in tool_names]
+
+
 class FakeRegistry:
-    def __init__(self, results):
+    def __init__(self, results, tool_names=("read_file",)):
         self.results = iter(results)
         self.calls = []
+        self.tool_names = tool_names
 
     def get_schemas_for_role(self, role):
-        return [{"type": "function", "function": {"name": "read_file"}}]
+        return fake_schemas(*self.tool_names)
 
     async def execute_tool(self, role, name, arguments):
         self.calls.append((role, name, arguments))
@@ -163,7 +177,7 @@ def test_failed_test_tool_marks_state_failed():
     ])
     agent = LoopAgent(model, FakeRegistry([
         ToolResult(success=False, output="AssertionError: expected 1, got 2"),
-    ]))
+    ], tool_names=("run_tests",)))
 
     response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Fix the app.")))
 
@@ -291,7 +305,7 @@ def test_agent_stops_at_test_run_budget():
     agent = LoopAgent(model, FakeRegistry([
         ToolResult(success=False, output="first failure"),
         ToolResult(success=False, output="second failure"),
-    ]))
+    ], tool_names=("run_tests",)))
     agent.max_test_runs = 1
 
     response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="Test")))
@@ -322,7 +336,7 @@ def test_drafter_prediction_is_injected_and_accepted_when_file_matches():
     registry = FakeRegistry([
         ToolResult(success=True, output="def foo(): pass"),  # read_file for the draft
         ToolResult(success=True, output="written", files_changed=["app.py"]),  # write_file
-    ])
+    ], tool_names=("read_file", "write_file"))
     drafter = FakeDrafter(prediction)
     agent = LoopAgent(model, registry, drafter=drafter)
 

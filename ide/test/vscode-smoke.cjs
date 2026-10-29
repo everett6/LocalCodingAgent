@@ -8,6 +8,6 @@ exports.run=async()=>{
   assert.equal(extension.isActive,true);
   assert.equal(require('node:fs').realpathSync(extension.extensionPath),require('node:fs').realpathSync(process.env.LOCAL_CODER_SMOKE_EXTENSION_PATH));
   const commands=await vscode.commands.getCommands(true);
-  for(const name of ['run','plan','review','security','bugs','configureProvider','cancel','refresh','diff'])assert.ok(commands.includes(`localCoder.${name}`),`Missing ${name}`);
+  for(const name of ['run','plan','review','security','bugs','configureProvider','cancel','refresh','diff','languageContext','snapshotDiff','memoryInspector'])assert.ok(commands.includes(`localCoder.${name}`),`Missing ${name}`);
   await vscode.commands.executeCommand('localCoder.refresh');
 };

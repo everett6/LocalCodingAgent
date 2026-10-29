@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from local_coder.workspace import Workspace
-from local_coder.processes import communicate as _communicate, process_options
+from local_coder.processes import OUTPUT_TRUNCATION_MARKER, communicate as _communicate, process_options
 from local_coder.tools.scan_scope import scan_files
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
@@ -23,6 +23,68 @@ from local_coder.security.triage import (
     BASELINE_FILE, LAST_SCAN_FILE, load_fingerprints, save_fingerprints, triage,
 )
 from local_coder.tools.quality import EXCLUDED_DIRS, find_executable, run_bounded
+
+
+# Structured scanner JSON is not an ordinary human-readable log tail. Retain
+# complete bounded streams and archive the original bytes before parsing them.
+MAX_SCANNER_STREAM_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _ScannerCapture:
+    returncode: int | None
+    stdout: str
+    parsed: dict | None
+    archive_reference: str
+    error: str = ""
+
+
+async def _capture_scanner(project_root: str | Path, engine: str, argv: list[str],
+                           timeout: int, ok_codes: tuple[int, ...] = (0, 1)) -> _ScannerCapture:
+    from local_coder.security.scan_archive import ScanArchive
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=str(project_root), stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, **process_options(),
+    )
+    timed_out = False
+    try:
+        stdout, stderr = await _communicate(proc, timeout=timeout,
+            max_stream_bytes=MAX_SCANNER_STREAM_BYTES, max_total_bytes=MAX_SCANNER_STREAM_BYTES * 2)
+        stdout, stderr = stdout or b"", stderr or b""
+    except asyncio.TimeoutError:
+        stdout, stderr, timed_out = b"", b"", True
+    truncated = any(stream.startswith(OUTPUT_TRUNCATION_MARKER) for stream in (stdout, stderr))
+    disposition = "timeout" if timed_out else "over_limit" if truncated else "complete"
+    reference = await asyncio.to_thread(ScanArchive(project_root).save_capture, engine,
+        {"argv": argv, "timeout_seconds": timeout}, stdout, stderr,
+        returncode=proc.returncode, stream_limit=MAX_SCANNER_STREAM_BYTES,
+        complete=not timed_out and not truncated, disposition=disposition)
+    if timed_out:
+        error = f"{engine} timed out; original scanner output is unavailable and coverage is unknown"
+    elif truncated:
+        error = (f"{engine} exceeded the scanner capture limit ({MAX_SCANNER_STREAM_BYTES} bytes per stream); "
+                 "incomplete JSON was not parsed; narrow the scan")
+    elif proc.returncode not in ok_codes:
+        error = stderr.decode("utf-8", errors="replace").strip()[:2000] or f"{engine} exit code {proc.returncode}"
+    else:
+        try:
+            text = stdout.decode("utf-8")
+            parsed = json.loads(text)
+            if (not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list)
+                    or any(not isinstance(item, dict) for item in parsed["results"])
+                    or not isinstance(parsed.get("errors", []), list)):
+                raise ValueError("Expected scanner object with results and optional errors lists")
+            return _ScannerCapture(proc.returncode, text, parsed, reference)
+        except (ValueError, UnicodeError, RecursionError):
+            error = f"{engine} returned invalid structured JSON; scan coverage is unknown"
+    return _ScannerCapture(proc.returncode, "", None, reference, error)
+
+
+def _capture_failure(engine: str, coverage: dict, capture: _ScannerCapture) -> ToolResult:
+    coverage["status"] = "failed"
+    coverage.setdefault("failed", []).append({"scanner": engine, "reason": capture.error})
+    return ToolResult(success=False, error=capture.error, exit_code=capture.returncode,
+                      data={"coverage": coverage, "scanner_capture_archives": {engine: capture.archive_reference}})
 
 
 class RunSASTTool(Tool):
@@ -51,7 +113,21 @@ class RunSASTTool(Tool):
     def __init__(self, project_root: str):
         self.project_root = Path(project_root).resolve()
 
-    async def execute(
+    async def execute(self, target_path: str = ".", tool: str = "auto", **kwargs: Any) -> ToolResult:
+        from local_coder.security.scan_archive import ScanArchive
+        result = await self._execute(target_path, tool, **kwargs)
+        try:
+            reference = await asyncio.to_thread(ScanArchive(self.project_root).save,
+                                                self.name.value, {"target_path": target_path, "tool": tool}, result)
+        except (OSError, ValueError) as exc:
+            return ToolResult(success=False, error=f"Full scan archive failed: {exc}",
+                              data={"coverage": {"status": "unknown", "failed": ["archive unavailable"]},
+                                    "scanner_capture_archives": result.data.get("scanner_capture_archives", {})})
+        result.data["archive_reference"] = reference
+        result.output += f"\nFull scan archive: {reference}"
+        return result
+
+    async def _execute(
         self,
         target_path: str = ".",
         tool: str = "auto",
@@ -97,9 +173,12 @@ class RunSASTTool(Tool):
                 "total_findings": len(findings),
                 "findings": [dict({"confidence": "heuristic", "verification": "unverified"}, **f) for f in findings],
                 "coverage": coverage,
+                "local_analysis": coverage.pop("local_analysis", {}),
             }
 
             output_text = self._format_findings_markdown(summary)
+            output_text += "\nLocal semantic surface (unverified): " + json.dumps(summary["local_analysis"], ensure_ascii=False)
+            output_text += "\nInput coverage: " + json.dumps(coverage, ensure_ascii=False)
             return ToolResult(
                 success=True,
                 output=output_text + f"\nCoverage: {coverage['status']}. Static candidates require manual verification.",
@@ -119,16 +198,12 @@ class RunSASTTool(Tool):
         if not rules.is_file():
             return None
         cmd = ["semgrep", "scan", "--config", str(rules), "--json", "--quiet", *map(str, files)]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(self.project_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, **process_options(),
-        )
-        stdout, stderr = await _communicate(proc, timeout=60)
-        if proc.returncode in (0, 1):  # 1 indicates findings in semgrep
+        capture = await _capture_scanner(self.project_root, "semgrep", cmd, 60)
+        if capture.error:
+            return _capture_failure("semgrep", coverage, capture)
+        if capture.returncode in (0, 1):
             try:
-                data = json.loads(stdout.decode("utf-8"))
+                data = capture.parsed
                 if data.get("errors"):
                     coverage["skipped"].extend(str(error.get("type", "Scanner error")) for error in data["errors"])
                     coverage["status"] = "partial"
@@ -151,26 +226,22 @@ class RunSASTTool(Tool):
                 return ToolResult(
                     success=True,
                     output=self._format_findings_markdown(summary) + f"\nCoverage: {coverage['status']}",
-                    data={**summary, "coverage": coverage},
-                    exit_code=proc.returncode,
+                    data={**summary, "coverage": coverage, "raw_scan": data,
+                          "scanner_capture_archives": {"semgrep": capture.archive_reference}},
+                    exit_code=capture.returncode,
                 )
-            except Exception:
-                return None
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return _capture_failure("semgrep", coverage, _ScannerCapture(capture.returncode, "", None,
+                    capture.archive_reference, "semgrep results could not be interpreted; coverage is unknown"))
         return None
 
     async def _run_bandit(self, scan_target: Path, files, coverage) -> ToolResult | None:
         cmd = ["bandit", "-f", "json", "-q", *map(str, files)]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(self.project_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, **process_options(),
-        )
-        stdout, stderr = await _communicate(proc, timeout=60)
+        capture = await _capture_scanner(self.project_root, "bandit", cmd, 60)
+        if capture.error:
+            return _capture_failure("bandit", coverage, capture)
         try:
-            data = json.loads(stdout.decode("utf-8"))
-            if proc.returncode not in (0, 1):
-                return None
+            data = capture.parsed
             if data.get("errors"):
                 coverage["skipped"].extend("Bandit could not parse a file" for _ in data["errors"])
                 coverage["status"] = "partial"
@@ -193,23 +264,32 @@ class RunSASTTool(Tool):
             return ToolResult(
                 success=True,
                 output=self._format_findings_markdown(summary) + f"\nCoverage: {coverage['status']}",
-                data={**summary, "coverage": coverage},
-                exit_code=proc.returncode,
+                data={**summary, "coverage": coverage, "raw_scan": data,
+                      "scanner_capture_archives": {"bandit": capture.archive_reference}},
+                exit_code=capture.returncode,
             )
-        except Exception:
-            return None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return _capture_failure("bandit", coverage, _ScannerCapture(capture.returncode, "", None,
+                capture.archive_reference, "bandit results could not be interpreted; coverage is unknown"))
 
     def _run_builtin_sast(self, scan_target: Path, files, coverage) -> list[dict[str, Any]]:
         """Builtin AST-based and pattern security scanner for Python and JS/TS."""
         findings: list[dict[str, Any]] = []
-
-
+        coverage.update(reviewed=[], failed=[], unknown=[])
+        coverage["local_analysis"] = {"entry_points": [], "authorization_traces": [],
+                                      "vulnerability_classes": [], "gaps": []}
         for file_path in files:
+            relative = file_path.relative_to(self.project_root).as_posix()
             if file_path.suffix == ".py":
                 findings.extend(self._scan_python_file(file_path, coverage))
-            elif file_path.suffix in (".js", ".jsx", ".ts", ".tsx"):
-                findings.extend(self._scan_js_file(file_path))
-
+            else:
+                if file_path.suffix in (".js", ".jsx", ".ts", ".tsx"):
+                    findings.extend(self._scan_js_file(file_path))
+                coverage["unknown"].append({"path": relative,
+                    "reason": "Semantic tracing supports Python only; other languages and formats require review"})
+                coverage["status"] = "partial"
+        if not coverage["reviewed"]:
+            coverage["status"] = "partial"
         return findings
 
     def _is_ignored(self, path: Path) -> bool:
@@ -222,13 +302,37 @@ class RunSASTTool(Tool):
             rel_path = str(file_path.relative_to(self.project_root))
             content = file_path.read_text(encoding="utf-8", errors="replace")
             ast.parse(content, filename=str(file_path))
-        except (OSError, UnicodeError, SyntaxError, ValueError) as exc:
+        except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError) as exc:
+            coverage.setdefault("failed", []).append({"path": str(file_path.relative_to(self.project_root)), "reason": type(exc).__name__})
             coverage["skipped"].append(f"{file_path.name}: {type(exc).__name__}")
             coverage["status"] = "partial"
             return findings
 
         from local_coder.tools.detection import python_candidates
-        return python_candidates(content, rel_path)
+        from local_coder.security.local_analysis import analyze_unit
+        from local_coder.security_analysis import AnalysisLimit
+        try:
+            analysis = analyze_unit(content, rel_path)
+            findings = python_candidates(content, rel_path)
+        except (AnalysisLimit, RecursionError) as exc:
+            coverage.setdefault("failed", []).append({"path": rel_path, "reason": type(exc).__name__})
+            coverage["skipped"].append(f"{rel_path}: {type(exc).__name__}")
+            coverage["status"] = "partial"
+            return []
+        coverage.setdefault("reviewed", []).append(rel_path)
+        aggregated = coverage.setdefault("local_analysis", {"entry_points": [], "authorization_traces": [],
+                                                           "vulnerability_classes": [], "gaps": []})
+        for key in aggregated:
+            for observation in analysis[key]:
+                if observation not in aggregated[key]:
+                    aggregated[key].append(observation)
+        for finding in findings:
+            function = analysis["functions"].get(finding.get("function"), {})
+            finding["semantic_trace"] = {"language": "python", "sources": finding.get("source_trace", []),
+                "transforms": [item for item in function.get("transforms", []) if item["line"] < finding["line"]],
+                "guards": function.get("guards", []), "sink": finding["sink"],
+                "gaps": analysis["gaps"], "verification": "unverified"}
+        return findings
 
     def _scan_js_file(self, file_path: Path) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
@@ -290,7 +394,7 @@ class RunSASTTool(Tool):
     def _format_findings_markdown(self, summary: dict[str, Any]) -> str:
         findings = summary.get("findings", [])
         if not findings:
-            return f"### SAST Scan: Static review\nEngine: `{summary.get('engine')}`\nTarget: `{summary.get('scanned_path')}`\nNo matching static candidates detected; runtime exploitability was not checked."
+            return f"### SAST Scan: Static review\nEngine: `{summary.get('engine')}`\nTarget: `{summary.get('scanned_path')}`\nNo matching static candidates detected; runtime exploitability was not checked. Empty output does not prove safety."
 
         md = [
             f"### SAST Security Report ({len(findings)} findings)",
@@ -312,7 +416,7 @@ class RunSASTTool(Tool):
             md.append(f"\n**{idx}. [{f.get('severity')}] {f.get('rule_id')}** in `{f.get('file')}:{f.get('line')}`")
             md.append(f"> {f.get('message')}")
             if f.get("sink"):
-                evidence = {key: f[key] for key in ("source_trace", "sink", "function", "callers", "guards", "decorators", "preconditions", "coverage_limits") if key in f}
+                evidence = {key: f[key] for key in ("source_trace", "semantic_trace", "sink", "function", "callers", "guards", "decorators", "preconditions", "coverage_limits") if key in f}
                 md.append("Static evidence (untrusted; reachability and guard efficacy require review):")
                 md.append("```json\n" + json.dumps(evidence, ensure_ascii=False) + "\n```")
             if f.get("code"):
@@ -749,15 +853,20 @@ class SecurityScanTool(Tool):
         self.project_root = project_root
         self.timeout = timeout
 
-    async def _run_json(self, argv: list[str], ok_codes: tuple[int, ...]) -> tuple[str | None, str]:
-        """Run a scanner and return (stdout, error message)."""
-        completed = await run_bounded(argv, self.project_root, self.timeout)
-        if completed is None:
-            return None, f"timed out after {self.timeout} seconds"
-        returncode, stdout, stderr = completed
-        if returncode not in ok_codes:
-            return None, (stderr.decode(errors="replace").strip() or f"exit code {returncode}")[:2000]
-        return stdout.decode(errors="replace"), ""
+    async def _run_json(self, argv: list[str], ok_codes: tuple[int, ...],
+                        captures: dict[str, str] | None = None, *,
+                        engine: str | None = None) -> tuple[str | None, str]:
+        """Retain the two-value caller contract while archiving raw process bytes."""
+        # The caller knows the scanner even when its executable has a project-local name.
+        label = engine or Path(argv[0]).name
+        capture = await _capture_scanner(self.project_root, label, argv, self.timeout, ok_codes)
+        if captures is not None:
+            captures[label] = capture.archive_reference
+        if capture.error:
+            return None, capture.error
+        errors = (capture.parsed or {}).get('errors', [])
+        return capture.stdout, (f'{label} reported {len(errors)} scanner errors; coverage is incomplete; '
+                                f'original evidence: {capture.archive_reference}' if errors else '')
 
     @staticmethod
     def _remember_scan(root: Path, fingerprints: set[str]) -> None:
@@ -774,6 +883,20 @@ class SecurityScanTool(Tool):
         return next((name for name in SEMGREP_CONFIGS if (root / name).exists()), None)
 
     async def execute(self, paths: list[str] | None = None, scanners: list[str] | None = None, **kwargs: Any) -> ToolResult:
+        from local_coder.security.scan_archive import ScanArchive
+        result = await self._execute(paths, scanners, **kwargs)
+        try:
+            reference = await asyncio.to_thread(ScanArchive(self.project_root).save, self.name.value,
+                                                {"paths": paths, "scanners": scanners}, result)
+        except (OSError, ValueError) as exc:
+            return ToolResult(success=False, error=f"Full baseline scan archive failed: {exc}",
+                              data={"coverage": {"status": "unknown", "failed": ["archive unavailable"]},
+                                    "scanner_capture_archives": result.data.get("scanner_capture_archives", {})})
+        result.data["archive_reference"] = reference
+        result.output += f"\nFull baseline scan archive: {reference}"
+        return result
+
+    async def _execute(self, paths: list[str] | None = None, scanners: list[str] | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
         try:
             workspace = Workspace(self.project_root)
@@ -793,6 +916,8 @@ class SecurityScanTool(Tool):
             ran: list[str] = []
             notes: list[str] = []
             errors: list[str] = []
+            scanner_outputs: dict[str, str] = {}
+            scanner_capture_archives: dict[str, str] = {}
 
             if "secrets" in requested:
                 targets = [workspace.resolve(p) for p in rel_paths]
@@ -805,10 +930,14 @@ class SecurityScanTool(Tool):
                     (errors if explicit else notes).append("bandit is not installed (pip install bandit)")
                 else:
                     # bandit exits 1 when it reports issues; that is not a failure.
-                    out, err = await self._run_json([bandit, "-r", "-f", "json", "-q", *args], (0, 1))
+                    out, err = await self._run_json([bandit, "-r", "-f", "json", "-q", *args], (0, 1),
+                                                    scanner_capture_archives, engine="bandit")
                     if out is None:
                         errors.append(f"bandit failed: {err}")
                     else:
+                        scanner_outputs["bandit"] = out
+                        if err:
+                            errors.append(err)
                         findings += parse_bandit(out)
                         ran.append("bandit")
 
@@ -824,10 +953,14 @@ class SecurityScanTool(Tool):
                 else:
                     out, err = await self._run_json(
                         [semgrep, "scan", "--config", config, "--json", "--metrics=off", "--quiet", *args], (0, 1),
+                        scanner_capture_archives, engine="semgrep",
                     )
                     if out is None:
                         errors.append(f"semgrep failed: {err}")
                     else:
+                        scanner_outputs["semgrep"] = out
+                        if err:
+                            errors.append(err)
                         findings += parse_semgrep(out)
                         ran.append("semgrep")
 
@@ -835,6 +968,7 @@ class SecurityScanTool(Tool):
             triaged = triage(
                 findings, root, LessonStore(root).suppressions(), load_fingerprints(root / BASELINE_FILE),
             )
+            original_findings = [f.__dict__.copy() for f in findings]
             findings = triaged.findings
             self._remember_scan(root, set(triaged.fingerprints.values()))
 
@@ -856,6 +990,12 @@ class SecurityScanTool(Tool):
             return ToolResult(
                 success=not errors and bool(ran),
                 output="\n".join(lines),
+                data={"findings": original_findings, "scanner_outputs": scanner_outputs,
+                      "scanner_capture_archives": scanner_capture_archives,
+                      "suppressed": [f.__dict__.copy() for f, _ in triaged.suppressed],
+                      "coverage": {"reviewed": ran, "skipped": notes, "failed": errors,
+                                   "unknown": ["Scanner completion does not establish per-file semantic coverage"],
+                                   "status": "partial" if errors or notes else "scanner_completed"}},
                 duration_ms=int((time.time() - start_t) * 1000),
             )
         except Exception as e:

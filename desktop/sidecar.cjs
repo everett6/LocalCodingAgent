@@ -4,8 +4,23 @@ const { discoverEngine } = require('./discovery.cjs');
 function isAllowedApiRequest(path, method) {
   if (typeof path !== 'string' || path.length > 4096 || !path.startsWith('/') || path.startsWith('//') || /[\\#\r\n]/.test(path)) return false;
   const pathname = path.split('?')[0];
-  if (method === 'GET') return ['/status', '/settings', '/events', '/workspace', '/diff', '/file', '/files', '/sessions', '/engagements', '/inference', '/security-playbooks'].includes(pathname) || /^\/engagements\/eng-[a-f0-9]{12}(\/report)?$/.test(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+$/.test(pathname);
-  if (method === 'POST') return ['/settings', '/jobs', '/engagements', '/inference/configure', '/inference/start', '/inference/stop', '/inference/install-runtime'].includes(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(pathname);
+  if (pathname === '/undo') return path === pathname && method === 'POST';
+  if (pathname === '/integrations/search/doctor') return path === pathname && ['GET', 'POST'].includes(method);
+  if (pathname === '/context/debugger') return path === pathname && method === 'GET';
+  if (pathname === '/status' && path.includes('?summary')) return path === '/status?summary=1' && method === 'GET';
+  if (method === 'GET' && ['/evaluations', '/findings', '/memory/retrievals', '/context/accounting', '/research/advisories/updates', '/inference/tuning/history', '/doctor'].includes(pathname)) return true;
+  if (method === 'GET' && (/^\/evaluations\/[a-f0-9]{32}$/.test(pathname) || /^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}$/.test(pathname) || /^\/findings\/[a-f0-9]{24}$/.test(pathname) || /^\/memory\/retrievals\/[a-f0-9]{32}$/.test(pathname))) return true;
+  if (method === 'POST' && ['/evaluations/run', '/evaluations/model/run', '/evaluations/heldout/run', '/context/tokenizer', '/research/advisories/update', '/inference/tuning/start', '/inference/tuning/apply', '/doctor/repair'].includes(pathname)) return true;
+  if (method === 'POST' && (/^\/(evaluations|findings|inference\/tuning)\/jobs\/[a-f0-9]{32}\/cancel$/.test(pathname) || /^\/findings\/[a-f0-9]{24}\/(review|prepare|verify|suppress|reopen)$/.test(pathname))) return true;
+  if (method === 'GET' && ['/research/capabilities', '/research/evidence', '/research/report', '/research/dependencies', '/research/advisories', '/memory/structure'].includes(pathname)) return true;
+  if (method === 'POST' && ['/research/audit', '/research/sarif/import', '/research/advisories/import'].includes(pathname)) return true;
+  if (method === 'GET') return ['/goals', '/bug-hunting/models', '/status', '/settings', '/events', '/workspace', '/diff', '/file', '/files', '/sessions', '/engagements', '/engagements/defaults', '/inference', '/inference/discovery', '/providers/models', '/providers/usage', '/providers/quota', '/providers/profiles', '/security-playbooks', '/memory', '/memory/status', '/memory/search', '/harness', '/snapshots', '/approvals', '/integrations/mcp', '/integrations/skills', '/language/status'].includes(pathname)
+    || /^\/engagements\/eng-[a-f0-9]{12}(\/report)?$/.test(pathname) || /^\/jobs\/[a-zA-Z0-9_-]+$/.test(pathname)
+    || /^\/snapshots\/[a-f0-9]{32}\/diff$/.test(pathname) || /^\/integrations\/skills\/[a-z][a-z0-9-]{0,63}$/.test(pathname);
+  if (method === 'POST') return ['/goals', '/goals/update', '/bug-hunting/models', '/settings', '/jobs', '/engagements', '/engagements/defaults', '/providers/discover', '/providers/profiles/save', '/inference/discover', '/inference/discovery/cancel', '/inference/discovery/select', '/inference/configure', '/inference/start', '/inference/stop', '/inference/install-runtime', '/memory/index', '/harness/configure', '/harness/probe-sandbox', '/integrations/mcp/configure', '/integrations/mcp/probe', '/integrations/skills/save', '/language/context', '/language/configure'].includes(pathname)
+    || /^\/jobs\/[a-zA-Z0-9_-]+\/cancel$/.test(pathname) || /^\/memory\/[a-f0-9]{32}\/(update|delete)$/.test(pathname)
+    || /^\/snapshots\/[a-f0-9]{32}\/restore$/.test(pathname) || /^\/approvals\/[a-f0-9]{32}\/respond$/.test(pathname)
+    || /^\/providers\/profiles\/[a-f0-9]{32}\/(select|delete)$/.test(pathname);
   return false;
 }
 class Sidecar {

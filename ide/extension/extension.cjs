@@ -4,8 +4,10 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {EngineConnection,validateJob,validateProvider}=require('./engine.cjs');
+const {registerHarnessViews}=require('./harness-views.cjs');
 let active;
 const presets=[
+  {label:'OpenRouter · full model catalog',backend:'openai_compatible',model_id:'',base_url:'https://openrouter.ai/api/v1',profile:'generic',api_key_env:'OPENROUTER_API_KEY',max_tokens:4096,catalog:true},
   {label:'DeepSeek V4.1 Flash · OpenRouter',backend:'openai_compatible',model_id:'deepseek/deepseek-v4.1-flash-1017',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_deepseek',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
   {label:'GLM 5.3 · OpenRouter',backend:'openai_compatible',model_id:'z-ai/glm-5.3',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_glm',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
   {label:'Kimi K3.1 Pro · OpenRouter',backend:'openai_compatible',model_id:'moonshotai/kimi-k3.1-pro',base_url:'https://openrouter.ai/api/v1',profile:'openrouter_kimi',api_key_env:'OPENROUTER_API_KEY',max_tokens:16384,context_length:1048576},
@@ -20,7 +22,7 @@ function keyID(provider){return `provider:${crypto.createHash('sha256').update(J
 function activate(context){
   const services=new Map();
   const changed=new vscode.EventEmitter();
-  const output=vscode.window.createOutputChannel('Local Coder Activity');
+  const output=vscode.window.createOutputChannel('Clin Activity');
   let disposed=false,refreshing=false;
   const documents=new Map();
   let documentID=0;
@@ -33,7 +35,7 @@ function activate(context){
     await vscode.window.showTextDocument(doc,{preview:true});
   }
   context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc=>documents.delete(doc.uri.toString())));
-  function trusted(){if(!vscode.workspace.isTrusted)throw new Error('Trust this workspace before starting the Local Coder engine');}
+  function trusted(){if(!vscode.workspace.isTrusted)throw new Error('Trust this workspace before starting the Clin engine');}
   async function chooseFolder(){
     trusted();
     const folders=(vscode.workspace.workspaceFolders||[]).filter(folder=>folder.uri.scheme==='file');
@@ -68,6 +70,7 @@ function activate(context){
     })().catch(async error=>{services.delete(folder.uri.fsPath);await engine.stop();throw error;});
     return entry.ready;
   }
+  registerHarnessViews(vscode,context,async()=>{const folder=await chooseFolder();return folder?service(folder):undefined;});
   const tree={onDidChangeTreeData:changed.event,getTreeItem:item=>item,getChildren:async item=>{
     if(!item)return (vscode.workspace.workspaceFolders||[]).filter(folder=>folder.uri.scheme==='file').map(folder=>{
       const node=new vscode.TreeItem(folder.name,vscode.TreeItemCollapsibleState.Expanded);node.folder=folder;node.contextValue='localCoder.workspace';
@@ -108,13 +111,13 @@ function activate(context){
       changed.fire();
     }finally{refreshing=false;}
   }
-  const register=(command,handler)=>context.subscriptions.push(vscode.commands.registerCommand(command,async(...args)=>{try{return await handler(...args);}catch(error){vscode.window.showErrorMessage(`Local Coder: ${error.message}`);}}));
+  const register=(command,handler)=>context.subscriptions.push(vscode.commands.registerCommand(command,async(...args)=>{try{return await handler(...args);}catch(error){vscode.window.showErrorMessage(`Clin: ${error.message}`);}}));
   async function startJob(mode,action){
     const folder=await chooseFolder();if(!folder)return;
     const entry=await service(folder);
     const configured=await entry.engine.request('/settings');
     if(!configured.provider){await configureProvider(folder);if(!(await entry.engine.request('/settings')).provider)return;}
-    const request=await vscode.window.showInputBox({title:`Local Coder · ${mode.replace('_',' ')}`,prompt:action==='review'?'What should the review focus on?':'Describe the task',value:action==='review'?'Review the current workspace changes for correctness, bugs, and security issues.':'',ignoreFocusOut:true});
+    const request=await vscode.window.showInputBox({title:`Clin · ${mode.replace('_',' ')}`,prompt:action==='review'?'What should the review focus on?':'Describe the task',value:action==='review'?'Review the current workspace changes for correctness, bugs, and security issues.':'',ignoreFocusOut:true});
     if(!request?.trim())return;
     if(mode==='red_team'){
       const listing=await entry.engine.request('/engagements');
@@ -148,14 +151,34 @@ function activate(context){
   }
   async function configureProvider(givenFolder){
     const folder=givenFolder||await chooseFolder();if(!folder)return;
-    const preset=await vscode.window.showQuickPick(presets,{placeHolder:'Choose your provider (model access and billing are supplied by your account)'});if(!preset)return;
-    const model_id=await vscode.window.showInputBox({title:'Provider model ID',value:preset.model_id,prompt:'Exact model ID enabled on your account'});if(model_id===undefined)return;
-    const base_url=await vscode.window.showInputBox({title:'Provider endpoint',value:preset.base_url,prompt:'HTTPS endpoint, or HTTP on localhost for a local model'});if(base_url===undefined)return;
+    let preset=await vscode.window.showQuickPick(presets,{placeHolder:'Choose your provider (model access and billing are supplied by your account)'});if(!preset)return;
+    let catalogModel;
+    if(preset.catalog){
+      const entry=await service(folder);
+      let models=[];
+      try{
+        const catalog=await entry.engine.request('/providers/models?source=openrouter');
+        models=Array.isArray(catalog.models)?catalog.models.filter(item=>typeof item.id==='string'&&item.id.length>0&&item.id.length<=200&&!/[\x00-\x1f]/.test(item.id)):[];
+      }catch{vscode.window.showInformationMessage('The model catalog is unavailable. You can enter an exact model ID manually.');}
+      if(models.length){
+        const chosen=await vscode.window.showQuickPick([{label:'Enter a model ID manually',manual:true},...models.map(model=>({label:typeof model.name==='string'?model.name.slice(0,200):model.id,description:model.id,detail:[Number.isInteger(model.context_length)?`${model.context_length.toLocaleString()} context tokens`:null,Number.isInteger(model.max_output_tokens)?`${model.max_output_tokens.toLocaleString()} output tokens`:null,model.is_free?'Free model':null].filter(Boolean).join(' · '),model}))],{title:'OpenRouter models',placeHolder:'Search the full catalog by model name or ID',matchOnDescription:true,matchOnDetail:true});
+        if(!chosen)return;
+        catalogModel=chosen.model;
+        if(catalogModel){
+          const validProfiles=['generic','glm53','qwen38','openrouter_deepseek','openrouter_glm','openrouter_kimi'];
+          preset={...preset,model_id:catalogModel.id,profile:validProfiles.includes(catalogModel.profile)?catalogModel.profile:'generic',...(Number.isInteger(catalogModel.context_length)&&catalogModel.context_length>=1024?{context_length:Math.min(catalogModel.context_length,2000000)}:{})};
+        }
+      }
+    }
+    const model_id=catalogModel?preset.model_id:await vscode.window.showInputBox({title:'Provider model ID',value:preset.model_id,prompt:'Exact model ID enabled on your account'});if(model_id===undefined)return;
+    const base_url=catalogModel?preset.base_url:await vscode.window.showInputBox({title:'Provider endpoint',value:preset.base_url,prompt:'HTTPS endpoint, or HTTP on localhost for a local model'});if(base_url===undefined)return;
     const profiles=[{label:'Standard harness',value:'generic'},{label:'GLM 5.3 reasoning harness',value:'glm53'},{label:'Qwen 3.8 thinking and tools harness',value:'qwen38'},{label:'OpenRouter DeepSeek harness',value:'openrouter_deepseek'},{label:'OpenRouter GLM harness',value:'openrouter_glm'},{label:'OpenRouter Kimi harness',value:'openrouter_kimi'}];
     profiles.sort((a,b)=>Number(b.value===preset.profile)-Number(a.value===preset.profile));
-    const profile=await vscode.window.showQuickPick(profiles,{placeHolder:'Choose the model harness',ignoreFocusOut:true});if(!profile)return;
+    const profile=catalogModel?profiles.find(item=>item.value===preset.profile):await vscode.window.showQuickPick(profiles,{placeHolder:'Choose the model harness',ignoreFocusOut:true});if(!profile)return;
     const budget=await vscode.window.showInputBox({title:'Maximum output tokens',value:String(preset.max_tokens),validateInput:value=>Number.isInteger(Number(value))&&Number(value)>=128&&Number(value)<=32768?undefined:'Enter an integer from 128 to 32768'});if(budget===undefined)return;
-    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget),...(preset.context_length?{context_length:preset.context_length}:{})});
+    const metadata={auto_context:true,...(catalogModel?{context_source:'openrouter'}:{})};
+    for(const key of ['input_cost_per_million','output_cost_per_million','request_cost_usd'])if(catalogModel&&typeof catalogModel[key]==='number'&&Number.isFinite(catalogModel[key])&&catalogModel[key]>=0)metadata[key]=catalogModel[key];
+    const provider=validateProvider({backend:preset.backend,model_id,base_url,profile:profile.value,max_tokens:Number(budget),...(preset.context_length?{context_length:preset.context_length}:{}),...metadata});
     const api_key_env=await vscode.window.showInputBox({title:'Optional API key environment variable',prompt:'Leave blank to use a saved or pasted key; the engine process must inherit this variable',value:preset.api_key_env||''});if(api_key_env===undefined)return;
     if(api_key_env&&!/^[A-Za-z_][A-Za-z0-9_]*$/.test(api_key_env))throw new Error('Enter a valid environment variable name');
     if(api_key_env)provider.api_key_env=api_key_env;
@@ -165,7 +188,7 @@ function activate(context){
     await entry.engine.request('/settings','POST',{...provider,...(api_key?{api_key}:{})});
     if(api_key)await context.secrets.store(keyID(provider),api_key);
     await context.globalState.update(configKey(folder),provider);
-    vscode.window.showInformationMessage(`Local Coder connected to ${model_id} with the ${profile.value} harness.`);
+    vscode.window.showInformationMessage(`Clin connected to ${model_id} with the ${profile.value} harness.`);
     await refresh();
   }
   register('localCoder.run',()=>startJob('coding','run'));
@@ -197,11 +220,11 @@ function activate(context){
     try{
       const updater=require('./update.cjs');
       const release=await updater.latest();
-      if(!release){if(manual)vscode.window.showInformationMessage('No validated Local Coder IDE release is published yet.');return;}
-      if(manual&&await vscode.window.showInformationMessage('Install the latest validated Local Coder IDE fork? Restart the IDE after installation.', 'Install')!=='Install')return;
+      if(!release){if(manual)vscode.window.showInformationMessage('No validated Clin IDE release is published yet.');return;}
+      if(manual&&await vscode.window.showInformationMessage('Install the latest validated Clin IDE fork? Restart the IDE after installation.', 'Install')!=='Install')return;
       const installed=await updater.install(release);
-      if(installed)vscode.window.showInformationMessage('Local Coder IDE updated. Restart the IDE to use the new version. Your previous installation is retained beside the current app.');
-      else if(manual)vscode.window.showInformationMessage('Local Coder IDE is already up to date.');
+      if(installed)vscode.window.showInformationMessage('Clin IDE updated. Restart the IDE to use the new version. Your previous installation is retained beside the current app.');
+      else if(manual)vscode.window.showInformationMessage('Clin IDE is already up to date.');
     }catch(error){if(manual)vscode.window.showErrorMessage(error.message);else output.appendLine(`IDE update: ${error.message}`);}
     finally{updateBusy=false;}
   }

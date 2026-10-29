@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import OrderedDict
 from typing import Any
@@ -25,6 +26,13 @@ def prompt_cache_key(config: ModelConfig, messages: list[Message]) -> str:
     hasher.update(config.model_id.encode())
     hasher.update(b"\x00")
     hasher.update(config.backend.value.encode())
+    # Shared helper caches must not reuse a result from another endpoint or
+    # generation policy. Credentials and accounting-only fields stay out.
+    hasher.update(b"\x00")
+    hasher.update(json.dumps({
+        field: getattr(config, field, None)
+        for field in ("base_url", "temperature", "max_tokens", "context_length", "profile")
+    }, sort_keys=True, separators=(",", ":")).encode())
     for message in messages:
         hasher.update(b"\x00")
         hasher.update(message.model_dump_json().encode())

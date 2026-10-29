@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict, deque
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
@@ -28,8 +28,9 @@ class AgentEvent:
         data: Optional[dict] = None,
         task_id: Optional[str] = None,
         timestamp: Optional[float] = None,
+        id: Optional[str] = None,
     ):
-        self.id = str(uuid.uuid4())
+        self.id = id if id is not None else str(uuid.uuid4())
         self.source = source
         self.event_type = event_type
         self.message = message
@@ -95,37 +96,49 @@ class EventBus(ABC):
 class InMemoryEventBus(EventBus):
     """In-memory event bus with support for async handlers and task-scoped filtering."""
     
-    def __init__(self):
+    def __init__(
+        self, *, max_task_events: int = 1000, max_tasks: int = 1000,
+        max_all_events: int = 1000,
+    ):
+        for value in (max_task_events, max_tasks, max_all_events):
+            if type(value) is not int or value < 1:
+                raise ValueError("Event history bounds must be positive integers")
         # event_type -> list of (handler, priority)
         self._handlers: Dict[str, List[tuple[Callable[[AgentEvent], None], int]]] = defaultdict(list)
-        # task_id -> list of events (for replay)
-        self._task_events: Dict[str, List[AgentEvent]] = defaultdict(list)
+        # Recently active tasks retain bounded tails; oldest tasks are evicted.
+        self._task_events: OrderedDict[str | None, deque[AgentEvent]] = OrderedDict()
+        self._max_task_events = max_task_events
+        self._max_tasks = max_tasks
         # All events for replay/debugging (limited size)
-        self._all_events: List[AgentEvent] = []
-        self._max_all_events = 1000
+        self._all_events: deque[AgentEvent] = deque(maxlen=max_all_events)
         self._lock = asyncio.Lock()
     
     async def emit(self, event: AgentEvent) -> None:
         """Emit an event to all registered handlers."""
         async with self._lock:
+            if event.task_id not in self._task_events:
+                self._task_events[event.task_id] = deque(maxlen=self._max_task_events)
             self._task_events[event.task_id].append(event)
+            self._task_events.move_to_end(event.task_id)
+            if len(self._task_events) > self._max_tasks:
+                self._task_events.popitem(last=False)
             self._all_events.append(event)
-            if len(self._all_events) > self._max_all_events:
-                self._all_events = self._all_events[-self._max_all_events:]
             
-            # Notify handlers for this event type
-            handlers = self._handlers.get(event.event_type, [])
-            for handler, priority in sorted(handlers, key=lambda x: -x[1]):
-                try:
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(event)
-                    else:
-                        handler(event)
-                except Exception as e:
-                    # Log error but don't crash the bus
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.error(f"Error in event handler for {event.event_type}: {e}")
+            # Freeze delivery order before callbacks may change subscriptions.
+            handlers = sorted(self._handlers.get(event.event_type, []), key=lambda x: -x[1])
+        # Callbacks can subscribe, unsubscribe or emit nested events. None of
+        # those operations may wait for a lock held by their own emitter.
+        for handler, priority in handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(event)
+                else:
+                    handler(event)
+            except Exception as e:
+                # Log error but don't crash the bus
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error in event handler for {event.event_type}: {e}")
     
     async def on(self, event_type: str, handler: Callable[[AgentEvent], None], priority: int = 0) -> None:
         """Register a handler for a specific event type."""
@@ -145,8 +158,10 @@ class InMemoryEventBus(EventBus):
     
     async def get_recent(self, task_id: str, limit: int = 50) -> List[AgentEvent]:
         """Get recent events for a task."""
-        events = self._task_events.get(task_id, [])
-        return events[-limit:] if len(events) > limit else events
+        if limit <= 0:
+            return []
+        async with self._lock:
+            return list(self._task_events.get(task_id, ()))[-limit:]
 
 
 class WebSocketEventBus:
@@ -178,7 +193,7 @@ class WebSocketEventBus:
         })
         
         disconnected: Set["WebSocketClient"] = set()
-        for client in self._ws_clients:
+        for client in tuple(self._ws_clients):
             try:
                 await client.send(message)
             except Exception:
@@ -199,19 +214,58 @@ class WebSocketEventBus:
 class WebSocketClient:
     """Wrapper for a WebSocket connection."""
     
-    def __init__(self, ws_connection):
+    def __init__(
+        self, ws_connection, *, max_queue_size: int = 256,
+        max_message_bytes: int = 1_000_000,
+    ):
+        for value in (max_queue_size, max_message_bytes):
+            if type(value) is not int or value < 1:
+                raise ValueError("WebSocket bounds must be positive integers")
         self._ws = ws_connection
-        self._send_queue: asyncio.Queue = asyncio.Queue()
+        self._send_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max_queue_size)
+        self._max_message_bytes = max_message_bytes
+        self._failed = False
         self._task: asyncio.Task | None = None
     
     async def send(self, message: str) -> None:
         """Send a message over the WebSocket."""
-        await self._send_queue.put(message)
+        # Never silently lose an event or stall the emitter behind a slow
+        # client. Overflow invalidates this subscription; the broadcaster
+        # removes it and the send loop closes its socket for explicit resync.
+        if self._failed:
+            raise BufferError("WebSocket event queue overflow; reconnect to resync")
+        if len(message) > self._max_message_bytes or len(message.encode("utf-8")) > self._max_message_bytes:
+            await self._overflow()
+            raise BufferError("WebSocket message exceeds limit; reconnect to resync")
+        try:
+            self._send_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            await self._overflow()
+            raise BufferError("WebSocket event queue overflow; reconnect to resync") from None
+
+    async def _overflow(self) -> None:
+        self._failed = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+        await self._close()
+
+    async def _close(self) -> None:
+        close = getattr(self._ws, "close", None)
+        if close is not None:
+            try:
+                await asyncio.wait_for(
+                    close(code=1013, reason="Event stream interrupted; reconnect to resync"),
+                    timeout=1,
+                )
+            except Exception:
+                pass
     
     async def start(self) -> None:
         """Start the send loop for this WebSocket client."""
         if self._task and not self._task.done():
             return
+        if self._failed:
+            raise BufferError("WebSocket event queue overflow; reconnect to resync")
         self._task = asyncio.create_task(self._send_loop())
     
     async def _send_loop(self) -> None:
@@ -224,10 +278,14 @@ class WebSocketClient:
                 await self._ws.send(message)
         except Exception:
             pass  # Connection closed
+        finally:
+            self._failed = True
+            # Standard websocket adapters support close(code, reason).
+            await self._close()
     
     def closed(self) -> bool:
         """Check if the WebSocket is closed."""
-        return getattr(self._ws, 'closed', True)
+        return self._failed or getattr(self._ws, 'closed', True)
 
 
 # Convenience function for common event types

@@ -39,7 +39,8 @@ def test_summary_checkpoint_restores_counters_and_original_archived_evidence(tmp
             turn("run_tests", "Verified summary."),
             ProcessCrash(),
         ])
-        agent = HarnessAgent(model, Registry(runtime, [ToolResult(success=True, output="ok")] * 3),
+        agent = HarnessAgent(model, Registry(runtime, [ToolResult(success=True, output="ok")] * 3,
+                                             tool_names=("run_tests",)),
                              context_window_chars=3200, compact_context_chars=2200)
         with pytest.raises(ProcessCrash):
             await agent.execute(task)

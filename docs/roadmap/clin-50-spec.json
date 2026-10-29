@@ -1,0 +1,255 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": 1,
+      "title": "Complete plan fidelity",
+      "acceptance": "Single-task execution retains objective, role, files, constraints, dependencies, success criteria and model selection."
+    },
+    {
+      "id": 2,
+      "title": "Original scan archives",
+      "acceptance": "Full baseline scan evidence is archived before bounded prompt extraction and recoverable by reference."
+    },
+    {
+      "id": 3,
+      "title": "Honest coverage",
+      "acceptance": "Reports distinguish reviewed, skipped, failed and unknown inputs; empty output never proves safety."
+    },
+    {
+      "id": 4,
+      "title": "Occurrence identities",
+      "acceptance": "Same-rule findings at separate locations retain separate stable identities with migration compatibility."
+    },
+    {
+      "id": 5,
+      "title": "Suppression preservation",
+      "acceptance": "Imports and synchronization retain false-positive/suppression decisions."
+    },
+    {
+      "id": 6,
+      "title": "Enforced write scopes",
+      "acceptance": "Parallel writer tools enforce inherited canonical write scopes; unconfined process tools cannot run concurrently."
+    },
+    {
+      "id": 7,
+      "title": "Verification freshness",
+      "acceptance": "Verification fingerprints source, dependency manifests, configuration and fixture changes and invalidates stale proof."
+    },
+    {
+      "id": 8,
+      "title": "Acceptance evidence",
+      "acceptance": "Acceptance criteria have observed checks or explicit unresolved status; model assertion alone never completes a goal."
+    },
+    {
+      "id": 9,
+      "title": "Mutation interruption",
+      "acceptance": "Crash-boundary tests prove unknown mutation completion cannot replay automatically."
+    },
+    {
+      "id": 10,
+      "title": "Streaming output bounds",
+      "acceptance": "Subprocess stdout/stderr are drained with bounded memory while the full child lifecycle remains controlled."
+    },
+    {
+      "id": 11,
+      "title": "Fresh Python verification",
+      "acceptance": "Same-second same-size Python edits cannot reuse stale test bytecode."
+    },
+    {
+      "id": 12,
+      "title": "Bounded event history",
+      "acceptance": "Per-task histories and websocket queues have enforced bounds and truthful overflow behavior."
+    },
+    {
+      "id": 13,
+      "title": "Comprehensive cancellation",
+      "acceptance": "Cancelling parent execution stops descendants, subagents, queued operations and pending approvals with tests."
+    },
+    {
+      "id": 14,
+      "title": "Shared engine ownership",
+      "acceptance": "Concurrent manager/IDE startup and owner exit are tested for one authenticated workspace engine."
+    },
+    {
+      "id": 15,
+      "title": "Native release matrix",
+      "acceptance": "Independent Linux, Windows and macOS test/build gates exist; unavailable runner results remain unverified."
+    },
+    {
+      "id": 16,
+      "title": "Incremental UI polling",
+      "acceptance": "Idle polling excludes full reports, diffs and file walks; selection/workspace views request needed data."
+    },
+    {
+      "id": 17,
+      "title": "Incremental indexing",
+      "acceptance": "Unchanged indexed source chunks are reused and changed/deleted sources invalidate correctly."
+    },
+    {
+      "id": 18,
+      "title": "Catalog snapshot cache",
+      "acceptance": "Normalized catalogs cache by file identity/freshness without relaxing quota or context admission."
+    },
+    {
+      "id": 19,
+      "title": "Relevant tool schemas",
+      "acceptance": "A deterministic role/task-aware catalog bounds schemas with explicit permitted discovery."
+    },
+    {
+      "id": 20,
+      "title": "Context composition",
+      "acceptance": "Each request reports bounded instruction/schema/history/retrieval/output attribution without prompt leakage."
+    },
+    {
+      "id": 21,
+      "title": "Tokenizer provenance",
+      "acceptance": "Exact supported local tokenizer accounting and conservative fallback are distinguishable."
+    },
+    {
+      "id": 22,
+      "title": "Hypothesis retrieval",
+      "acceptance": "Retrieval incorporates bounded current hypotheses and recent observations, preserving original task constraints."
+    },
+    {
+      "id": 23,
+      "title": "Evidence deduplication",
+      "acceptance": "Identical unchanged evidence is referenced compactly; changed evidence and full originals remain recoverable."
+    },
+    {
+      "id": 24,
+      "title": "Symbol-first context",
+      "acceptance": "Language context returns bounded symbol definitions/callers/references with explicit fallback coverage."
+    },
+    {
+      "id": 25,
+      "title": "Compaction fidelity gates",
+      "acceptance": "Tests preserve constraints, decisions, failures, next work and source references across compaction."
+    },
+    {
+      "id": 26,
+      "title": "Compaction thrash guard",
+      "acceptance": "Repeated low-yield compaction contracts the working set or returns an actionable bounded stop."
+    },
+    {
+      "id": 27,
+      "title": "Verified outcome cost",
+      "acceptance": "Observed request usage/cost is attributed to task outcomes; unknown pricing/usage remains unknown."
+    },
+    {
+      "id": 28,
+      "title": "Investigation board",
+      "acceptance": "Task memory separately records hypotheses, counterevidence, next tests, blockers and remaining budget."
+    },
+    {
+      "id": 29,
+      "title": "Successful no-op detection",
+      "acceptance": "Repeated successful unchanged observations do not count as novel progress."
+    },
+    {
+      "id": 30,
+      "title": "Distinct recovery strategies",
+      "acceptance": "Each retry records what changed and cannot repeat an identical failing strategy indefinitely."
+    },
+    {
+      "id": 31,
+      "title": "Evidence-based escalation",
+      "acceptance": "Escalation preserves task state and shared remaining budget and honors spending approvals."
+    },
+    {
+      "id": 32,
+      "title": "Subagent contracts",
+      "acceptance": "Children inherit bounded scope, objective, budget, expected artifact and completion contract."
+    },
+    {
+      "id": 33,
+      "title": "Delegation accounting",
+      "acceptance": "Delegation records observed usage, duplicated context and useful artifact outcomes without invented benefit."
+    },
+    {
+      "id": 34,
+      "title": "Milestone invalidation",
+      "acceptance": "Changed upstream verification marks dependent completion stale until reverified."
+    },
+    {
+      "id": 35,
+      "title": "Compact durable handoffs",
+      "acceptance": "Resume handoffs include next actions, blockers, revision, evidence refs and remaining limits within a fixed budget."
+    },
+    {
+      "id": 36,
+      "title": "Language-aware local tracing",
+      "acceptance": "Supported-language source/transform/guard/sink traces are structured and unsupported coverage is explicit."
+    },
+    {
+      "id": 37,
+      "title": "Authorization tracing",
+      "acceptance": "Local route-to-service traces retain observed guards, data boundaries and coverage gaps."
+    },
+    {
+      "id": 38,
+      "title": "Negative controls",
+      "acceptance": "Local reproduction evidence includes safe controls; missing controls cannot be silently treated as proof."
+    },
+    {
+      "id": 39,
+      "title": "Proof stages",
+      "acceptance": "Scanner candidates, model assessments, reproductions and verified fixes are distinct persisted states."
+    },
+    {
+      "id": 40,
+      "title": "Reproducible fuzzing",
+      "acceptance": "Local bounded fuzz cases retain seeds and minimized counterexamples without external targets."
+    },
+    {
+      "id": 41,
+      "title": "Finding packages",
+      "acceptance": "Export includes revision, prerequisites, evidence, reproduction, impact, remediation and verification disposition."
+    },
+    {
+      "id": 42,
+      "title": "Surface coverage",
+      "acceptance": "Security report tracks local entry points and investigated vulnerability classes with explicit gaps."
+    },
+    {
+      "id": 43,
+      "title": "Search connection doctor",
+      "acceptance": "Search setup validates enabled configuration, credential presence, supported tools and actionable failures."
+    },
+    {
+      "id": 44,
+      "title": "Search provenance",
+      "acceptance": "Research records citation URLs, retrieval timestamps, provider/tool and applicable version information."
+    },
+    {
+      "id": 45,
+      "title": "Truthful run states",
+      "acceptance": "UI distinguishes executing, waiting, stalled, blocked, incomplete and verified states using observed data."
+    },
+    {
+      "id": 46,
+      "title": "Context debugger",
+      "acceptance": "Users inspect bounded request composition, retrieval reasons and omissions without leaking credentials."
+    },
+    {
+      "id": 47,
+      "title": "Recovery explanation",
+      "acceptance": "Resume UI distinguishes saved-boundary continuation, new work and unknown-effect reconciliation."
+    },
+    {
+      "id": 48,
+      "title": "Held-out benchmark gates",
+      "acceptance": "Versioned local held-out coding/security/bug tasks include harmless controls and cannot prove real-model quality without model runs."
+    },
+    {
+      "id": 49,
+      "title": "Model-profile regressions",
+      "acceptance": "Profile activation compares observed completion/false positives/cost/latency/tool failures under shared budgets."
+    },
+    {
+      "id": 50,
+      "title": "Commercial readiness gate",
+      "acceptance": "Licenses, brand clearance, update signing, key storage, privacy, rollback and support have evidence fields; missing external evidence blocks release readiness."
+    }
+  ]
+}

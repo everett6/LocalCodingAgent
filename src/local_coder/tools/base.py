@@ -1,11 +1,16 @@
 """Base tool system with registry and permissions."""
 from __future__ import annotations
 import abc
+import asyncio
+import contextvars
+import sqlite3
 import time
 from typing import Any
 
 from local_coder.types import ToolResult, ToolName, AgentRole, ToolSettings
 from local_coder.workspace import Workspace
+from local_coder.orchestrator.blocked import AgentBlocked
+from local_coder.providers.quota import ProviderQuotaExhausted
 
 # Tools that write files, keyed by the argument holding the target path.
 FILE_WRITING_TOOLS = {ToolName.WRITE_FILE: "path", ToolName.EDIT_FILE: "path"}
@@ -17,6 +22,15 @@ class Tool(abc.ABC):
     name: ToolName
     description: str
     parameters: dict[str, Any]  # JSON Schema for parameters
+    # Unknown/custom tools are serialized unless they explicitly declare all
+    # three effects. These declarations never bypass permissions or schemas.
+    read_only: bool = False
+    mutating: bool = True
+    retry_safe: bool = False
+
+    def effects(self):
+        from local_coder.tools.scheduling import tool_effects
+        return tool_effects(self)
     
     @abc.abstractmethod
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -42,9 +56,11 @@ class ToolRegistry:
     WRITE_SCOPES: dict[AgentRole, str] = {
         AgentRole.EXPLOIT_VALIDATOR: "tests/security_poc",
     }
+    leaf_tool_names = {"read_file", "list_files", "search_files", "grep", "code_search", "task_memory", "skill_library"}
     
     def __init__(self):
         self._tools: dict[ToolName, Tool] = {}
+        self.task_context = contextvars.ContextVar("local_coder_tool_task", default=None)
         self._permissions: dict[AgentRole, set[ToolName]] = {
             # Default permissions
             AgentRole.EXPLORER: {
@@ -118,15 +134,25 @@ class ToolRegistry:
 
         # code_search and repo_map are read-only, so every role that can
         # grep can use them.
-        for allowed in self._permissions.values():
+        for role, allowed in self._permissions.items():
             if ToolName.GREP in allowed:
+                allowed.add(ToolName.TOOL_CATALOG)
                 allowed.add(ToolName.CODE_SEARCH)
                 allowed.add(ToolName.REPO_MAP)
+                if role != AgentRole.EXPLOIT_VALIDATOR:
+                    allowed.add(ToolName.WEB_SEARCH)
     
     def register(self, tool: Tool) -> None:
         """Register a tool instance."""
         self._tools[tool.name] = tool
     
+    def effects_for(self, name: str):
+        from local_coder.tools.scheduling import ToolEffects, tool_effects
+        try:
+            return tool_effects(self.get_tool(ToolName(name)))
+        except ValueError:
+            return ToolEffects()
+
     def get_tool(self, name: ToolName) -> Tool | None:
         """Get a registered tool by name."""
         return self._tools.get(name)
@@ -134,7 +160,8 @@ class ToolRegistry:
     def get_tools_for_role(self, role: AgentRole) -> list[Tool]:
         """Get all tools available for a given role."""
         allowed_names = self._permissions.get(role, set())
-        return [tool for name, tool in self._tools.items() if name in allowed_names]
+        return [tool for name, tool in self._tools.items() if name in allowed_names
+                and (name != ToolName.TEAM_MESSAGE or getattr(self, "team_mailbox", None) is not None)]
     
     def get_schemas_for_role(self, role: AgentRole) -> list[dict]:
         """Get OpenAI-compatible function schemas for tools available to a role."""
@@ -198,6 +225,113 @@ class ToolRegistry:
             command_tool.sandbox_runtime = settings.sandbox_runtime
             command_tool.sandbox_image = settings.sandbox_image
 
+    async def evaluate_revision(self, revision):
+        """Measure local contract checks; never trust model-reported test success."""
+        started = time.monotonic()
+        kind, payload = revision["kind"], revision["payload"]
+        if kind == "tool":
+            result = await self.sandbox.run(payload["source"], {"probe": True}, timeout=5, name=payload["name"])
+            return {"success": result["success"] and bool(result.get("output", "").strip()),
+                    "measurements": {"duration_ms": result["duration_ms"], "exit_code": abs(result["exit_code"]), "output_bytes": len(result.get("output", "").encode())}}
+        from local_coder.models.profiles import validate_overlay, resolve_profile
+        checks = 0
+        if kind == "loop_plan":
+            validate_overlay(payload)
+            profile = resolve_profile(type("Config", (), {"model_id": "test", "profile": "generic"})(), AgentRole.CODER, payload)
+            schemas = self.get_schemas_for_role(AgentRole.CODER)
+            original = {s["function"]["name"] for s in schemas}
+            if not {s["function"]["name"] for s in profile.apply_tools(schemas)}.issubset(original):
+                return {"success": False, "measurements": {"checks": 1}}
+            from local_coder.harness.improvement import validate_profile_revision
+            tool = self.get_tool(ToolName.HARNESS_EVOLVE)
+            evaluator = getattr(tool, 'improvement_evaluator', None)
+            return await validate_profile_revision(self.evolution, revision, evaluator)
+        else:
+            text = payload["text"]
+            if len(text) > 6000:
+                return {"success": False, "measurements": {"characters": len(text), "checks": 1}}
+            checks = 1
+        return {"success": True, "measurements": {"checks": checks, "duration_ms": int((time.monotonic()-started)*1000)}}
+
+    async def close(self):
+        for name in ("language_service", "mcp"):
+            service = getattr(self, name, None)
+            if service is not None:
+                await service.close()
+
+    def _write_targets(self, name, arguments):
+        if name in FILE_WRITING_TOOLS:
+            return [arguments.get(FILE_WRITING_TOOLS[name])]
+        if name == ToolName.APPLY_PATCH:
+            from local_coder.tools.filesystem import patch_targets
+            return patch_targets(self.project_root, arguments.get("patch", ""), arguments.get("working_dir"))
+        return []
+
+    def _leaf_scope(self, name, arguments):
+        current = self.task_context.get() or {}
+        if not current.get("depth"):
+            return
+        if name.value not in self.leaf_tool_names:
+            raise ValueError("Leaf tasks have only scoped read and task-memory capabilities")
+        if name == ToolName.MEMORY_TASK_STATE:
+            if arguments.get("task_id") != current.get("task_id"):
+                raise ValueError("Leaf memory must belong to the current task")
+            return
+        if name == ToolName.SKILL_LIBRARY:
+            return
+        workspace = Workspace(self.project_root)
+        roots = [workspace.resolve(path) for path in current.get("files", [])] or [workspace.root]
+        target = workspace.resolve(arguments.get("path") or ".")
+        if not any(target == root or target.is_relative_to(root) for root in roots):
+            raise ValueError("Tool path exceeds the leaf task's inherited scope; supply an in-scope path")
+
+    def _parallel_scope(self, name, arguments, targets):
+        """Enforce host-owned worker boundaries before any mutation or snapshot."""
+        current = self.task_context.get() or {}
+        if not current.get('parallel_worker'):
+            return
+        scope = current.get('write_scope')
+        if scope is None:
+            raise ValueError('Parallel worker requires a host write scope')
+        workspace = Workspace(self.project_root)
+        roots = [workspace.resolve(path) for path in scope]
+        for target in targets:
+            path = workspace.resolve(target)
+            if not any(path == root or path.is_relative_to(root) for root in roots):
+                raise ValueError('File mutation exceeds the parallel worker write scope')
+        # Process tools, dynamic tools and unclassified effects can mutate paths
+        # outside their arguments. They must run at a serialized boundary.
+        if name == ToolName.TEAM_MESSAGE:
+            from local_coder.tools.team_message import TeamMessageTool
+            if type(self.get_tool(name)) is TeamMessageTool:
+                return  # This concrete tool changes only bounded plan mailboxes.
+        if not targets and self.effects_for(name.value).mutating:
+            raise ValueError('Unconfined mutation requires a serialized task scope')
+
+    async def _language_before_edit(self, paths):
+        """Expose current symbols to the model before allowing an unread edit."""
+        if not getattr(self, "auto_language_context", False) or (self.task_context.get() or {}).get("depth"):
+            return ""
+        import hashlib
+        current = self.task_context.get() or {}
+        cache = getattr(self, "_language_reads", None)
+        if cache is None:
+            cache = self._language_reads = set()
+        context = []
+        for path in paths:
+            target = Workspace(self.project_root).resolve(path)
+            if not target.is_file() or target.stat().st_size > self.language_service.max_file_bytes:
+                continue
+            identity = (current.get("task_id"), str(target), hashlib.sha256(target.read_bytes()).hexdigest())
+            if identity in cache:
+                continue
+            result = await self.language_service.context(str(target), char_budget=1800)
+            cache.add(identity)
+            if len(cache) > 1000:
+                cache.intersection_update({identity})
+            context.append(result["text"])
+        return "\n".join(context)[:6000]
+
     async def execute_tool(
         self, role: AgentRole, tool_name: str, arguments: dict[str, Any]
     ) -> ToolResult:
@@ -228,6 +362,17 @@ class ToolRegistry:
                 duration_ms=int((time.time() - start_time) * 1000)
             )
             
+        # Validate model-supplied JSON before scope inspection, snapshots, hooks
+        # or execution. Engine-only arguments are injected after this gateway.
+        from jsonschema import Draft202012Validator
+        if not isinstance(arguments, dict) or any(not isinstance(key, str) or key.startswith("_") for key in arguments):
+            return ToolResult(success=False, output="Tool arguments must be an object without engine-only fields")
+        schema = {**tool.parameters, "additionalProperties": False}
+        errors = list(Draft202012Validator(schema).iter_errors(arguments))
+        if errors:
+            # Do not echo argument values (which can contain credentials).
+            return ToolResult(success=False, output="Tool arguments failed schema validation: " +
+                              ", ".join(sorted({str(error.validator) for error in errors})))
         scope_error = self._outside_write_scope(role, name_enum, tool, arguments)
         if scope_error:
             return ToolResult(
@@ -236,16 +381,72 @@ class ToolRegistry:
                 duration_ms=int((time.time() - start_time) * 1000)
             )
 
+        execution_started = False
         try:
-            if name_enum == ToolName.RECOVER_CONTEXT:
+            self._leaf_scope(name_enum, arguments)
+            if name_enum in {ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE} and not getattr(self, "memory_enabled", True):
+                raise ValueError("Project context memory is disabled in harness settings")
+            if name_enum == ToolName.MEMORY_TASK_STATE and role == AgentRole.RED_TEAM:
+                current = self.task_context.get() or {}
+                if not current.get("task_id") or arguments.get("task_id") != current["task_id"]:
+                    raise ValueError("Red team task memory is confined to the current engagement task")
+            snapshot = None
+            targets = self._write_targets(name_enum, arguments)
+            self._parallel_scope(name_enum, arguments, targets)
+            root = getattr(self, "project_root", None)
+            if root:
+                for target in targets:
+                    if not isinstance(target, str):
+                        raise ValueError("File mutation requires an explicit workspace path")
+                    path = Workspace(root).resolve(target).relative_to(Workspace(root).root)
+                    if path.parts and path.parts[0] in {".git", ".local-coder"}:
+                        raise ValueError("Private engine state must be changed through its dedicated tools")
+            if targets:
+                language = await self._language_before_edit(targets)
+                if language:
+                    return ToolResult(success=False, output="Review the current language context before retrying the edit (no files changed):\n" + language)
+            if targets and getattr(self, "pre_edit_snapshots", False):
+                snapshot = await asyncio.to_thread(self.snapshots.capture, targets)
+            if name_enum in {ToolName.TOOL_CATALOG, ToolName.RECOVER_CONTEXT, ToolName.DELEGATE_TASK, ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL}:
                 arguments = {**arguments, "_caller_role": role}
+            if name_enum == ToolName.DELEGATE_TASK:
+                current = self.task_context.get() or {}
+                arguments = {**arguments, "_delegation_depth": current.get("depth", 0)}
+            if name_enum == ToolName.TEAM_MESSAGE:
+                current = self.task_context.get() or {}
+                arguments = {**arguments, "_caller_task_id": current.get("task_id"),
+                             "_caller_run_id": current.get("team_run_id")}
+            execution_started = True
             result = await tool.execute(**arguments)
+            if result.success and name_enum == ToolName.READ_FILE:
+                language = await self._language_before_edit([arguments["path"]])
+                if language:
+                    result.output += "\n\nLanguage context (untrusted evidence):\n" + language
+            if snapshot:
+                await asyncio.to_thread(self.snapshots.complete, snapshot["id"])
+                result.data["snapshot_id"] = snapshot["id"]
+            memory = getattr(self, "context_memory", None)
+            if memory and getattr(self, "memory_enabled", True) and name_enum not in {ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE}:
+                current = self.task_context.get() or {}
+                kind = "finding" if name_enum == ToolName.RECORD_FINDING and result.success else "tool" if result.success else "failure"
+                source = arguments.get("path") if name_enum in {ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.LANGUAGE_CONTEXT} else None
+                try:
+                    await asyncio.to_thread(memory.ingest, kind, result.output[:16000], source_path=source,
+                                            task_id=current.get("task_id"), metadata={"tool": tool_name, "success": result.success})
+                except (OSError, ValueError, sqlite3.Error):
+                    # Optional evidence storage must not turn a known completed
+                    # mutation into an unknown failure that invites a replay.
+                    result.data["memory_ingest_failed"] = True
             if not hasattr(result, "duration_ms") or result.duration_ms is None:
                 result.duration_ms = int((time.time() - start_time) * 1000)
             return result
+        except (AgentBlocked, ProviderQuotaExhausted):
+            raise
         except Exception as e:
             return ToolResult(
                 success=False, 
                 output=f"Error executing tool {tool_name}: {str(e)}",
+                data={"execution_outcome": "unknown" if execution_started else "not_started",
+                      "mutation_completion_unknown": execution_started and self.effects_for(tool_name).mutating},
                 duration_ms=int((time.time() - start_time) * 1000)
             )

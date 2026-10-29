@@ -1,0 +1,37 @@
+name: Offline adversarial regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pydantic pydantic-settings httpx rich click pyyaml 'jsonschema>=4.25,<5' pytest
+      - name: Check engine boundaries and improvement gates without model credentials
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q tests/test_adversarial_regressions.py tests/test_working_memory.py tests/test_improvement_loop.py tests/test_adaptive_harness.py tests/test_context_gateway.py tests/test_security_evidence.py tests/test_security_regression.py tests/test_threat_model.py
+  native-memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - run: cargo test --locked --manifest-path native/Cargo.toml
+      - run: cargo build --locked --release --manifest-path native/Cargo.toml
+      - run: python -m pip install pydantic pydantic-settings httpx rich click pyyaml 'jsonschema>=4.25,<5' pytest
+      - name: Verify native and persisted vector parity
+        env:
+          PYTHONPATH: src
+          LOCAL_CODER_NATIVE_LIBRARY: ${{ github.workspace }}/native/target/release/liblocal_coder_native.so
+        run: python -m pytest -q tests/test_native_memory.py tests/test_context_memory.py tests/test_context.py

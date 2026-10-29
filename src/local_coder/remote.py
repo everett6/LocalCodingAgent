@@ -27,7 +27,7 @@ from local_coder import local_server
 from local_coder.orchestrator.config_loader import load_config
 from local_coder.orchestrator.coordinator import Coordinator
 from local_coder.orchestrator.sessions import SessionError, SessionStore
-from local_coder.types import AgentEvent, AgentRole
+from local_coder.types import AgentEvent, AgentRole, AgentMode, ModelConfig
 
 _WEBUI_ROOT = Path(__file__).parent / "webui" / "dist"
 _WEBUI_INDEX = _WEBUI_ROOT / "index.html"
@@ -106,15 +106,15 @@ class RemoteControlServer(WorkbenchAPI):
         # --set / --temperature from the command line that started the server.
         self.config_overrides = list(config_overrides or [])
         self.temperature = temperature
-        # The HTTP server has no terminal to prompt with, so there is never
-        # an interactive approval callback here -- ASK-risk actions are
-        # denied unless the operator explicitly opted into --yolo when
-        # starting the server.
+        # The authenticated workbench supplies a human approval inbox.
+        # Unanswered requests expire as denials; model tools cannot respond.
         self.yolo = yolo
         self.token = token
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
         self._event_seq = 0
         self.lock = Lock()
+        from local_coder.statedir import state_path
+        state_path(project_root, '.local-coder/bootstrap')
         self.sessions = SessionStore(project_root)
         self._init_workbench()
         self._lease_file = None
@@ -144,6 +144,12 @@ class RemoteControlServer(WorkbenchAPI):
                     job["checkpoint"] = event.data.get("path")
                 if event.event_type == "checkpoint_created":
                     job["pre_run_checkpoint_id"] = event.data.get("checkpoint_id")
+                if event.event_type == "verification_result" and event.source == "ORCHESTRATOR":
+                    data = event.data
+                    if (type(data.get("passed")) is bool and isinstance(data.get("command"), str)
+                            and 0 < len(data["command"]) <= 1000):
+                        job["verification"] = {"passed": data["passed"], "command": self._redact(data["command"]),
+                                               "recorded_at": event.timestamp.isoformat()}
             self.events.append(payload)
         if job is not None and event.event_type == "checkpoint_saved":
             # Make Resume available even when the process dies before the job finalizer.
@@ -164,21 +170,50 @@ class RemoteControlServer(WorkbenchAPI):
         if self._using_inference and provider is None:
             raise ValueError("The on-device model is not ready")
         if provider is not None:
-            config.models = {"workbench": provider.model_copy(deep=True)}
+            config.models = {**config.models, "workbench": provider.model_copy(deep=True)}
             config.agentic.role_models = {role.value: "workbench" for role in AgentRole}
         elif self.model_name:
             config.agentic.role_models = {role.value: self.model_name for role in AgentRole}
-        if provider is not None and (provider.profile.startswith("openrouter_") or self._using_inference):
-            config.agentic.context_window_chars = min(provider.context_length * 3, 240000)
-            config.agentic.compact_context_chars = config.agentic.context_window_chars // 2
         if self.yolo:
             config.approval.require_approval_for_commands = False
             config.approval.require_approval_for_commits = False
-        coordinator = Coordinator(
-            config=config,
-            project_root=self.project_root,
-            code_index=self.code_index,
-        )
+        config.harness = self.harness_settings()
+        mode = getattr(self._context, "mode", config.mode)
+        config.mode = mode
+        if mode == AgentMode.BUG_HUNTING:
+            from local_coder.statedir import state_path
+            mapping_path = state_path(self.project_root, ".local-coder/bug-models.json")
+            mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else {}
+            roles = {"lead": ["orchestrator", "planner"],
+                     "delegate": ["explorer", "coder", "debugger", "tester", "reviewer"],
+                     "exploit": ["bug_hunter", "security", "exploit_validator"]}
+            for purpose, profile_id in mapping.items():
+                if profile_id:
+                    record = self.provider_profiles.get(profile_id)
+                    model = ModelConfig.model_validate({**record["provider"], "name": "bug-" + purpose})
+                    config.models[model.name] = model
+                    for role in roles[purpose]:
+                        config.agentic.role_models[role] = model.name
+        self._apply_auto_routing(config, provider)
+        from local_coder.providers.context_policy import context_policy
+        selected = provider or config.models.get(self.model_name or "default") or next(iter(config.models.values()), None)
+        if selected is not None and selected.auto_context:
+            policy = context_policy(selected, mode, config.harness)
+            config.agentic.context_window_chars = policy["context_window_chars"]
+            config.agentic.compact_context_chars = policy["compact_context_chars"]
+            config.harness.memory_context_chars = policy["memory_chars"]
+            for model in config.models.values():
+                if model.auto_context:
+                    model.max_tokens = context_policy(model, mode, config.harness)["completion_tokens"]
+        safety_tier = self.harness_safety_tier()
+        if safety_tier is not None:
+            config.safety_tier = safety_tier
+        coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request,
+                                  quota_guard=self.free_quota_guard, code_index=self.code_index)
+        if hasattr(coordinator, "tool_registry"):
+            coordinator.tool_registry.goal_id = getattr(self._context, "goal_id", None)
+        self.current_budget = getattr(coordinator, "budget", None)
+        self.current_registry = getattr(coordinator, "tool_registry", None)
         coordinator.on_event(self._event)
         return coordinator
 

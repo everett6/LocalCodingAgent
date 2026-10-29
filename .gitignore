@@ -8,3 +8,9 @@ benchmark_task_results.json
 dist/
 build/
 .venv/
+
+# Native product artwork is source input, not generated application output.
+!desktop/build/
+!desktop/build/icon.png
+!desktop/build/icon.ico
+!desktop/build/icon.icns

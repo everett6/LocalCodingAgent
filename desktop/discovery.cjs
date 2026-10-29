@@ -8,7 +8,7 @@ function canonical(workspace) {
   const value=fs.realpathSync(workspace).split(path.sep).join('/');
   return process.platform==='win32'?value.toLowerCase():value;
 }
-async function discoverEngine(workspace, directory=path.join(os.homedir(),'.local-coder','connections')) {
+async function discoverEngine(workspace, directory=process.env.LOCAL_CODER_CONNECTION_DIR || path.join(os.homedir(),'.local-coder','connections')) {
   if(!workspace)return null;
   try {
     const root=canonical(workspace),file=path.join(directory,createHash('sha256').update(root).digest('hex')+'.json');

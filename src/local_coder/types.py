@@ -4,7 +4,8 @@ import enum
 import uuid
 from datetime import datetime
 from typing import Any, Literal
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
+from local_coder.context.allocation import ContextAllocation
 
 
 # === Enums ===
@@ -95,6 +96,8 @@ class ToolName(str, enum.Enum):
     RUN_SAST = "run_sast"
     AUDIT_DEPENDENCIES = "audit_dependencies"
     AUDIT_CONFIG = "audit_config"
+    ADVANCED_AUDIT = "advanced_audit"
+    DEPENDENCY_INTELLIGENCE = "dependency_intelligence"
     RUN_BUG_SCAN = "run_bug_scan"
     REDTEAM_WORKSPACE = "redteam_workspace"
     REDTEAM_HTTP = "redteam_http_check"
@@ -105,6 +108,20 @@ class ToolName(str, enum.Enum):
     RECOVER_CONTEXT = "recover_context"
     SECURITY_SCAN = "security_scan"
     RECORD_FINDING = "record_finding"
+    GENERATE_EXPLOIT = "generate_exploit"
+    PRIVILEGE_ANALYSIS = "analyze_privilege_escalation"
+    FUZZ_INPUTS = "generate_fuzz_cases"
+    MEMORY_SEARCH = "memory_search"
+    MEMORY_WRITE = "memory_write"
+    MEMORY_TASK_STATE = "task_memory"
+    LANGUAGE_CONTEXT = "language_context"
+    HARNESS_EVOLVE = "harness_evolve"
+    DELEGATE_TASK = "delegate_task"
+    GENERATED_TOOL = "generated_tool"
+    MCP_CALL = "mcp_call"
+    WEB_SEARCH = "web_search"
+    TOOL_CATALOG = "tool_catalog"
+    SKILL_LIBRARY = "skill_library"
 
 
 # === Messages ===
@@ -162,9 +179,14 @@ class ModelConfig(BaseModel):
     model_id: str  # The model identifier for the backend (e.g., 'qwen2.5-coder:7b')
     base_url: str = "http://localhost:11434"  # Default Ollama URL
     context_length: int = 8192
+    auto_context: bool = True
+    context_source: str = Field(default="configured", max_length=100)
     temperature: float = 0.2
     strategy_attempt_limit: int = Field(default=3, ge=1, le=10)
     max_tokens: int = 4096
+    input_cost_per_million: float | None = Field(default=None, ge=0)
+    output_cost_per_million: float | None = Field(default=None, ge=0)
+    request_cost_usd: float | None = Field(default=0, ge=0)
     quantization: str | None = None  # e.g., 'Q4_K_M'
     gpu_layers: int | None = None
     estimated_vram_mb: int | None = None
@@ -356,6 +378,23 @@ class VerificationConfig(BaseModel):
     run_tests_after_changes: bool = True
     require_review: bool = True
     rollback_on_failure: bool = False
+    visual_url: str | None = Field(default=None, max_length=2048)
+    visual_assertions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    visual_viewport: dict[str, int] | None = None
+    visual_timeout_seconds: int = Field(default=15, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def validate_visual_check(self):
+        if self.visual_url is None:
+            if self.visual_assertions:
+                raise ValueError("Visual assertions require an explicit local UI URL")
+            return self
+        from local_coder.verification.visual import validate_visual_request
+        validate_visual_request(self.visual_url, assertions=self.visual_assertions,
+                                viewport=self.visual_viewport, timeout_seconds=self.visual_timeout_seconds)
+        if not self.visual_assertions:
+            raise ValueError("Automatic UI verification requires explicit assertions")
+        return self
 
 
 class AgenticConfig(BaseModel):
@@ -385,6 +424,11 @@ class RoutingConfig(BaseModel):
     """
     escalate_to: str | None = None
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+    auto_enabled: bool = Field(default=True, strict=True)
+    economy_model: str | None = Field(default=None, max_length=100)
+    local_classifier: str | None = Field(default=None, max_length=100)
+    classifier_timeout_seconds: float = Field(default=2, ge=0.25, le=5, strict=True)
+    allow_cross_provider: bool = Field(default=False, strict=True)
 
 
 class ToolSettings(BaseModel):
@@ -403,8 +447,27 @@ class ToolSettings(BaseModel):
     roles: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class HarnessSettings(BaseModel):
+    """Bounded runtime controls; model profiles cannot disable these gates."""
+    memory_enabled: bool = True
+    memory_context_chars: int = Field(default=3000, ge=0, le=12000)
+    language_context_enabled: bool = True
+    pre_edit_snapshots: bool = True
+    context_snapshots: bool = False
+    context_allocation: ContextAllocation | None = None
+    max_requests: int = Field(default=200, ge=1, le=10000)
+    max_tokens: int = Field(default=1000000, ge=1024, le=100000000)
+    max_request_tokens: int = Field(default=131072, ge=1024, le=2000000)
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_subagents: int = Field(default=3, ge=0, le=3)
+    profile_overrides: dict[str, Any] = Field(default_factory=dict)
+    sandbox_backend: Literal["auto", "bubblewrap", "docker"] = "auto"
+    sandbox_image: str = "python:3.12-slim"
+
+
 class ProjectConfig(BaseModel):
     """Top-level project configuration."""
+    harness: HarnessSettings = Field(default_factory=HarnessSettings)
     models: dict[str, ModelConfig] = Field(default_factory=dict)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
     permissions: list[AgentPermissions] = Field(default_factory=list)

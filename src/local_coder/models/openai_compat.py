@@ -1,5 +1,6 @@
 """OpenAI-compatible backend implementation."""
 from __future__ import annotations
+import asyncio
 import json
 import time
 from typing import AsyncIterator
@@ -13,10 +14,12 @@ from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 class OpenAICompatibleBackend(BaseModelBackend):
     """Backend for OpenAI-compatible APIs (vLLM, LMStudio, llama.cpp server)."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, quota_guard=None, *, trust_env: bool = True):
         super().__init__(config)
+        self.quota_guard = quota_guard
         key = config.resolve_api_key()
         self.client = httpx.AsyncClient(base_url=config.base_url, timeout=300.0,
+                                        trust_env=trust_env, follow_redirects=False,
                                         headers={"Authorization": f"Bearer {key}"} if key else {})
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
@@ -25,6 +28,31 @@ class OpenAICompatibleBackend(BaseModelBackend):
             return None
         # Assuming tools are already in OpenAI JSON schema format
         return tools
+
+    async def _observe_quota(self, status_code, body, headers=None):
+        if self.quota_guard is not None:
+            exhausted = await asyncio.to_thread(self.quota_guard.observe_http_error, self.config, status_code, body, headers)
+            if exhausted is not None:
+                raise exhausted
+
+    async def _observe_response_quota(self, response):
+        if self.quota_guard is None or response.status_code != 429:
+            return
+        if response.is_stream_consumed:
+            body = response.content[:128000]
+        else:
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > 128000:
+                    return
+                body.extend(chunk)
+            body = bytes(body)
+        await self._observe_quota(response.status_code, body, response.headers)
+
+    async def _observe_embedded_quota(self, data, headers=None):
+        error = data.get('error') if isinstance(data, dict) else None
+        if isinstance(error, dict) and error.get('code') in (429, '429'):
+            await self._observe_quota(429, data, headers)
 
     def _profile_payload(self, payload):
         if self.config.profile.startswith("openrouter_"):
@@ -79,6 +107,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
                 data = await self._collect_stream(payload)
             else:
                 response = await self.client.post("/chat/completions", json=payload)
+                await self._observe_response_quota(response)
                 response.raise_for_status()
                 data = response.json()
         except httpx.HTTPError as e:
@@ -86,6 +115,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
 
         latency_ms = (time.time() - start_time) * 1000.0
         
+        await self._observe_embedded_quota(data)
         if data.get("error") or not data.get("choices"):
             raise RuntimeError("Provider returned an error or no completion; check model access and quota")
         choice = data["choices"][0]
@@ -125,8 +155,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
     async def _collect_stream(self, payload):
         """Assemble indexed tool deltas before any tool may execute."""
         content, reasoning, calls, usage, details = [], [], {}, {}, []
-        finish, model = "stop", self.config.model_id
+        finish, model = None, self.config.model_id
         async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+            await self._observe_response_quota(response)
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -136,6 +167,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     break
                 data = json.loads(raw)
                 if data.get("error"):
+                    await self._observe_embedded_quota(data, response.headers)
                     raise RuntimeError("Provider stream failed; check model access and quota")
                 usage = data.get("usage") or usage
                 model = data.get("model") or model
@@ -150,6 +182,10 @@ class OpenAICompatibleBackend(BaseModelBackend):
                         assembled["id"] += call.get("id") or ""
                         for key in ("name", "arguments"):
                             assembled["function"][key] += call.get("function", {}).get(key) or ""
+        if finish is None:
+            # EOF (or a bare [DONE]) does not establish that all tool deltas
+            # arrived. Never execute a syntactically valid but partial call.
+            raise RuntimeError("Provider returned an incomplete completion stream")
         return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning) or None,
                                           "tool_calls": [calls[i] for i in sorted(calls)], "reasoning_details": details or None}, "finish_reason": finish}],
                 "usage": usage, "model": model}
@@ -175,6 +211,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
         self._profile_payload(payload)
         try:
             async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+                await self._observe_response_quota(response)
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line or not line.startswith("data: "):
@@ -186,6 +223,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
                         
                     try:
                         data = json.loads(data_str)
+                        if data.get('error'):
+                            await self._observe_embedded_quota(data, response.headers)
+                            raise RuntimeError('Provider stream failed; check model access and quota')
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})

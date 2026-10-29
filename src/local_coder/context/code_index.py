@@ -8,7 +8,7 @@ Identifiers are split on snake_case and camelCase so a query like
 chunk's symbol name or file path rank higher than matches in its body.
 
 The index lives in ``.local-coder/index/code_index.json`` and is refreshed
-incrementally: only files whose size or mtime changed are re-read.
+incrementally: unchanged content reuses chunks; hashes detect same-stat rewrites.
 """
 from __future__ import annotations
 
@@ -120,21 +120,25 @@ def tokenize(text: str) -> list[str]:
     ``parseConfigFile`` yields ``parseconfigfile``, ``parse``, ``config`` and
     ``file``; ``read_file_safe`` yields the whole name plus its parts.
     """
-    tokens: list[str] = []
-    for word in _WORD_RE.findall(text):
+    return list(iter_tokens(text))
+
+
+def iter_tokens(text: str):
+    """Yield the same search terms without retaining a document-sized list."""
+    for match in _WORD_RE.finditer(text):
+        word = match.group()
         parts: list[str] = []
         for piece in word.split("_"):
             if piece:
                 parts.extend(_CAMEL_RE.findall(piece))
         lowered = word.lower().strip("_")
         if len(parts) > 1 and lowered not in STOPWORDS:
-            tokens.append(lowered)
+            yield lowered
         for part in parts:
             p = part.lower()
             if len(p) < 2 or p in STOPWORDS or p.isdigit():
                 continue
-            tokens.append(_stem(p))
-    return tokens
+            yield _stem(p)
 
 
 @dataclass
@@ -346,7 +350,8 @@ class CodeIndex:
         return (not path.is_absolute() and bool(path.parts) and ".." not in path.parts
                 and not is_private_source(path)
                 and not any(part in SKIP_DIRS or part.endswith(".egg-info") for part in path.parts)
-                and path.suffix.lower() not in SKIP_EXTENSIONS)
+                and not path.name.lower().startswith(("secrets.", "credentials."))
+                and path.suffix.lower() not in SKIP_EXTENSIONS | {".pem", ".key", ".p12", ".pfx", ".keystore"})
 
     def _inside(self, full: Path) -> bool:
         """False for a committed symlink that points outside the project."""
@@ -447,18 +452,15 @@ class CodeIndex:
                 continue
             if full.is_symlink() or not full.is_file() or st.st_size > MAX_FILE_BYTES or not self._inside(full):
                 continue
-            entry = self._files.get(rel)
-            if (entry and entry.get("mtime_ns") == st.st_mtime_ns and entry.get("size") == st.st_size
-                    and entry.get("ctime_ns") == st.st_ctime_ns and entry.get("inode") == st.st_ino
-                    and entry.get("device") == st.st_dev):
-                seen.add(rel)
-                stats["unchanged"] += 1
-                continue
             source = self._read_source(full)
             if source is None:
                 continue
             seen.add(rel)
             text, content_hash = source
+            entry = self._files.get(rel)
+            if entry and entry.get("content_hash") == content_hash:
+                stats["unchanged"] += 1
+                continue
             chunks = chunk_file(rel, text)
             self._files[rel] = {
                 "mtime_ns": st.st_mtime_ns,

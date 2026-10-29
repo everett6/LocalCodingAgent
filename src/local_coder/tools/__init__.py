@@ -24,6 +24,7 @@ def create_tool_registry(
     approval: ApprovalConfig | None = None,
     approval_callback: ApprovalCallback | None = None,
     safety_harness: Any = None,
+    improvement_evaluator: Any = None,
     code_index: CodeIndex | None = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry and register all available tools.
@@ -38,10 +39,71 @@ def create_tool_registry(
         safety_harness = SafetyHarness()
 
     registry = ToolRegistry()
+    registry.project_root = project_root
+    registry.approval_callback = approval_callback
+    registry.safety_harness = safety_harness
+    from local_coder.memory.context_store import ContextMemory
+    from local_coder.tools.memory import MemorySearchTool, MemoryWriteTool, TaskMemoryTool
+    from local_coder.context.language_service import LanguageService
+    from local_coder.tools.language_context import LanguageContextTool
+    from local_coder.harness.evolution import EvolutionStore
+    from local_coder.tools.evolution import HarnessEvolveTool, DelegateTaskTool, GeneratedToolTool
+    from local_coder.core.sandbox import SandboxRunner
+    from local_coder.core.snapshots import FileSnapshots
+    from local_coder.integrations.mcp import MCPManager
+    from local_coder.tools.mcp import MCPTool
+    from local_coder.tools.web_search import WebSearchTool
+    from local_coder.skills import SkillLibrary, SkillLibraryTool
+    from local_coder.types import AgentRole, ToolName
+    registry.context_memory = ContextMemory(project_root)
+    from local_coder.memory.goals import GoalLedger
+    registry.goal_ledger = GoalLedger(project_root)
+    from local_coder.statedir import state_path
+    import json
+    language_config = state_path(project_root, ".local-coder/language/settings.json")
+    language_settings = json.loads(language_config.read_text()) if language_config.is_file() and language_config.stat().st_size <= 64000 else {}
+    registry.language_service = LanguageService(project_root, server_commands=language_settings.get("server_commands"), auto_discover=language_settings.get("auto_discover", False))
+    registry.evolution = EvolutionStore(project_root)
+    registry.snapshots = FileSnapshots(project_root)
+    registry.sandbox = SandboxRunner()
+    registry.mcp = MCPManager(project_root, approval_callback=approval_callback)
+    registry.memory_context_chars = 3000
+    registry.memory_enabled = True
+    registry.profile_overrides = {}
+    registry.auto_language_context = False
+    registry.pre_edit_snapshots = True
+    registry.team_mailbox = None
+    from local_coder.tools.team_message import TeamMessageTool
+    from local_coder.tools.visual import VisualVerificationTool
+    registry.register(TeamMessageTool(registry))
+    registry.register(VisualVerificationTool(project_root, approval_callback, safety_harness=safety_harness))
+    from local_coder.tools.exploit import GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool
+    for cls in (GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool):
+        registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
+    for tool in (MemorySearchTool(registry.context_memory), MemoryWriteTool(registry.context_memory), TaskMemoryTool(registry.context_memory),
+                 LanguageContextTool(registry.language_service), MCPTool(registry.mcp), WebSearchTool(registry.mcp), SkillLibraryTool(SkillLibrary(project_root)),
+                 HarnessEvolveTool(registry.evolution, safety_harness, approval_callback, validator=registry.evaluate_revision,
+                                   improvement_evaluator=improvement_evaluator),
+                 DelegateTaskTool(), GeneratedToolTool(registry.evolution, runner=registry.sandbox.run)):
+        registry.register(tool)
+    for role, allowed in registry._permissions.items():
+        if role != AgentRole.RED_TEAM:
+            allowed.update({ToolName.MEMORY_SEARCH, ToolName.MEMORY_WRITE, ToolName.MEMORY_TASK_STATE, ToolName.LANGUAGE_CONTEXT, ToolName.SKILL_LIBRARY})
+        if role in {AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.ORCHESTRATOR}:
+            allowed.update({ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL, ToolName.DELEGATE_TASK, ToolName.MCP_CALL})
+        if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.REVIEWER}:
+            allowed.add(ToolName.MCP_CALL)
+        if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.TESTER, AgentRole.REVIEWER}:
+            allowed.add(ToolName.TEAM_MESSAGE)
+        if role in {AgentRole.CODER, AgentRole.TESTER}:
+            allowed.add(ToolName.VERIFY_UI)
+    registry._permissions[AgentRole.BUG_HUNTER].add(ToolName.DELEGATE_TASK)
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
     from local_coder.tools.context_archive import RecoverContextTool
+    from local_coder.tools.tool_catalog import ToolCatalogTool
     registry.register(RecoverContextTool(registry))
+    registry.register(ToolCatalogTool(registry))
     for allowed in registry._permissions.values():
         allowed.add(RecoverContextTool.name)
 
@@ -74,6 +136,12 @@ def create_tool_registry(
     registry.register(BuildTool(project_root))
 
     # Security & Audit tools
+    from local_coder.tools.advanced_audit import AdvancedAuditTool
+    from local_coder.tools.dependency_intelligence import DependencyIntelligenceTool
+    registry.register(AdvancedAuditTool(project_root))
+    registry.register(DependencyIntelligenceTool(project_root))
+    for role in (AgentRole.SECURITY, AgentRole.BUG_HUNTER, AgentRole.REVIEWER, AgentRole.EXPLORER):
+        registry._permissions[role].update({ToolName.ADVANCED_AUDIT, ToolName.DEPENDENCY_INTELLIGENCE})
     registry.register(RunSASTTool(project_root))
     registry.register(AuditDependenciesTool(project_root))
     registry.register(AuditConfigTool(project_root))

@@ -91,10 +91,11 @@ def test_plan_parses_the_schema_the_planner_prompt_declares(tmp_path):
 
     plan = run(coordinator._plan("Add a helper function", "exploration notes"))
 
-    assert [t.task_id for t in plan.tasks] == ["1", "2"]
+    assert [t.task_id.rsplit(":", 1)[-1] for t in plan.tasks] == ["1", "2"]
+    assert len({t.task_id.split(":", 1)[0] for t in plan.tasks}) == 1
     assert plan.tasks[0].objective == "Add the calculate_average helper"
     assert plan.tasks[1].objective == "Add a unit test for calculate_average"
-    assert plan.tasks[1].depends_on == ["1"]
+    assert plan.tasks[1].depends_on == [plan.tasks[0].task_id]
     assert plan.tasks[1].role == AgentRole.TESTER
 
 
@@ -411,7 +412,9 @@ def test_plan_only_emits_plan_created_with_the_full_task_list(tmp_path):
 
     plan_events = [e for e in received if e.event_type == "plan_created"]
     assert len(plan_events) == 1
-    assert plan_events[0].data["tasks"] == [
+    rows = plan_events[0].data["tasks"]
+    assert len({row["task_id"].split(":", 1)[0] for row in rows}) == 1
+    assert [{**row, "task_id": row["task_id"].rsplit(":", 1)[-1]} for row in rows] == [
         {"task_id": "1", "role": "coder", "objective": "Add the helper"},
         {"task_id": "2", "role": "tester", "objective": "Add a test"},
     ]

@@ -226,3 +226,50 @@ request credentials, all query values and response bodies. XML entities/DTDs are
 rejected. `redteam_http_check` with `check: security_txt` can validate bounded
 Contact/Expires disclosure metadata on an authorized security.txt URL. No contact
 is made and no authorization is inferred from that metadata.
+
+## Plan-local team messages
+
+Independent planned coding tasks can use `team_message` to send `status`,
+`evidence`, `blocked` or `question` messages to another task in the same plan.
+The host binds sender and plan identity; model arguments cannot impersonate
+another task. Read lists the plan's participants and consumes only the caller's
+inbox. Channels have explicit pending-message, lifetime-message and byte limits;
+a full channel rejects the send. Completion or cancellation closes the plan's
+channels. Messages never grant permissions, change file ownership, approve
+commands or mark a peer complete. They are transient coordination data; task
+memory and checkpoints remain the durable handoff mechanisms. The ordinary DAG
+scheduler and shared model budgets still govern execution.
+
+## Optional local UI verification
+
+The `verify_ui` tool can capture an already-running local UI and check explicit
+DOM visibility/text expectations, page errors and horizontal overflow. It requires
+an installed optional Playwright/Chromium runtime and explicit host approval.
+It never starts a server, installs a browser, calls a model or browses remote
+sites. The read-only safety tier blocks browser execution. Screenshots are private,
+bounded project artifacts. Request filtering permits only bounded read requests
+to the exact selected loopback origin; redirects, credentials and WebSockets are
+blocked. This filtering is not an OS network sandbox.
+
+To request the check automatically after passing project tests, configure:
+
+```yaml
+verification:
+  visual_url: http://127.0.0.1:5173/
+  visual_assertions:
+    - selector: main
+      visible: true
+    - selector: h1
+      text: Welcome
+  visual_viewport: {width: 1280, height: 800}
+  visual_timeout_seconds: 15
+```
+
+The URL and assertions are validated before execution. Missing browser support,
+denied approval or an unperformed check blocks verification rather than claiming
+success or repeatedly asking a model to fix an installation problem. A screenshot
+without assertions is `captured`, not `verified`. This is a browser/DOM assertion
+hook, not a vision-model assessment or comparison against a wireframe. Current
+private artifact storage requires POSIX no-follow directory operations; other
+platforms report unavailable. Install the optional `visual` dependency and a
+compatible Chromium separately when needed.

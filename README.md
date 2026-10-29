@@ -1,6 +1,20 @@
-# Local Coding Agent
+# Clin
 
-Local Coding Agent is a Python coding agent for local model backends. It combines repository context, role-specific tools, and a bounded model/tool loop that can inspect files, apply edits, run tests, and feed results back into the model.
+Clin is an agent workspace for planning, building, and reviewing software with your own cloud provider or on-device model. The desktop manager pairs a focused task composer with a Code OSS IDE, repository context, role-specific tools, and a bounded execution loop.
+
+The workspace includes keyboard command search (Ctrl/⌘ K), file navigation (Ctrl/⌘ P), source-context attachments, a searchable task inbox with project-specific pins, readable Markdown reports, and an inspector for actual plans, activity, artifacts, and context budgets. Planning actions prepare a draft for review before a run starts.
+
+Existing `local-coder` commands, saved workspace directories, provider settings, and IDE extension IDs remain compatible. Clin is the product display name; commercial name and trademark availability have not been verified.
+
+![Clin workspace](docs/images/clin-workspace.png)
+
+*Workspace preview with synthetic tasks; no model is connected in this fixture.*
+
+Agent workflow improvements and remaining work are documented in the
+[execution and context audit](docs/reviews/2026-10-26-agentic-audit.md).
+Agents also have [bounded public web search](docs/web-search.md) through an
+explicitly configured MCP search service; no search account or credential is
+enabled automatically.
 
 ## Install
 
@@ -618,7 +632,7 @@ review is the default; opt into fixes and test execution explicitly. `/hunt`,
 `/audit`, `/plan`, `/review` and file mentions such as `@src/app.py` also work.
 See [harness details](docs/harness.md).
 
-The IDE is a **separate Code OSS source fork**, with Local Coder bundled as a
+The IDE is a **separate Code OSS source fork**, with Clin bundled as a
 first-party integration. It shares the Python harness and model providers.
 See [desktop setup](desktop/README.md) and [IDE source/build instructions](ide/README.md).
 Windows and macOS installers are built on their matching OS; release signing
@@ -749,3 +763,54 @@ local models make far more often than frontier ones.
 
 Each can be turned off per agent class with `parse_text_tool_calls`,
 `require_read_before_overwrite`, and `check_syntax_after_edits`.
+
+## Context memory and evolving harness
+
+The desktop sidebar now includes **Project memory**, **Harness controls**, and
+**Connections & skills**. Context is retrieved within a fixed budget before each
+agent step; file snapshots, shared model-call/token/cost caps, declarative model
+profiles and bounded leaf delegation keep long tasks reviewable. The IDE adds
+**Clin: Inspect Language Context**, **Compare Agent Snapshot**, and **Inspect Project Memory** commands.
+
+See [context memory](docs/context-memory.md), [adaptive scaffolding](docs/adaptive-harness.md),
+[language context](docs/language-context.md), [MCP and skills](docs/mcp-and-skills.md),
+and [local security generation](docs/exploit-generation.md) for interfaces and limits.
+See [context budgets and debugging](docs/context-management.md),
+[adversarial regression scope](docs/adversarial-testing.md), and
+[optional Rust acceleration](native/README.md) for the added development workflows.
+GitHub MCP is an explicit connection using your chosen environment variable; it
+starts disabled. The built-in vector backend uses local lexical hashes, with no
+model download or claim of neural semantic search.
+
+## Automatic model and review setup
+
+Model settings browse the complete live OpenRouter catalog, including exact
+`:free` variants, context windows, output limits, prices and tool support. Named
+connection profiles store configuration and environment-variable references,
+never API key values. The native IDE also has an OpenRouter catalog picker.
+Automatic context allocation adapts to the operating mode and stays within
+the detected model window and the task's request budget. Its displayed prompt
+allowance is a conservative UTF-8/JSON bound, not an exact tokenizer count.
+
+OpenRouter's daily free allowance counts **requests**, not tokens. When reported
+capacity is exhausted, the job pauses at a recoverable checkpoint; it never
+switches to paid inference automatically. Choose an on-device model, wait for a
+confirmed reset, or explicitly select a paid model and positive spending limit
+before resuming. Unknown account limits remain unknown. See the
+[official rate-limit contract](https://openrouter.ai/docs/api_reference/limits).
+
+The On-device tab automatically discovers local GGUF files and compatible
+runtime executable headers. Search results distinguish model tensors from
+vocabulary fixtures and candidates from runtimes that have actually started.
+Selecting a path does not execute it or download model weights. The protected,
+path-only location manifest is `~/.config/local-coder/locations.env` on Linux;
+the UI shows the platform-specific path. It is parsed as data, never sourced
+as shell commands. Owner-only permissions protect preferences; they do not
+make files immutable against the owning operating-system account.
+
+Red Team's **Review this project** action prepares a local source-only
+engagement automatically. Private preferences live in
+`.local-coder/redteam.defaults.env`; hostnames receive an HTTPS scheme (HTTP
+for loopback). Optional HTTP scope still requires an explicitly created,
+authorized engagement. Saving setup or browsing model metadata sends no
+requests to engagement targets.

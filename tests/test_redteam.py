@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -138,10 +139,11 @@ def test_dns_changes_never_retarget_a_saved_engagement(tmp_path,monkeypatch):
     assert EngagementStore(str(tmp_path)).load(record['id'])['requests_used']==0
 
 
-def test_engagement_api_requires_a_scope_and_rejects_fix_or_plan(tmp_path):
+def test_engagement_api_defaults_to_local_scope_and_rejects_fix_or_plan(tmp_path):
     from local_coder.remote import RemoteControlServer
     server=RemoteControlServer(str(tmp_path))
-    assert server.handle('POST','/jobs',{'request':'Review boundaries','mode':'red_team'})[0]==400
+    defaults = server.handle('GET', '/engagements/defaults')[1]['settings']
+    assert defaults['origins'] == [] and defaults['active_http'] is False
     assert server.handle('POST','/engagements',{'name':'lab','objective':'test','active_http':True,'origins':['https://example.test']})[0]==400
     status,engagement=server.handle('POST','/engagements',{'name':'lab','objective':'test'})
     assert status==201
@@ -235,14 +237,18 @@ def test_redteam_job_runs_the_bound_engagement_and_persists_identity(tmp_path,mo
             self.calls+=1
             if self.calls==1:return ModelResponse(tool_calls=[ToolCall(name='redteam_workspace',arguments={'action':'scan'})])
             if self.calls==2:
-                evidence=json.loads(messages[-1].content)['evidence_id']
+                # The expanded static evidence can be archived and bounded for
+                # the prompt. The stable ID is retained in the output head.
+                evidence=re.search(r'"evidence_id":\s*"([^"]+)"', messages[-1].content).group(1)
                 return ModelResponse(tool_calls=[ToolCall(name='redteam_record_finding',arguments={'title':'Possible eval sink','asset':'app/api.py','evidence_ids':[evidence],'hypothesis':'Inspect callers; unverified'})])
-            assert json.loads(messages[-1].content)['verification']=='unverified'
+            assert re.search(r'"verification":\s*"unverified"', messages[-1].content)
             return ModelResponse(content='Static candidate, unverified.')
         async def close(self):pass
     monkeypatch.setattr(ModelManager,'_create_backend',lambda *args:Model())
     server=RemoteControlServer(str(tmp_path))
-    server.handle('POST','/settings',{'model_id':'test','backend':'openai_compatible','base_url':'http://localhost:1234/v1'})
+    # Routing reads stable handle fields from bounded tool output; full scan
+    # evidence is archived independently. Tiny-window compaction has separate tests.
+    server.handle('POST','/settings',{'model_id':'test','backend':'openai_compatible','base_url':'http://localhost:1234/v1','context_length':131072})
     status,job=server.handle('POST','/jobs',{'request':'Review boundaries','mode':'red_team','engagement_id':record['id']})
     assert status==202
     for _ in range(300):

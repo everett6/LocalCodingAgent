@@ -21,4 +21,5 @@ def test_two_apps_share_one_engine_in_either_order_and_during_race(tmp_path):
     assert result.returncode == 0, result.stderr
     for order in ['manager-first', 'ide-first', 'simultaneous']:
         assert order + ': one authenticated engine' in result.stdout
+    assert 'owner-exit: explicit reconnect recovered one authenticated engine' in result.stdout
     assert not list((home/'.local-coder/connections').glob('*.json'))

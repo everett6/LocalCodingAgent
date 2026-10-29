@@ -188,8 +188,13 @@ def load_config(
             backend=backend,
             base_url=model_data.get("base_url", "http://localhost:11434"),
             context_length=model_data.get("context_length", 8192),
+            auto_context=model_data.get("auto_context", True),
+            context_source=model_data.get("context_source", "configured"),
             temperature=temperature if temperature is not None else model_data.get("temperature", 0.2),
             max_tokens=model_data.get("max_tokens", 4096),
+            input_cost_per_million=model_data.get("input_cost_per_million"),
+            output_cost_per_million=model_data.get("output_cost_per_million"),
+            request_cost_usd=model_data.get("request_cost_usd", 0),
             quantization=model_data.get("quantization"),
             gpu_layers=model_data.get("gpu_layers"),
             estimated_vram_mb=model_data.get("estimated_vram_mb"),
@@ -210,6 +215,11 @@ def load_config(
         run_tests_after_changes=verification_data.get("run_tests_after_changes", True),
         max_fix_iterations=verification_data.get("max_fix_iterations", 3),
         rollback_on_failure=verification_data.get("rollback_on_failure", False),
+        require_review=verification_data.get("require_review", True),
+        visual_url=verification_data.get("visual_url"),
+        visual_assertions=verification_data.get("visual_assertions", []),
+        visual_viewport=verification_data.get("visual_viewport"),
+        visual_timeout_seconds=verification_data.get("visual_timeout_seconds", 15),
     )
 
     # Safe by default: an absent `approval:` section (or an absent key
@@ -239,7 +249,8 @@ def load_config(
     fallbacks = {}
     for name, alternatives in (routing_data.get("fallbacks", {}) or {}).items():
         fallbacks[name] = [alternatives] if isinstance(alternatives, str) else list(alternatives or [])
-    routing = RoutingConfig(escalate_to=routing_data.get("escalate_to"), fallbacks=fallbacks)
+    routing = RoutingConfig(**{key: value for key, value in routing_data.items()
+                              if key in RoutingConfig.model_fields and key != "fallbacks"}, fallbacks=fallbacks)
 
     tools_data = data.get("tools", {}) or {}
     tool_roles = {role: list(names or []) for role, names in (tools_data.get("roles", {}) or {}).items()}
@@ -257,7 +268,9 @@ def load_config(
         roles=tool_roles,
     )
 
+    from local_coder.types import HarnessSettings
     return ProjectConfig(
+        harness=HarnessSettings.model_validate(data.get("harness", {})),
         models=models,
         resources=resources,
         verification=verification,

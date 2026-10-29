@@ -100,9 +100,17 @@ def triage(findings: list, root: Path, suppressions: list[Lesson], baseline: set
         # Fingerprint with the first scanner name so a finding that bandit and
         # semgrep both report keeps one identity whichever ran.
         scanner = finding.scanner.split("+")[0]
-        fp = fingerprint(scanner, finding.rule, finding.path, _line_text(root, finding.path, finding.line, cache), finding.line)
+        text = _line_text(root, finding.path, finding.line, cache)
+        legacy = fingerprint(scanner, finding.rule, finding.path, text, finding.line)
+        # Relative occurrence among equal source anchors survives unrelated line
+        # insertion while keeping two identical sink lines distinct. Legacy
+        # baselines still mean "previously seen", then migrate on promotion.
+        anchor = " ".join(text.split())
+        occurrence = sum(" ".join(line.split()) == anchor
+                         for line in cache.get(finding.path, [])[:finding.line]) if anchor else finding.line
+        fp = hashlib.sha256(f"{legacy}|occurrence:{occurrence}".encode()).hexdigest()[:24]
         result.fingerprints[id(finding)] = fp
-        if baseline is not None and fp not in baseline:
+        if baseline is not None and fp not in baseline and legacy not in baseline:
             result.new.add(fp)
         result.findings.append(finding)
     result.findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), not result.is_new(f), f.path, f.line))

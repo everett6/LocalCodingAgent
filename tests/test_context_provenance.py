@@ -63,3 +63,28 @@ def test_external_edit_between_read_and_checkpoint_does_not_bless_new_source(tmp
         with pytest.raises(ValueError, match='changed'):
             validate_workspace_file_fingerprints(str(tmp_path), observed[-1])
     asyncio.run(scenario())
+
+
+def test_rejected_source_read_does_not_poison_checkpoint_or_stop_recovery(tmp_path):
+    class Agent(BaseAgent):
+        role = AgentRole.CODER
+        system_prompt = 'Respect workspace boundaries.'
+    class Model:
+        config = SimpleNamespace(temperature=0., max_tokens=100, context_length=8192)
+        responses = iter([
+            ModelResponse(tool_calls=[ToolCall(id='outside', name='read_file', arguments={'path': '../outside.py'})]),
+            ModelResponse(content='The source is outside the workspace; recorded the boundary.'),
+        ])
+        async def generate(self, messages, **kwargs):
+            return next(self.responses)
+    async def scenario():
+        registry = create_tool_registry(str(tmp_path))
+        registry.runtime = AgentRuntime(str(tmp_path))
+        agent = Agent(Model(), registry)
+        response = await agent.execute(AgentTask(role=AgentRole.CODER, objective='Inspect source boundaries'))
+        assert response.summary.startswith('The source is outside')
+        assert agent.state.files_read == set()
+        assert agent._metrics.tool_calls == 1
+        for path in registry.runtime.state_dir.glob('checkpoint_*.json'):
+            assert json.loads(path.read_text())['notes']['workspace_file_fingerprints'] == {}
+    asyncio.run(scenario())

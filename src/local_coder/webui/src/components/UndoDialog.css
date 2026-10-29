@@ -1,0 +1,9 @@
+.undo-dialog{width:min(440px,calc(100vw - 32px));padding:24px;color:#e7e7e9;background:#202123;border:1px solid #3c3d42;border-radius:16px;box-shadow:0 24px 80px #0007;font:inherit}
+.undo-dialog::backdrop{background:#0008;backdrop-filter:blur(3px)}
+.undo-dialog h2{margin:0 0 10px;font-size:19px;font-weight:550;letter-spacing:-.02em}
+.undo-dialog p{color:#a9abb2;font-size:13px;line-height:1.6}
+.undo-dialog .undo-task-name{color:#dedee3;overflow-wrap:anywhere}
+.undo-dialog footer{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+.undo-dialog button{border:1px solid #4a4b52;border-radius:8px;padding:9px 13px;font:inherit;font-size:12px;color:#e4e4e8;background:#2c2d31;cursor:pointer}
+.undo-dialog button.primary{background:#b8c5ff;color:#151820;border-color:#b8c5ff}
+.undo-dialog button:focus-visible{outline:2px solid #c4cfff;outline-offset:3px}

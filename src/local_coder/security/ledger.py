@@ -10,10 +10,15 @@ from one batch to the next the same way.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from contextlib import contextmanager
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from local_coder.file_lock import exclusive_lock
+from local_coder.statedir import state_path
 from local_coder.security.lessons import STATE_DIR, Lesson
 
 LEDGER_FILE = f"{STATE_DIR}/ledger.json"
@@ -42,7 +47,12 @@ class LedgerEntry:
         # The same issue reported twice (by two batches, or once more after a
         # compaction) updates one entry instead of adding a duplicate.
         subject = self.rule or re.sub(r"[^a-z0-9]+", " ", self.title.lower()).strip()
-        return f"{self.path}|{subject}"
+        return f"{self.path}|{subject}|line:{self.line}"
+
+    @property
+    def legacy_key(self) -> str:
+        """Pre-occurrence identity, retained only for evidence migration."""
+        return self.key.rsplit("|line:", 1)[0]
 
     def location(self) -> str:
         return f"{self.path}:{self.line}" if self.line else self.path
@@ -73,33 +83,97 @@ class LedgerEntry:
 class FindingsLedger:
     path: Path
     entries: list[LedgerEntry] = field(default_factory=list)
+    _project_root: Path | None = field(default=None, repr=False)
 
     @classmethod
     def for_project(cls, project_root: str | Path) -> "FindingsLedger":
-        ledger = cls(Path(project_root) / LEDGER_FILE)
+        root = Path(project_root).resolve()
+        ledger = cls(root / LEDGER_FILE, _project_root=root)
         ledger.load()
         return ledger
 
+    def _safe_path(self, name: str) -> Path:
+        root = self._project_root or self.path.parent
+        relative = self.path.parent.relative_to(root) / name
+        return state_path(root, relative)
+
+    @contextmanager
+    def _locked(self):
+        lock_path = self._safe_path(self.path.name + ".lock")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(lock_path, flags, 0o600), "a+") as lock_file:
+            with exclusive_lock(lock_file):
+                yield
+
     def load(self) -> None:
+        with self._locked():
+            self._load_unlocked()
+
+    def _load_unlocked(self) -> None:
+        path = self._safe_path(self.path.name)
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = []
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "r", encoding="utf-8") as source:
+                data = json.load(source)
+        except FileNotFoundError:
+            self.entries = []
+            return
+        except (OSError, ValueError) as exc:
+            raise ValueError("Findings ledger is unreadable; preserve it and restore a valid copy") from exc
+        if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+            raise ValueError("Findings ledger must contain a list of finding objects")
         fields = set(LedgerEntry.__dataclass_fields__)
-        self.entries = [
-            LedgerEntry(**{k: v for k, v in item.items() if k in fields}) for item in data if isinstance(item, dict)
-        ]
+        try:
+            entries = [LedgerEntry(**{k: v for k, v in item.items() if k in fields}) for item in data]
+            self._validate_entries(entries)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Findings ledger contains invalid records; preserve it before recovery") from exc
+        self.entries = entries
+
+    @staticmethod
+    def _validate_entries(entries: list[LedgerEntry]) -> None:
+        fields = set(LedgerEntry.__dataclass_fields__)
+        for entry in entries:
+            if (entry.status not in STATUSES or entry.severity not in SEVERITIES
+                    or type(entry.line) is not int or entry.line < 0
+                    or type(entry.confidence) is not int or not 1 <= entry.confidence <= 10
+                    or any(not isinstance(getattr(entry, name), str) for name in fields - {"line", "confidence"})):
+                raise ValueError("Invalid finding fields")
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps([asdict(entry) for entry in self.entries], indent=2), encoding="utf-8")
+        """Replace the snapshot explicitly; use record() for concurrent updates."""
+        with self._locked():
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        self._validate_entries(self.entries)
+        path = self._safe_path(self.path.name)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                             prefix=".ledger-", suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                json.dump([asdict(entry) for entry in self.entries], output, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            self._safe_path(self.path.name)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def reset(self) -> None:
-        self.entries = []
-        self.save()
+        with self._locked():
+            self.entries = []
+            self._save_unlocked()
 
     def record(self, entry: LedgerEntry) -> tuple[LedgerEntry, bool]:
-        """Add or update an entry. Returns (stored entry, created)."""
+        """Merge against the latest disk state under a cross-process lock."""
+        with self._locked():
+            self._load_unlocked()
+            return self._record_unlocked(entry)
+
+    def _record_unlocked(self, entry: LedgerEntry) -> tuple[LedgerEntry, bool]:
         for index, existing in enumerate(self.entries):
             if existing.key == entry.key or (entry.id and existing.id == entry.id):
                 merged = LedgerEntry(**{
@@ -107,14 +181,18 @@ class FindingsLedger:
                     for name, value in asdict(entry).items()
                 })
                 merged.id = existing.id
+                # Repeated scanner imports cannot erase a reviewed dismissal.
+                if existing.status == "false_positive":
+                    merged.status = existing.status
+                    merged.lesson = existing.lesson or merged.lesson
                 self.entries[index] = merged
-                self.save()
+                self._save_unlocked()
                 return merged, False
         entry.status = entry.status or "suspected"
         entry.confidence = entry.confidence or 5
         entry.id = f"F{len(self.entries) + 1}"
         self.entries.append(entry)
-        self.save()
+        self._save_unlocked()
         return entry, True
 
     def reportable(self, min_confidence: int = REPORT_MIN_CONFIDENCE) -> list[LedgerEntry]:

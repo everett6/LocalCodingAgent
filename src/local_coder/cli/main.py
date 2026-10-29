@@ -254,6 +254,10 @@ def security_lessons_suppress(ctx, rule, path_glob, reason):
     console.print("[green]Added to SECURITY_LESSONS.md[/green]" if added else "[yellow]Already in SECURITY_LESSONS.md[/yellow]")
 
 
+from local_coder.security.cli import security_findings
+cli.add_command(security_findings)
+
+
 @cli.command(name="validate-finding")
 @json_option
 @click.argument("finding", nargs=-1, required=True)

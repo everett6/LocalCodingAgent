@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 from typing import Any
 
@@ -11,6 +12,7 @@ from local_coder.workspace import Workspace
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
 from local_coder.context.source_snapshot import read_source_snapshot
+from local_coder.processes import process_options, terminate_tree
 
 
 def _resolve_and_check_path(project_root: str, path: str) -> Path:
@@ -332,11 +334,38 @@ def _patched_files(patch: str) -> list[str]:
     return files
 
 
+def patch_targets(project_root: str, patch: str, working_dir: str | None = None) -> list[str]:
+    """Validate both sides of every unified header before GNU patch sees them."""
+    if not isinstance(patch, str) or not patch or len(patch.encode()) > 2_000_000:
+        raise ValueError("Provide a bounded unified diff")
+    workspace = Workspace(project_root)
+    cwd = workspace.resolve(working_dir or ".")
+    targets = []
+    for line in patch.splitlines():
+        if not line.startswith(("--- ", "+++ ")):
+            continue
+        header = line[4:].split("\t", 1)[0].strip()
+        if header == "/dev/null":
+            continue
+        # Quoted/ambiguous filenames and context diffs are deliberately unsupported.
+        parts = header.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1] or header.startswith(("/", '"')) or ".." in Path(parts[1]).parts:
+            raise ValueError("Patch headers must use unquoted a/path and b/path filenames")
+        relative = workspace.relative_path(cwd / parts[1])
+        if Path(relative).parts[0] in {".git", ".local-coder"}:
+            raise ValueError("Patches cannot modify private engine or Git state")
+        if relative not in targets:
+            targets.append(relative)
+    if not targets:
+        raise ValueError("No valid unified diff file headers found")
+    return targets
+
+
 class ApplyPatchTool(Tool):
     name = ToolName.APPLY_PATCH
     description = (
-        "Apply a unified diff patch atomically: all file paths are checked first, "
-        "and affected files are restored if application fails."
+        "Validate a complete unified diff before editing and restore its affected "
+        "files on application failure. Concurrent user edits still require care."
     )
     parameters = {
         "type": "object",
@@ -353,6 +382,55 @@ class ApplyPatchTool(Tool):
         
     async def execute(self, patch: str, working_dir: str | None = None, **kwargs: Any) -> ToolResult:
         start_t = time.time()
+        process_started = False
+        potential_targets = []
+        backups = {}
+        workspace = Workspace(self.project_root)
+
+        async def run_patch(cwd, *, dry_run=False):
+            nonlocal process_started
+            args = ["patch", "--batch", "--forward", "--no-backup-if-mismatch", "--reject-file=-", "-p1"]
+            if dry_run:
+                args.append("--dry-run")
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=cwd, **process_options(),
+            )
+            if not dry_run:
+                process_started = True
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(patch.encode()), timeout=30)
+                return proc.returncode, stdout, stderr
+            except BaseException:
+                if proc.returncode is None:
+                    await terminate_tree(proc)
+                raise
+
+        def restore():
+            errors = []
+            for relative, backup in backups.items():
+                temporary = None
+                try:
+                    target = workspace.resolve(relative)
+                    if (workspace.root / relative).is_symlink() or (target.exists() and not target.is_file()):
+                        raise ValueError("Patch target changed type")
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        content, mode = backup
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        descriptor, temporary = tempfile.mkstemp(prefix=".patch-restore-", dir=target.parent)
+                        with os.fdopen(descriptor, "wb") as stream:
+                            stream.write(content)
+                        os.chmod(temporary, mode)
+                        os.replace(temporary, target)
+                except (OSError, ValueError):
+                    errors.append(relative)
+                finally:
+                    if temporary is not None:
+                        Path(temporary).unlink(missing_ok=True)
+            return errors
+
         try:
             if self.safety_harness:
                 allowed, _ = self.safety_harness.can_modify_files()
@@ -361,87 +439,71 @@ class ApplyPatchTool(Tool):
                         success=False,
                         output="Operation blocked: Current Safety Tier does not allow file modifications (Read-Only Mode).",
                         error="Blocked by Safety Tier 1 (Paranoia)",
+                        data={"execution_outcome": "not_started", "potential_targets": []},
                         duration_ms=int((time.time() - start_t) * 1000),
                     )
 
             cwd = _resolve_and_check_path(self.project_root, working_dir or ".")
-            workspace = Workspace(self.project_root)
-            rel_paths = _patched_files(patch)
-            if not rel_paths:
-                return ToolResult(
-                    success=False,
-                    output="Patch contains no supported file paths.",
-                    duration_ms=int((time.time() - start_t) * 1000),
-                )
-
-            targets: dict[str, Path] = {}
-            for rel in rel_paths:
-                target = workspace.resolve(cwd / rel)
-                if target.exists() and not target.is_file():
-                    raise ValueError(f"Patch target is not a regular file: {rel}")
-                targets[workspace.relative_path(target)] = target
-
-            backups: dict[str, tuple[bytes, int] | None] = {}
-            for rel, target in targets.items():
-                if target.is_file():
-                    stat = target.stat()
-                    backups[rel] = (target.read_bytes(), stat.st_mode)
+            potential_targets = patch_targets(self.project_root, patch, working_dir)
+            if len(potential_targets) > 50:
+                raise ValueError("Patch requires at most 50 files")
+            backup_bytes = 0
+            for relative in potential_targets:
+                target = workspace.resolve(relative)
+                if target.exists():
+                    snapshot = await asyncio.to_thread(read_source_snapshot, self.project_root, relative,
+                                                       max_bytes=2 * 1024 * 1024)
+                    backup_bytes += len(snapshot.data)
+                    if backup_bytes > 8 * 1024 * 1024:
+                        raise ValueError("Patch backup exceeds 8 MiB limit")
+                    backups[relative] = (snapshot.data, target.stat().st_mode & 0o777)
                 else:
-                    backups[rel] = None
+                    backups[relative] = None
 
-            proc = await asyncio.create_subprocess_exec(
-                "patch", "--dry-run", "-p1",
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=cwd,
-            )
-            stdout, stderr = await proc.communicate(patch.encode())
-            if proc.returncode != 0:
+            returncode, stdout, stderr = await run_patch(cwd, dry_run=True)
+            if returncode != 0:
                 output = stdout.decode(errors="replace")
                 if stderr:
                     output += f"\nStderr:\n{stderr.decode(errors='replace')}"
                 return ToolResult(
                     success=False,
                     output=(output.strip() + "\nPatch validation failed; no files were changed.").strip(),
+                    data={"execution_outcome": "not_started", "potential_targets": potential_targets},
                     duration_ms=int((time.time() - start_t) * 1000),
                 )
-
-            proc = await asyncio.create_subprocess_exec(
-                "patch", "-p1",
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=cwd,
-            )
-            stdout, stderr = await proc.communicate(patch.encode())
-            success = proc.returncode == 0
+            returncode, stdout, stderr = await run_patch(cwd)
+            success = returncode == 0
             res_str = stdout.decode(errors="replace")
             if stderr:
                 res_str += f"\nStderr:\n{stderr.decode(errors='replace')}"
             if not success:
-                rollback_errors = []
-                for rel, target in targets.items():
-                    try:
-                        backup = backups[rel]
-                        if backup is None:
-                            if target.is_file():
-                                target.unlink()
-                        else:
-                            content, mode = backup
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_bytes(content)
-                            os.chmod(target, mode)
-                    except OSError as error:
-                        rollback_errors.append(f"{rel}: {error}")
+                rollback_errors = await asyncio.to_thread(restore)
                 if rollback_errors:
                     res_str += "\nRollback failed for: " + "; ".join(rollback_errors)
                 else:
                     res_str += "\nPatch failed; all affected files were restored."
-            files_changed = [
-                workspace.relative_path(target) for target in targets.values()
-            ] if success else []
+            files_changed = [workspace.relative_path(cwd / relative) for relative in _patched_files(patch)] if success else []
             return ToolResult(
                 success=success,
                 output=res_str.strip(),
                 files_changed=files_changed,
+                # A nonzero exit may follow successfully applied earlier hunks.
+                # Headers identify possible effects, not observed file changes.
+                data={"execution_outcome": "completed" if success else "unknown",
+                      "potential_targets": potential_targets},
                 duration_ms=int((time.time()-start_t)*1000),
             )
+        except asyncio.CancelledError:
+            if process_started:
+                await asyncio.to_thread(restore)
+            raise
         except Exception as e:
-            return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time()-start_t)*1000))
+            rollback_errors = await asyncio.to_thread(restore) if process_started else []
+            detail = f"Error: {str(e)}"
+            if process_started:
+                detail += ("\nRollback failed for: " + "; ".join(rollback_errors) if rollback_errors
+                           else "\nPatch failed; all affected files were restored.")
+            return ToolResult(success=False, output=detail,
+                              data={"execution_outcome": "unknown" if process_started else "not_started",
+                                    "potential_targets": potential_targets},
+                              duration_ms=int((time.time()-start_t)*1000))

@@ -1,7 +1,8 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),crypto=require('node:crypto'),http=require('node:http');
 const {discoverEngine}=require('../discovery.cjs');
 test('discovery rejects stale, unsafe, and cross-workspace descriptors',async()=>{
-  const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'discovery-')),directory=path.join(workspace,'connections');fs.mkdirSync(directory,{mode:0o700});
+  const realWorkspace=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'discovery-'))).split(path.sep).join('/');
+  const workspace=process.platform==='win32'?realWorkspace.toLowerCase():realWorkspace,directory=path.join(workspace,'connections');fs.mkdirSync(directory,{mode:0o700});
   const file=path.join(directory,crypto.createHash('sha256').update(workspace).digest('hex')+'.json');
   let hits=0;
   const server=http.createServer((req,res)=>{hits++;res.end(JSON.stringify({project_root:os.tmpdir()}));});

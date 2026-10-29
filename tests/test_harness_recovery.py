@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from local_coder.agents.base import BaseAgent
+from tests.test_agents import fake_schemas
 from local_coder.core.runtime import AgentRuntime
 from local_coder.orchestrator.coordinator import Coordinator
 from local_coder.types import (
@@ -35,13 +36,14 @@ class ScriptedModel:
 
 
 class Registry:
-    def __init__(self, runtime, results=()):
+    def __init__(self, runtime, results=(), tool_names=("read_file",)):
         self.runtime = runtime
         self.results = iter(results)
         self.calls = []
+        self.tool_names = tool_names
 
     def get_schemas_for_role(self, role):
-        return []
+        return fake_schemas(*self.tool_names)
 
     async def execute_tool(self, role, name, arguments):
         self.calls.append((name, arguments))
@@ -68,7 +70,7 @@ def test_restart_after_complete_batch_preserves_history_and_remaining_budgets(tm
         registry = Registry(runtime, [
             ToolResult(success=True, output="code", files_changed=["app.py"]),
             ToolResult(success=False, output="red regression"),
-        ])
+        ], tool_names=("read_file", "run_tests"))
         agent = HarnessAgent(first_model, registry)
         agent.max_iterations, agent.max_tool_calls, agent.max_test_runs = 3, 3, 2
         with pytest.raises(ProcessCrash):
@@ -88,7 +90,8 @@ def test_restart_after_complete_batch_preserves_history_and_remaining_budgets(tm
             ModelResponse(tool_calls=[ToolCall(name="run_tests", arguments={"test_path": "tests/test_app.py"})]),
             ModelResponse(content="Verified boundary.", prompt_tokens=2),
         ])
-        next_registry = Registry(restarted, [ToolResult(success=True, output="green regression")])
+        next_registry = Registry(restarted, [ToolResult(success=True, output="green regression")],
+                                 tool_names=("run_tests",))
         resumed = HarnessAgent(next_model, next_registry)
         response = await resumed.resume(recovered)
         assert next_registry.calls == [("run_tests", {"test_path": "tests/test_app.py"})]
@@ -121,14 +124,15 @@ def test_resume_uses_remaining_budget_and_prior_failed_test(tmp_path, limit):
         agent = HarnessAgent(ScriptedModel([
             ModelResponse(tool_calls=[ToolCall(name="run_tests", arguments={"test_path": "a.py"})]),
             ProcessCrash(),
-        ]), Registry(runtime, [ToolResult(success=False, output="red")]))
+        ]), Registry(runtime, [ToolResult(success=False, output="red")], tool_names=("run_tests",)))
         agent.max_iterations, agent.max_tool_calls, agent.max_test_runs = 2, (1 if limit == "tool-call" else 10), 1
         with pytest.raises(ProcessCrash):
             await agent.execute(AgentTask(role=AgentRole.SECURITY, objective="Inspect"))
         path = runtime.state_dir / f"checkpoint_{agent.state.run_id}_1.json"
         recovered = await AgentRuntime(str(tmp_path)).recover_from_checkpoint(agent.state.run_id, str(path))
         assert recovered is not None
-        registry = Registry(recovered._runtime)
+        registry = Registry(recovered._runtime,
+                            tool_names=("read_file" if limit == "tool-call" else "run_tests",))
         resumed = HarnessAgent(ScriptedModel([
             ModelResponse(tool_calls=[ToolCall(name="read_file" if limit == "tool-call" else "run_tests")]),
         ]), registry)
@@ -253,7 +257,8 @@ def test_crash_during_batch_never_saves_or_replays_partial_tools(tmp_path):
                 if len(self.calls) == 1:
                     raise ProcessCrash()
                 return await super().execute_tool(role, name, arguments)
-        registry = CrashingRegistry(runtime, [ToolResult(success=True, output="changed", files_changed=["app.py"])])
+        registry = CrashingRegistry(runtime, [ToolResult(success=True, output="changed", files_changed=["app.py"])],
+                                    tool_names=("write_file", "run_tests"))
         agent = HarnessAgent(ScriptedModel([ModelResponse(tool_calls=[
             ToolCall(name="write_file", arguments={"path": "app.py"}),
             ToolCall(name="run_tests"),
@@ -312,7 +317,9 @@ class Model:
 class Registry:
     runtime = AgentRuntime(str(root))
     def get_schemas_for_role(self, role):
-        return []
+        return [{"type": "function", "function": {"name": "record", "parameters": {
+            "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"],
+        }}}]
     async def execute_tool(self, role, name, arguments):
         with (root / "effects.txt").open("a") as target:
             target.write(arguments["value"] + "\n")
@@ -345,3 +352,51 @@ asyncio.run(Agent(Model(), Registry()).execute(AgentTask(role=AgentRole.SECURITY
         assert [message.content for message in model.calls[0][-2:]] == ["one", "two"]
     asyncio.run(scenario())
     assert (tmp_path / "effects.txt").read_text() == "one\ntwo\n"
+
+
+@pytest.mark.parametrize("edit_after_check", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+def test_goal_verification_remembers_test_revision(tmp_path, edit_after_check, resume):
+    from local_coder.memory.goals import GoalLedger
+
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.test", "commit", "--allow-empty",
+                    "-m", "init"], check=True, capture_output=True)
+
+    async def scenario():
+        runtime = AgentRuntime(str(tmp_path))
+        ledger = GoalLedger(tmp_path)
+
+        class EditingRegistry(Registry):
+            async def execute_tool(self, role, name, arguments):
+                if name == "write_file":
+                    (tmp_path / "changed.py").write_text("changed = True")
+                return ToolResult(success=True, output="ok")
+
+        calls = [ModelResponse(tool_calls=[ToolCall(name="run_tests", arguments={})])]
+        if edit_after_check:
+            calls.append(ModelResponse(tool_calls=[ToolCall(name="write_file", arguments={})]))
+        calls.append(ModelResponse(content="Verified."))
+        registry = EditingRegistry(runtime, tool_names=("run_tests", "write_file") if edit_after_check else ("run_tests",))
+        registry.goal_ledger = ledger
+        agent = HarnessAgent(ScriptedModel(calls), registry)
+        task = AgentTask(role=AgentRole.SECURITY, objective="Verify project")
+        if resume:
+            agent.model = ScriptedModel([calls[0], ProcessCrash()])
+            with pytest.raises(ProcessCrash):
+                await agent.execute(task)
+            checkpoint = runtime.state_dir / f"checkpoint_{agent.state.run_id}_1.json"
+            recovered = await runtime.recover_from_checkpoint(agent.state.run_id, str(checkpoint))
+            agent = HarnessAgent(ScriptedModel(calls[1:]), registry)
+            response = await agent.resume(recovered)
+        else:
+            response = await agent.execute(task)
+        assert response.status == TaskStatus.COMPLETED
+        goal = ledger.get(task.task_id)
+        assert goal["status"] == ("verifying" if edit_after_check else "completed")
+        assert goal["evidence_stale"] is edit_after_check
+        checkpoints = list(runtime.state_dir.glob("checkpoint_*.json"))
+        assert any(json.loads(path.read_text())["notes"].get("test_revisions") for path in checkpoints)
+
+    asyncio.run(scenario())

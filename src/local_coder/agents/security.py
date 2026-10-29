@@ -19,6 +19,10 @@ Apply the task's reviewed SECURITY_LESSONS.md first; never re-report suppressed 
 Use security_scan for a secrets/bandit/semgrep baseline and prioritize [new] findings. Automatic run_sast,
 audit_config and audit_dependencies results are candidates, never proof of security or exploitability.
 Use security_playbook to select review and false-positive checklists.
+Use advanced_audit for Python AST candidates; dependency_intelligence for offline advisories.
+Verify callers, guards and reachability; missing matches do not establish safety.
+Describe only the scope and isolation that the active tools actually enforce. If a model or tool
+cannot perform a step, retain that blocker and continue available source review and remediation work.
 
 Map entry points, callers and trust boundaries. Trace attacker-controlled input through transformations to sinks:
 eval/exec, shell execution, SQL/templates, paths, deserializers, URL destinations, auth and object ownership.

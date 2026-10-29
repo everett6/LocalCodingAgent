@@ -1,6 +1,7 @@
 """Tests for context budgeting: tool-output truncation, pruning, summarization."""
 import asyncio
 import json
+import pytest
 from types import SimpleNamespace
 
 from local_coder.agents.base import BaseAgent
@@ -162,7 +163,7 @@ class ScriptedRegistry:
         self.outputs = iter(outputs)
 
     def get_schemas_for_role(self, role):
-        return []
+        return [{"type": "function", "function": {"name": "run_tests", "parameters": {"type": "object", "properties": {}}}}]
 
     async def execute_tool(self, role, name, arguments):
         return ToolResult(success=True, output=next(self.outputs))
@@ -228,17 +229,22 @@ class TestAgentLoopBudget:
 
     def test_server_reported_tokens_trigger_compaction(self):
         # Well under the 24000-char default budget, but the server says the
-        # prompt is at 950 of 1000 tokens.
-        near_limit = ModelResponse(content="", tool_calls=[call("2", "run_tests")], prompt_tokens=950)
+        # prompt is at 1450 of 1500 tokens.
+        near_limit = ModelResponse(content="", tool_calls=[call("2", "run_tests")], prompt_tokens=1450)
         model = ScriptedModel(
             [tool_turn("1"), near_limit, ModelResponse(content="done")],
-            context_length=1000,
+            context_length=1500,
         )
         agent = LoopAgent(model, ScriptedRegistry(["a" * 800, "b" * 800]))
 
-        run(agent.execute(AgentTask(role=AgentRole.CODER, objective="x")))
+        response = run(agent.execute(AgentTask(role=AgentRole.CODER, objective="x")))
 
-        assert any(m.content == PRUNED_TOOL_OUTPUT for m in model.calls[-1][0])
+        assert response.status == TaskStatus.COMPLETED
+        assert len(model.calls) == 3
+        assert all(item[1]["tools"][0]["function"]["name"] == "run_tests" for item in model.calls)
+        assert any(m.content == PRUNED_TOOL_OUTPUT or m.content.startswith("[Tool text compacted;")
+                   for m in model.calls[-1][0])
+        assert any("history before compaction:" in m.content for m in model.calls[-1][0])
 
 
 class TestReadFilePaging:
@@ -328,8 +334,10 @@ def test_spill_is_gitignored_and_never_follows_symlinks(tmp_path):
     other = tmp_path / "other"
     other.mkdir()
     (other / ".local-coder").symlink_to(outside)
-    agent2 = LoopAgent(ScriptedModel([]), create_tool_registry(str(other)), max_tool_output_chars=1000)
-    agent2._fit_tool_output(call("x", "run_tests"), big)
+    # Persistent context now opens during registry initialization, so refuse
+    # the untrusted state tree before any agent or spill can start.
+    with pytest.raises(ValueError, match="symlink"):
+        create_tool_registry(str(other))
     assert list(outside.iterdir()) == []
 
 
