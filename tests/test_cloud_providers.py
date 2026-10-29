@@ -123,7 +123,7 @@ def test_anthropic_stream_and_error_does_not_expose_key():
         backend = AnthropicBackend(config)
         await backend.close()
         backend.client = httpx.AsyncClient(base_url="https://api.anthropic.com/v1", transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, content='data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}\n\n')))
+            lambda request: httpx.Response(200, content='data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}\n\ndata: {"type":"message_stop"}\n\n')))
         assert [x async for x in backend.stream([Message(role="user", content="Hi")])] == ["hello"]
         await backend.close()
     asyncio.run(scenario())

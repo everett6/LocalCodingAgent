@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from local_coder.context.allocation import ContextAllocation
 
@@ -158,6 +158,8 @@ class ToolResult(BaseModel):
 
 # === Model Interface ===
 
+MAX_REPORTED_TOKENS = 1_000_000_000_000
+
 class ModelResponse(BaseModel):
     """Response from a model."""
     content: str = ""
@@ -166,6 +168,12 @@ class ModelResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    usage_reported: bool = Field(default=False, strict=True)
+    usage_cost_known: bool = Field(default=True, strict=True)
+    usage_details: dict[
+        Literal["uncached_input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
+        Annotated[int, Field(strict=True, ge=0, le=MAX_REPORTED_TOKENS)],
+    ] | None = Field(default=None, max_length=3)
     latency_ms: float = 0.0
     model: str = ""
     reasoning_content: str | None = Field(default=None, repr=False)

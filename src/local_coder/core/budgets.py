@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from local_coder.context.token_count import request_accounting
 from local_coder.context.telemetry import ContextTelemetry
+from local_coder.types import MAX_REPORTED_TOKENS
 
 _REQUEST_TELEMETRY: ContextVar[tuple[ContextTelemetry, str, tuple[str, ...]] | None] = ContextVar('request_telemetry', default=None)
 
@@ -46,6 +47,22 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
+def _valid_rate(value):
+    if type(value) not in (int, float) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _valid_usage(prompt, completion, reported=False):
+    return (type(prompt) is int and type(completion) is int
+            and 0 <= prompt <= MAX_REPORTED_TOKENS and 0 <= completion <= MAX_REPORTED_TOKENS
+            and prompt + completion <= MAX_REPORTED_TOKENS
+            and (prompt + completion > 0 or reported is True))
+
+
 class BudgetLedger:
     def __init__(self, *, max_requests=200, max_tokens=1_000_000, max_request_tokens=131072,
                  max_cost_usd=None, state_path=None, token_counter=None):
@@ -75,7 +92,7 @@ class BudgetLedger:
             return {'limits':self.limits.copy(),'requests':len(self.entries),
                     'tokens':sum(e['tokens'] for e in self.entries),
                     'cost_usd':sum(e.get('cost_usd') or 0 for e in self.entries),
-                    'cost_known':all(e['cost_usd'] is not None for e in self.entries),
+                    'cost_known':all(e.get('cost_known',e['cost_usd'] is not None) for e in self.entries),
                     'entries':[e.copy() for e in self.entries]}
 
     def reserve(self,config,messages,max_tokens,tools=None):
@@ -85,9 +102,10 @@ class BudgetLedger:
         input_price=getattr(config,'input_cost_per_million',None)
         output_price=getattr(config,'output_cost_per_million',None)
         request_price=getattr(config,'request_cost_usd',0)
-        if any(p is not None and (isinstance(p,bool) or not isinstance(p,(int,float)) or not math.isfinite(p) or p<0) for p in [input_price,output_price,request_price]):
+        if any(p is not None and not _valid_rate(p) for p in [input_price,output_price,request_price]):
             raise BudgetExceeded('Invalid model pricing')
         cost=(prompt_bound*input_price+output*output_price)/1_000_000+request_price if input_price is not None and output_price is not None and request_price is not None else None
+        if cost is not None and not math.isfinite(cost):raise BudgetExceeded('Invalid model pricing')
         with self._lock:
             status=self.status()
             if len(self.entries)>=self.limits['max_requests']:raise BudgetExceeded('Model request limit reached')
@@ -95,10 +113,12 @@ class BudgetLedger:
             if status['tokens']+tokens>self.limits['max_tokens']:raise BudgetExceeded('Shared token budget exhausted')
             if self.limits['max_cost_usd'] is not None:
                 if cost is None:raise BudgetExceeded('Known model pricing is required for a dollar cap')
+                if not status['cost_known']:raise BudgetExceeded('A previous request has unknown cost; review usage before continuing under a dollar cap')
                 if status['cost_usd']+cost>self.limits['max_cost_usd']+1e-12:raise BudgetExceeded('Shared cost budget exhausted')
             entry={'id':uuid.uuid4().hex,'model':str(getattr(config,'model_id','unknown'))[:256],
                    'created_at':time.time(),'status':'reserved','tokens':tokens,'prompt_bound':prompt_bound,
                    'output_reserved':output,'cost_usd':cost,'usage':'conservative_reservation',
+                   'cost_known':cost is not None,'pricing_rates':(input_price,output_price,request_price),
                    'accounting':accounting,'tokens_reserved':tokens}
             self.entries.append(entry);self._save();return entry['id']
 
@@ -108,13 +128,31 @@ class BudgetLedger:
             if entry['status']!='reserved':return
             entry['status']='failed' if error else 'completed'
             prompt=getattr(response,'prompt_tokens',0);completion=getattr(response,'completion_tokens',0)
-            if response is not None and type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and prompt+completion>0:
+            rates=entry.get('pricing_rates',tuple(getattr(config,key,None) for key in ('input_cost_per_million','output_cost_per_million','request_cost_usd')))
+            known_rates=all(_valid_rate(rate) for rate in rates)
+            free=known_rates and all(rate==0 for rate in rates)
+            response_cost_known=getattr(response,'usage_cost_known',True) is True or free
+            if not response_cost_known:
+                # Retain the admitted amount as an estimate; special provider
+                # charges cannot be priced using ordinary input/output rates.
+                entry['cost_known']=False
+            if response is not None and _valid_usage(prompt,completion,getattr(response,'usage_reported',False)):
                 entry.update(tokens=prompt+completion,prompt_tokens=prompt,completion_tokens=completion,usage='provider_reported')
                 entry['provider_actual'] = {'prompt_tokens':prompt,'completion_tokens':completion,
                                             'total_tokens':prompt+completion,'source':'provider_reported'}
-                ip=getattr(config,'input_cost_per_million',None);op=getattr(config,'output_cost_per_million',None)
-                request_price=getattr(config,'request_cost_usd',0)
-                if ip is not None and op is not None and request_price is not None:entry['cost_usd']=(prompt*ip+completion*op)/1_000_000+request_price
+                details=getattr(response,'usage_details',None)
+                allowed={'uncached_input_tokens','cache_creation_input_tokens','cache_read_input_tokens'}
+                if (isinstance(details,dict) and set(details)<=allowed
+                        and all(type(value) is int and 0<=value<=1_000_000_000_000 for value in details.values())):
+                    entry['provider_actual']['usage_details']=details.copy()
+                if known_rates and response_cost_known:
+                    ip,op,request_price=rates
+                    actual_cost=(prompt*ip+completion*op)/1_000_000+request_price
+                    if math.isfinite(actual_cost):
+                        entry['cost_usd']=actual_cost
+                        entry['cost_known']=True
+                    else:
+                        entry['cost_known']=False
             # Failed/unknown requests retain the reservation; do not treat retries as free.
             self._save()
 
@@ -124,7 +162,7 @@ class BudgetLedger:
             entries = self.entries[-max(0, min(100, limit)):] if limit else []
             return copy.deepcopy({'requests':len(self.entries), 'entries':[
                 {key:entry[key] for key in ('id','created_at','status','tokens','tokens_reserved',
-                 'prompt_bound','output_reserved','accounting','provider_actual') if key in entry}
+                 'prompt_bound','output_reserved','accounting','provider_actual','cost_usd','cost_known') if key in entry}
                 for entry in entries]})
 
     def release_unattempted(self, identity):
@@ -166,7 +204,8 @@ class BudgetedModel:
             record = telemetry.record_request(messages, kwargs.get('tools'),
                 kwargs.get('max_tokens') or getattr(self.config, 'max_tokens', 4096),
                 task_id=task_id, retrieval_ids=retrieval_ids)
-            return telemetry, record['id']
+            pricing = {key: getattr(self.config, key, None) for key in ('input_cost_per_million', 'output_cost_per_million', 'request_cost_usd')}
+            return telemetry, record['id'], pricing
         except (OSError, ValueError, TypeError):
             # Diagnostics are best effort and cannot weaken or bypass admission.
             return None
@@ -174,14 +213,15 @@ class BudgetedModel:
     def _record_usage(self, record, response):
         if record is None:
             return
-        telemetry, identity = record
+        telemetry, identity, pricing = record
         prompt = getattr(response, 'prompt_tokens', None)
         completion = getattr(response, 'completion_tokens', None)
-        reported = type(prompt) is int and type(completion) is int and prompt >= 0 and completion >= 0 and (prompt + completion > 0 or getattr(response, 'usage_reported', False) is True)
+        reported = _valid_usage(prompt, completion, getattr(response, 'usage_reported', False))
         usage = {'prompt_tokens': prompt, 'completion_tokens': completion} if reported else None
-        pricing = {key: getattr(self.config, key, None) for key in ('input_cost_per_million', 'output_cost_per_million', 'request_cost_usd')}
+        free = all(type(rate) in (int, float) and rate == 0 for rate in pricing.values())
         try:
-            telemetry.record_usage(identity, usage, pricing=pricing)
+            telemetry.record_usage(identity, usage, pricing=pricing,
+                                   cost_known=getattr(response, 'usage_cost_known', True) is True or free)
         except (OSError, ValueError, TypeError):
             pass
 

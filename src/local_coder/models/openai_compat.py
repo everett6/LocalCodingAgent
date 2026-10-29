@@ -7,7 +7,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from local_coder.types import Message, ModelResponse, ModelConfig, ToolCall
+from local_coder.types import MAX_REPORTED_TOKENS, Message, ModelResponse, ModelConfig, ToolCall
 from local_coder.models.base import BaseModelBackend, decode_tool_arguments
 
 
@@ -28,6 +28,16 @@ class OpenAICompatibleBackend(BaseModelBackend):
             return None
         # Assuming tools are already in OpenAI JSON schema format
         return tools
+
+    @staticmethod
+    def _single_choice(data):
+        """These requests use n=1; never combine unrelated completion branches."""
+        choices = data.get("choices") or []
+        if (not isinstance(choices, list) or len(choices) > 1
+                or any(not isinstance(choice, dict) or type(choice.get("index", 0)) is not int
+                       or choice.get("index", 0) != 0 for choice in choices)):
+            raise RuntimeError("Provider returned an unexpected completion choice")
+        return choices
 
     async def _observe_quota(self, status_code, body, headers=None):
         if self.quota_guard is not None:
@@ -118,12 +128,17 @@ class OpenAICompatibleBackend(BaseModelBackend):
         await self._observe_embedded_quota(data)
         if data.get("error") or not data.get("choices"):
             raise RuntimeError("Provider returned an error or no completion; check model access and quota")
-        choice = data["choices"][0]
+        choice = self._single_choice(data)[0]
         msg_data = choice.get("message", {})
         content = msg_data.get("content") or ""
+        finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "content_filter":
+            raise RuntimeError("Provider completion was filtered; no tool calls were accepted")
+        if finish_reason is None:
+            raise RuntimeError("Provider returned an incomplete completion")
         
         parsed_tool_calls = []
-        if "tool_calls" in msg_data and msg_data["tool_calls"]:
+        if msg_data.get("tool_calls") and finish_reason not in {"length", "max_tokens"}:
             for tc in msg_data["tool_calls"]:
                 func = tc.get("function", {})
                 args = decode_tool_arguments(func.get("arguments", "{}"))
@@ -137,15 +152,25 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     arguments=args
                 ))
 
-        usage = data.get("usage", {})
+        usage = data.get("usage")
+        prompt = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        completion = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        reported = (type(prompt) is int and type(completion) is int and min(prompt, completion) >= 0
+                    and prompt + completion <= MAX_REPORTED_TOKENS
+                    and (usage.get("total_tokens") is None or (
+                        type(usage["total_tokens"]) is int and usage["total_tokens"] == prompt + completion)))
+        if not reported:
+            # Partial/coerced usage must not refund an unknown prompt or output.
+            prompt = completion = 0
 
         return ModelResponse(
             content=content,
             tool_calls=parsed_tool_calls,
-            finish_reason=choice.get("finish_reason", "stop"),
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
+            finish_reason=finish_reason,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+            usage_reported=reported,
             latency_ms=latency_ms,
             model=data.get("model", self.config.model_id),
             reasoning_content=msg_data.get("reasoning_content") or msg_data.get("reasoning"),
@@ -160,9 +185,9 @@ class OpenAICompatibleBackend(BaseModelBackend):
             await self._observe_response_quota(response)
             response.raise_for_status()
             async for line in response.aiter_lines():
-                if not line.startswith("data: "):
+                if not line.startswith("data:"):
                     continue
-                raw = line[6:]
+                raw = line[5:].lstrip(" ")
                 if raw.strip() == "[DONE]":
                     break
                 data = json.loads(raw)
@@ -171,7 +196,7 @@ class OpenAICompatibleBackend(BaseModelBackend):
                     raise RuntimeError("Provider stream failed; check model access and quota")
                 usage = data.get("usage") or usage
                 model = data.get("model") or model
-                for choice in data.get("choices", []):
+                for choice in self._single_choice(data):
                     finish = choice.get("finish_reason") or finish
                     delta = choice.get("delta", {})
                     content.append(delta.get("content") or "")
@@ -209,16 +234,18 @@ class OpenAICompatibleBackend(BaseModelBackend):
         }
 
         self._profile_payload(payload)
+        completed = False
         try:
             async with self.client.stream("POST", "/chat/completions", json=payload) as response:
                 await self._observe_response_quota(response)
                 response.raise_for_status()
                 async for line in response.aiter_lines():
-                    if not line or not line.startswith("data: "):
+                    if not line.startswith("data:"):
                         continue
                     
-                    data_str = line[6:]
+                    data_str = line[5:].lstrip(" ")
                     if data_str.strip() == "[DONE]":
+                        completed = True
                         break
                         
                     try:
@@ -226,15 +253,22 @@ class OpenAICompatibleBackend(BaseModelBackend):
                         if data.get('error'):
                             await self._observe_embedded_quota(data, response.headers)
                             raise RuntimeError('Provider stream failed; check model access and quota')
-                        choices = data.get("choices", [])
+                        choices = self._single_choice(data)
                         if choices:
+                            finish_reason = choices[0].get("finish_reason")
+                            if finish_reason in {"length", "max_tokens", "content_filter"}:
+                                raise RuntimeError("Provider stream output was truncated or filtered")
+                            if finish_reason:
+                                completed = True
                             delta = choices[0].get("delta", {})
                             if "content" in delta and delta["content"]:
                                 yield delta["content"]
                     except json.JSONDecodeError:
-                        continue
+                        raise RuntimeError("Provider returned an invalid stream event") from None
         except httpx.HTTPError as e:
             raise RuntimeError("Provider stream failed; check endpoint, model access and quota") from None
+        if not completed:
+            raise RuntimeError("Provider returned an incomplete completion stream")
 
     async def is_available(self) -> bool:
         """Check if the server is reachable and model exists."""

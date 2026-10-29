@@ -8,7 +8,7 @@ from typing import AsyncIterator
 import httpx
 
 from local_coder.models.base import BaseModelBackend
-from local_coder.types import Message, ModelConfig, ModelResponse, ToolCall
+from local_coder.types import MAX_REPORTED_TOKENS, Message, ModelConfig, ModelResponse, ToolCall
 
 
 class AnthropicBackend(BaseModelBackend):
@@ -70,34 +70,63 @@ class AnthropicBackend(BaseModelBackend):
         except httpx.HTTPError:
             raise RuntimeError("Anthropic connection failed; check the endpoint and network") from None
         blocks = data.get("content", [])
-        usage = data.get("usage", {})
-        prompt = usage.get("input_tokens", 0)
-        output = usage.get("output_tokens", 0)
+        finish_reason = data.get("stop_reason") or "stop"
+        usage = data.get("usage")
+        prompt = usage.get("input_tokens") if isinstance(usage, dict) else None
+        output = usage.get("output_tokens") if isinstance(usage, dict) else None
+        cache_fields = ("cache_creation_input_tokens", "cache_read_input_tokens")
+        details = {"uncached_input_tokens": prompt,
+                   **{key: usage.get(key, 0) if isinstance(usage, dict) else None for key in cache_fields}}
+        reported = (all(type(value) is int and 0 <= value <= MAX_REPORTED_TOKENS
+                        for value in (*details.values(), output))
+                    and sum(details.values()) + output <= MAX_REPORTED_TOKENS)
+        if not reported:
+            prompt = output = 0
+            details = None
+        else:
+            prompt = sum(details.values())
+        # Cache pricing varies by model, lifetime and platform. Keep counts
+        # accurate without pretending ordinary input prices cover these rates.
+        cost_known = (not any(details[key] for key in cache_fields) if details is not None
+                      else not isinstance(usage, dict) or not any(key in usage for key in cache_fields))
         return ModelResponse(
             content="\n".join(block["text"] for block in blocks if block.get("type") == "text"),
             tool_calls=[ToolCall(id=b["id"], name=b["name"], arguments=b["input"])
-                        for b in blocks if b.get("type") == "tool_use"],
-            finish_reason=data.get("stop_reason") or "stop", prompt_tokens=prompt,
+                        for b in blocks if b.get("type") == "tool_use"
+                        and finish_reason not in {"max_tokens", "length", "refusal"}],
+            finish_reason=finish_reason, prompt_tokens=prompt,
             completion_tokens=output, total_tokens=prompt + output,
+            usage_reported=reported, usage_details=details, usage_cost_known=cost_known,
             latency_ms=(time.monotonic() - start) * 1000, model=data.get("model", self.config.model_id))
 
     async def stream(self, messages: list[Message], *, temperature=None, max_tokens=None) -> AsyncIterator[str]:
         payload = self._payload(messages, temperature, max_tokens)
         payload["stream"] = True
+        completed = False
         try:
             async with self.client.stream("POST", "/messages", json=payload) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
+                    if not line.startswith("data:"):
                         continue
-                    data = json.loads(line[6:])
+                    try:
+                        data = json.loads(line[5:].lstrip(" "))
+                    except json.JSONDecodeError:
+                        raise RuntimeError("Anthropic returned an invalid stream event") from None
                     if data.get("type") == "error":
-                        raise RuntimeError("Anthropic stream failed; retry the request")
+                        raise RuntimeError("Anthropic stream failed; check the task state before continuing")
+                    if data.get("type") == "message_stop":
+                        completed = True
+                        break
                     delta = data.get("delta", {})
+                    if delta.get("stop_reason") == "max_tokens":
+                        raise RuntimeError("Anthropic stream output was truncated")
                     if delta.get("type") == "text_delta":
                         yield delta["text"]
         except httpx.HTTPError:
             raise RuntimeError("Anthropic stream connection failed") from None
+        if not completed:
+            raise RuntimeError("Anthropic returned an incomplete completion stream")
 
     async def is_available(self) -> bool:
         try:
