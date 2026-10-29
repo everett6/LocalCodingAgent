@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import math
 import os
 import subprocess
 import mimetypes
@@ -36,6 +37,46 @@ _WEBUI_ASSETS = {
     "/sw.js": (Path(__file__).parent / "webui" / "public" / "sw.js", "application/javascript"),
     "/icon.svg": (Path(__file__).parent / "webui" / "public" / "icon.svg", "image/svg+xml"),
 }
+
+
+def _request_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate request key")
+        result[key] = value
+    return result
+
+
+def _request_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Nonfinite request number")
+    return number
+
+
+def _invalid_json_constant(value):
+    raise ValueError("Nonfinite request constant")
+
+
+def _validate_request_depth(data: bytes) -> None:
+    depth, quoted, escaped = 0, False, False
+    for character in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == 92:  # Backslash inside a JSON string.
+                escaped = True
+            elif character == 34:
+                quoted = False
+        elif character == 34:
+            quoted = True
+        elif character in (91, 123):
+            depth += 1
+            if depth > 64:
+                raise ValueError("Request JSON exceeds the nesting limit")
+        elif character in (93, 125):
+            depth -= 1
 
 
 def _git(project_root: str, *args: str) -> str:
@@ -344,6 +385,9 @@ class RemoteControlServer(WorkbenchAPI):
         control = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Bound idle socket reads/writes, not the duration of a model task.
+            # This is an inactivity timeout, not a total request deadline.
+            timeout = 30
             def end_headers(self):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
@@ -422,8 +466,19 @@ class RemoteControlServer(WorkbenchAPI):
                     if length < 0 or length > 100000:
                         self._respond(413, {"error": "Request body exceeds 100 KB"})
                         return
-                    body = json.loads(self.rfile.read(length) or b"{}")
-                except (ValueError, UnicodeError):
+                    raw_body = self.rfile.read(length)
+                    if len(raw_body) != length:
+                        self.close_connection = True
+                        self._respond(400, {"error": "incomplete JSON request body"})
+                        return
+                    _validate_request_depth(raw_body)
+                    body = json.loads((raw_body or b"{}").decode("utf-8"), object_pairs_hook=_request_object,
+                                      parse_float=_request_number, parse_constant=_invalid_json_constant)
+                except (TimeoutError, ConnectionError):
+                    self.close_connection = True
+                    self._respond(408, {"error": "Request body was not received before the connection expired"})
+                    return
+                except (ValueError, UnicodeError, RecursionError):
                     self._respond(400, {"error": "invalid JSON"})
                     return
                 try:

@@ -6,6 +6,7 @@ function startupError(code, signal, diagnostic) {
     engine_dependency_missing: 'A required engine dependency is missing; repair or reinstall the application.',
     engine_permission_denied: 'The engine could not access a required file; check workspace and application permissions.',
     engine_workspace_busy: 'The workspace database is busy; close duplicate workspace engines and retry.',
+    engine_state_invalid: 'Saved workspace state is invalid. Preserve the original state and restore a valid copy; reinstalling the app will not repair project history.',
   };
   const classification = details[diagnostic] ? diagnostic : 'engine_exited';
   return Object.assign(new Error(`Local engine exited before readiness (${signal || code}). ${details[classification] || 'Retry startup; if it repeats, check the application installation.'}`),
@@ -87,6 +88,7 @@ class Sidecar {
         if (/ModuleNotFoundError:|ImportError:/.test(text)) diagnostic = 'engine_dependency_missing';
         else if (!diagnostic && /PermissionError:/.test(text)) diagnostic = 'engine_permission_denied';
         else if (!diagnostic && /(?:OperationalError:|DatabaseError:) database is locked/.test(text)) diagnostic = 'engine_workspace_busy';
+        else if (!diagnostic && /(?:^|\n|\.)SessionError:/.test(text)) diagnostic = 'engine_state_invalid';
         stderrTail = text.slice(-128);
       };
       child.stdout.on('data', onData);

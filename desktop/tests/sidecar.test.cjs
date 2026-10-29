@@ -44,6 +44,19 @@ test('startup errors classify a missing dependency without returning stderr secr
     });
   } finally { await sidecar.stop(); }
 });
+test('damaged saved history gets recovery guidance without raw state or an automatic retry', async () => {
+  const sidecar = new Sidecar({command: process.execPath,
+    args: ['-e', 'console.error("local_coder.orchestrator.sessions.SessionError: private-fixture-state"); process.exit(1)'], timeout: 2000});
+  try {
+    await assert.rejects(sidecar.start(), error => {
+      assert.equal(error.code, 'engine_state_invalid');
+      assert.equal(error.retryable, false);
+      assert.match(error.message, /restore a valid copy/);
+      assert.doesNotMatch(error.message, /private-fixture-state/);
+      return true;
+    });
+  } finally {await sidecar.stop();}
+});
 test('bridge only permits known relative API operations', () => {
   assert.ok(isAllowedApiRequest('/settings', 'POST'));
   assert.ok(isAllowedApiRequest('/engagements', 'POST'));
