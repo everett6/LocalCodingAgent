@@ -1,5 +1,6 @@
 """Pure policy tests: no network or model calls."""
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 
 import pytest
@@ -127,3 +128,22 @@ def test_classifier_threshold_and_non_override():
     assert classified.prompt_digest == unknown.prompt_digest
     assert not classified.classifier_eligible
     assert apply_classifier_decision(unknown, "garbage").tier == "selected"
+
+
+def test_full_context_digest_survives_bounded_policy_text():
+    task = {"objective": "Summarize README.md", "context": {"architecture": "x" * 100_000}}
+    first = classify_task(task, "explorer")
+    assert first.tier == "selected" and not first.classifier_eligible
+    expected_text = "Summarize README.md\narchitecture\n" + "x" * 100_000
+    assert first.prompt_digest == hashlib.sha256(expected_text.encode()).hexdigest()
+    task["context"]["architecture"] += "y"
+    assert classify_task(task, "explorer").prompt_digest != first.prompt_digest
+
+
+def test_routing_digest_preserves_full_unicode_and_field_order():
+    task = {"objective": "Explain README.md", "constraints": ["αβ"], "files": ["readme.txt"],
+            "context": {"architecture": "模块"}, "success_criteria": ["done"]}
+    first = classify_task(task, "explorer")
+    expected = "Explain README.md\nαβ\nreadme.txt\narchitecture\n模块\ndone"
+    assert first.prompt_digest == hashlib.sha256(expected.encode()).hexdigest()
+    assert first.tier == "selected" and not first.classifier_eligible

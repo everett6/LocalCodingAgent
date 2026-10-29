@@ -191,7 +191,9 @@ map), a model named after the role, a model named `default`, then the first
 model. With `escalate_to` set, a plan task that fails is rerun once on that
 model (seeing whatever files the first attempt already changed), and the
 second and later fix-loop attempts use it for the debugger. `fallbacks` are
-only probed for models that list them, once per run.
+only probed for models that list them. Successful availability checks are cached
+for the model manager; failures are cached for five seconds so restarted servers
+can recover. Concurrent checks of the same model share one probe.
 
 ## Custom commands
 

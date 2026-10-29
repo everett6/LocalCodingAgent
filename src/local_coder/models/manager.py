@@ -6,6 +6,7 @@ from dataclasses import replace
 import hashlib
 import json
 import math
+from time import monotonic
 from typing import Dict
 from urllib.parse import urlsplit
 
@@ -19,6 +20,8 @@ from local_coder.models.auto_routing import RoutingDecision, classify_task, appl
 from local_coder.models.profiles import resolve_profile
 from local_coder.types import Message
 
+_NEGATIVE_AVAILABILITY_SECONDS = 5.0
+
 
 class ModelManager:
     """Manages model instances, queues, and resources."""
@@ -29,8 +32,10 @@ class ModelManager:
         self.quota_guard = quota_guard
         self._models: Dict[str, LocalModel] = {}
         self._lock = asyncio.Lock()
-        # Reachability of models that have fallbacks, probed once per manager.
+        # Healthy probes are reused; unavailable servers may recover mid-run.
         self._availability: Dict[str, bool] = {}
+        self._availability_failed_at: Dict[str, float] = {}
+        self._availability_locks: Dict[str, asyncio.Lock] = {}
         self._routing_cache: OrderedDict[str, RoutingDecision] = OrderedDict()
         
         # Concurrency limit logic
@@ -75,8 +80,9 @@ class ModelManager:
 
         escalate=True asks for routing.escalate_to, used when a step is being
         retried after a failure. When routing.fallbacks lists alternatives
-        for the chosen model, its server is probed once per run and the first
-        reachable model in the chain is used instead.
+        for the chosen model, its server is probed and the first reachable model
+        in the chain is used instead. Successful probes are reused per manager;
+        failures have a short negative cache so restarted servers can recover.
         """
         if not self._models:
             await self.initialize()
@@ -119,20 +125,32 @@ class ModelManager:
         endpoint = cls._endpoint(config)
         return endpoint is not None and endpoint[1] in {"localhost", "127.0.0.1", "::1"}
 
-    def _economy_blocker(self, selected: str, economy: str, role) -> str | None:
-        selected_config, economy_config = self.config.models[selected], self.config.models[economy]
-        selected_endpoint, economy_endpoint = self._endpoint(selected_config), self._endpoint(economy_config)
+    @classmethod
+    def supports_local_classifier(cls, config: ModelConfig | None) -> bool:
+        """Share classifier admission with status without probing or inference."""
+        return bool(config is not None and cls._is_local(config)
+                    and config.backend in {ModelBackend.OPENAI_COMPAT, ModelBackend.LLAMACPP})
+
+    @classmethod
+    def economy_blocker(cls, selected_config: ModelConfig, economy_config: ModelConfig,
+                        role, *, allow_cross_provider: bool = False) -> str | None:
+        """Pure endpoint/capability admission shared by routing and diagnostics."""
+        selected_endpoint, economy_endpoint = cls._endpoint(selected_config), cls._endpoint(economy_config)
         if selected_endpoint is None or economy_endpoint is None:
             return "invalid_endpoint"
-        if self._is_local(selected_config) and not self._is_local(economy_config):
+        if cls._is_local(selected_config) and not cls._is_local(economy_config):
             return "local_to_cloud_blocked"
         if (selected_endpoint != economy_endpoint
-                and not (self._is_local(selected_config) and self._is_local(economy_config))
-                and not self.config.routing.allow_cross_provider):
+                and not (cls._is_local(selected_config) and cls._is_local(economy_config))
+                and not allow_cross_provider):
             return "cross_provider_blocked"
         if resolve_profile(economy_config, role).capabilities.get("tools") is False:
             return "tools_unsupported"
         return None
+
+    def _economy_blocker(self, selected: str, economy: str, role) -> str | None:
+        return self.economy_blocker(self.config.models[selected], self.config.models[economy],
+                                    role, allow_cross_provider=self.config.routing.allow_cross_provider)
 
     def _affordable_fallback(self, selected: str, candidate: str) -> bool:
         """An automatic chain hop cannot silently become a costly escalation."""
@@ -189,8 +207,7 @@ class ModelManager:
             classifier = routing.local_classifier
             if decision.classifier_eligible and classifier:
                 classifier_config = self.config.models.get(classifier)
-                if (classifier_config is None or not self._is_local(classifier_config)
-                        or classifier_config.backend not in {ModelBackend.OPENAI_COMPAT, ModelBackend.LLAMACPP}):
+                if not self.supports_local_classifier(classifier_config):
                     decision = replace(decision, tier="selected", reason="invalid_local_classifier", classifier_eligible=False)
                 else:
                     objective = task if isinstance(task, str) else (task.get("objective", "") if isinstance(task, dict) else getattr(task, "objective", ""))
@@ -236,15 +253,29 @@ class ModelManager:
 
     async def _is_reachable(self, name: str) -> bool:
         async with self._lock:
-            if name in self._availability:
-                return self._availability[name]
-        try:
-            available = bool(await self._models[name].is_available())
-        except Exception:
-            available = False
-        async with self._lock:
+            probe_lock = self._availability_locks.setdefault(name, asyncio.Lock())
+        # Coalesce simultaneous checks for the same model without blocking
+        # unrelated backends or repeatedly probing an unavailable server.
+        async with probe_lock:
+            cached = self._availability.get(name)
+            if cached is True:
+                return True
+            if (cached is False and monotonic() - self._availability_failed_at.get(name, 0)
+                    < _NEGATIVE_AVAILABILITY_SECONDS):
+                return False
+            model = self._models[name]
+            try:
+                available = bool(await model.is_available())
+            except Exception:
+                available = False
+            if self._models.get(name) is not model:
+                return False
             self._availability[name] = available
-        return available
+            if available:
+                self._availability_failed_at.pop(name, None)
+            else:
+                self._availability_failed_at[name] = monotonic()
+            return available
 
     async def check_gpu_status(self) -> GPUStatus:
         """Check GPU status via nvidia-smi if available."""
@@ -290,6 +321,10 @@ class ModelManager:
                 if hasattr(model, "close"):
                     await model.close()
             self._models.clear()
+            self._availability.clear()
+            self._availability_failed_at.clear()
+            self._availability_locks.clear()
+            self._routing_cache.clear()
         callback = getattr(self, "on_close", None)
         if callback is not None:
             await callback()

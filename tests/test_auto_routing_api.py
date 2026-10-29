@@ -166,3 +166,148 @@ def test_equal_prices_and_non_openai_backend_do_not_create_candidate(host):
     host.catalog["vendor/selected"]["input_cost_per_million"] = 3
     host._provider.backend = "anthropic"
     assert not host._routing_settings_status()["status"]["economy_available"]
+
+
+@pytest.mark.parametrize("selected_url,economy_url,allow,expected", [
+    ("http://127.0.0.1:8090/v1", "https://openrouter.ai/api/v1", True, False),
+    ("https://openrouter.ai/api/v1", "https://other.example/v1", False, False),
+    ("https://openrouter.ai/api/v1", "https://other.example/v1", True, True),
+    ("https://openrouter.ai/api/v1", "http://user@127.0.0.1:8090/v1", True, False),
+])
+def test_configured_economy_status_obeys_runtime_boundaries(host, selected_url, economy_url, allow, expected):
+    host._provider.base_url = selected_url
+    config = host.config()
+    config.routing.economy_model = "custom"
+    config.routing.allow_cross_provider = allow
+    config.models["custom"] = model("custom")
+    config.models["custom"].base_url = economy_url
+    status = host._apply_auto_routing(config, host._provider)["status"]
+    assert status["economy_available"] is expected
+    if not expected:
+        assert "available" not in status["reason"].lower()
+
+
+def test_economy_status_rejects_confirmed_missing_tool_support(host, monkeypatch):
+    config = host.config()
+    config.routing.economy_model = "custom"
+    config.models["custom"] = model("custom")
+    monkeypatch.setattr("local_coder.models.manager.resolve_profile",
+                        lambda *args: SimpleNamespace(capabilities={"tools": False}))
+    assert not host._apply_auto_routing(config, host._provider)["status"]["economy_available"]
+
+
+def test_unsupported_local_classifier_backend_is_never_reported_ready(host):
+    from local_coder.types import ModelBackend
+
+    classifier = model("classifier")
+    classifier.base_url = "http://127.0.0.1:8090/v1"
+    classifier.backend = ModelBackend.OLLAMA
+    host.local = classifier
+    config = host.config()
+    config.routing.local_classifier = "classifier"
+    config.models["classifier"] = classifier
+    status = host._apply_auto_routing(config, host._provider)["status"]
+    assert status["classifier_configured"]
+    assert not status["classifier_ready"]
+    assert not status["classifier_local_configured"]
+    assert status["classifier_state"] == "unsupported"
+
+
+def test_loaded_classifier_requires_compatible_backend_and_effective_endpoint(host):
+    from local_coder.types import ModelBackend
+
+    host.local = model("local")
+    host.local.backend = ModelBackend.OLLAMA
+    host.local.base_url = "http://127.0.0.1:8090/v1"
+    result = host._provider_post("/routing/settings", {"use_loaded_local_classifier": True})[1]
+    assert not result["status"]["classifier_ready"]
+    host.local.backend = ModelBackend.OPENAI_COMPAT
+    config = host.config()
+    config.routing.local_classifier = "classifier"
+    config.models["classifier"] = host.local.model_copy(update={"name": "classifier", "backend": ModelBackend.LLAMACPP})
+    host.local.backend = ModelBackend.ANTHROPIC
+    assert not host._apply_auto_routing(config, host._provider)["status"]["classifier_ready"]
+
+
+def test_routing_save_replace_failure_preserves_previous_preferences(host, tmp_path, monkeypatch):
+    host._provider_post("/routing/settings", {"auto_enabled": False})
+    path = tmp_path / SETTINGS_PATH
+    previous = path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("fixture replacement failure")
+
+    monkeypatch.setattr("local_coder.auto_routing_api.os.replace", fail_replace)
+    with pytest.raises(OSError, match="fixture replacement"):
+        host._provider_post("/routing/settings", {"auto_enabled": True})
+    assert path.read_bytes() == previous
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_routing_save_is_private_and_keeps_unrelated_preferences(host, tmp_path):
+    import os
+    import stat
+
+    host._provider_post("/routing/settings", {"auto_enabled": False, "classifier_timeout_seconds": .5})
+    host._provider_post("/routing/settings", {"use_loaded_local_classifier": True})
+    path = tmp_path / SETTINGS_PATH
+    saved = json.loads(path.read_text())
+    assert saved == {"auto_enabled": False, "classifier_timeout_seconds": .5, "use_loaded_local_classifier": True}
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_routing_save_flush_failure_does_not_replace_preferences(host, tmp_path, monkeypatch):
+    host._provider_post("/routing/settings", {"auto_enabled": False})
+    path = tmp_path / SETTINGS_PATH
+    previous = path.read_bytes()
+
+    def fail_flush(*args):
+        raise OSError("fixture flush failure")
+
+    monkeypatch.setattr("local_coder.auto_routing_api.os.fsync", fail_flush)
+    with pytest.raises(OSError, match="fixture flush"):
+        host._provider_post("/routing/settings", {"auto_enabled": True})
+    assert path.read_bytes() == previous
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_overlapping_routing_save_keeps_idle_gate(host, tmp_path, monkeypatch):
+    import os
+
+    entered, finish = threading.Event(), threading.Event()
+    real_replace = os.replace
+    errors = []
+
+    def paused_replace(*args):
+        entered.set()
+        assert finish.wait(5)
+        return real_replace(*args)
+
+    def save():
+        try:
+            host._provider_post("/routing/settings", {"auto_enabled": False})
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr("local_coder.auto_routing_api.os.replace", paused_replace)
+    worker = threading.Thread(target=save)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(ValueError, match="idle|active"):
+            host._provider_post("/routing/settings", {"auto_enabled": True})
+    finally:
+        finish.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert json.loads((tmp_path / SETTINGS_PATH).read_text()) == {"auto_enabled": False}
+
+
+def test_equivalent_classifier_endpoints_can_match_loaded_runtime(host):
+    host.local = model("local")
+    host.local.base_url = "http://127.0.0.1:80/v1/"
+    config = host.config()
+    config.routing.local_classifier = "classifier"
+    config.models["classifier"] = host.local.model_copy(update={"name": "classifier", "base_url": "http://127.0.0.1/v1"})
+    assert host._apply_auto_routing(config, host._provider)["status"]["classifier_ready"]
