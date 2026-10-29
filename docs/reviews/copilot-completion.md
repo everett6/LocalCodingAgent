@@ -19,6 +19,12 @@ Checked 2026-10-28. This continues the Copilot work on `codex/test-verified-codi
 - Packaged Linux engine: **9 smoke checks passed**: authentication, lightweight status, harness/routing/language/memory routes, compiled asset hashes, actual guarded Undo restoration in a disposable repository, and graceful shutdown.
 - Local dependency consistency and whitespace checks pass. Tests use synthetic providers and fixtures; no paid model requests ran.
 
+## Installed Linux check
+
+The user installation was updated to code commit `57ce6c8`, with the manager archive, both packaged engine copies and the IDE bridge verified against the built artifacts. Previous files and installation metadata are retained under the installation's `updates/copilot-57ce6c8` rollback directory. The two root-owned mode-4755 sandbox helpers were preserved, including their inode identities and hashes.
+
+The actual installed IDE extension host passed activation, command registration, workspace verification and authenticated shared-engine refresh using a disposable test profile. Clin and the IDE were then opened on the user's existing project. Clin recorded `engine_ready owned` and `window_ready`; authenticated status, harness, routing, memory and language endpoints returned HTTP 200. No task or model inference was submitted. One initial manager launch exited before engine readiness; direct installed-engine checks and a manager restart succeeded. The initial failure's cause was not established.
+
 The parallel-scope regression now synchronizes sibling completion and reads the sibling file first. This deliberately bypasses the independent unread-overwrite guard, so it consistently tests the host-owned write boundary rather than racing two valid rejection mechanisms.
 
 ## Limits
