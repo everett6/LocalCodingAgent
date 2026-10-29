@@ -7,7 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 from collections.abc import Iterable
-from itertools import islice
+from itertools import chain, islice
 
 
 @lru_cache(maxsize=4)
@@ -31,7 +31,7 @@ def _load(path: str):
 def python_counts(tokens: Iterable[str]) -> list[float]:
     vector = [0.0] * 256
     for token in tokens:
-        features = [token] + [token[n:n + 3] for n in range(max(0, len(token) - 2))]
+        features = chain((token,), (token[n:n + 3] for n in range(max(0, len(token) - 2))))
         for feature in features:
             value = hashlib.blake2b(feature.encode(), digest_size=4).digest()
             vector[value[1]] += 1 if value[2] & 1 else -1

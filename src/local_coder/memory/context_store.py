@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterator
 import uuid
 
 from local_coder.context.code_index import SKIP_DIRS, SKIP_EXTENSIONS, tokenize, iter_tokens
+from local_coder.context.source_snapshot import SourceSnapshot, is_private_source, read_source_snapshot
 from local_coder.statedir import state_path
 from local_coder.memory.code_structure import module_names, structure_chunks
 
@@ -39,6 +40,14 @@ _PRIVATE_NAMES = {".env", ".netrc", ".npmrc", ".pypirc", "credentials", "credent
 _PRIVATE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".keystore"}
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
+_UNSET = object()
+
+
+def _private_source(path: Path) -> bool:
+    name = path.name.lower()
+    return (is_private_source(path) or name in _PRIVATE_NAMES
+            or path.suffix.lower() in _PRIVATE_SUFFIXES
+            or name.startswith(("secrets.", "credentials.")))
 
 
 def _clean(value: Any) -> Any:
@@ -189,10 +198,17 @@ class ContextMemory:
                 connection.close()
 
     def _path(self, source_path: str | Path) -> Path:
-        path = (self.project_root / source_path).resolve()
-        if not path.is_relative_to(self.project_root):
+        # Keep the lexical path so the descriptor reader can reject symlink
+        # components rather than silently replacing them with their targets.
+        path = Path(os.path.abspath(self.project_root / source_path))
+        if not path.is_relative_to(self.project_root) or not path.resolve().is_relative_to(self.project_root):
             raise ValueError("Memory source path escapes project")
         return path
+
+    def _source_snapshot(self, path: Path) -> SourceSnapshot:
+        if _private_source(path.relative_to(self.project_root)):
+            raise ValueError("Private files are not context memory sources")
+        return read_source_snapshot(self.project_root, path, max_bytes=self.max_file_bytes)
 
     def _head(self) -> str | None:
         try:
@@ -209,7 +225,14 @@ class ContextMemory:
         else:
             from local_coder.memory.native import lexical_counts
             vector = lexical_counts(iter_tokens(content))
-        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        magnitude = sum(value * value for value in vector)
+        if not math.isfinite(magnitude) or (magnitude == 0 and any(vector)):
+            # User-supplied finite vectors may overflow/underflow when squared.
+            # Preserve existing persisted lexical semantics for normal values.
+            scale = max(abs(value) for value in vector) or 1.0
+            vector = [value / scale for value in vector]
+            magnitude = sum(value * value for value in vector)
+        norm = math.sqrt(magnitude) or 1.0
         return [value / norm for value in vector]
 
     @staticmethod
@@ -232,7 +255,8 @@ class ContextMemory:
         return chunks[:128]
 
     def _prepare(self, kind: str, content: str, source_path: str | None, task_id: str | None, metadata: dict | None,
-                 vector_cache: dict[str, list[float]] | None = None) -> list[dict]:
+                 vector_cache: dict[str, list[float]] | None = None, *,
+                 source_snapshot: SourceSnapshot | None = None, revision: str | None | object = _UNSET) -> list[dict]:
         if kind not in _KINDS:
             raise ValueError("Unsupported memory kind")
         if not isinstance(content, str) or len(content) > 200000:
@@ -243,10 +267,13 @@ class ContextMemory:
         if relative and _clean(relative) != relative:
             raise ValueError("Memory source path contains a credential")
         source_hash = None
-        if path and path.is_file():
-            if path.stat().st_size > self.max_file_bytes:
-                raise ValueError("Memory source exceeds file size limit")
-            source_hash = _digest(path.read_bytes())
+        if path:
+            if _private_source(path.relative_to(self.project_root)):
+                raise ValueError("Private files are not context memory sources")
+            try:
+                source_hash = (source_snapshot or self._source_snapshot(path)).sha256
+            except FileNotFoundError:
+                pass
         cleaned = _clean(content)
         clean_metadata = _clean(metadata or {})
         if not isinstance(clean_metadata, dict) or len(json.dumps(clean_metadata)) > 16000:
@@ -254,7 +281,7 @@ class ContextMemory:
         links = clean_metadata.pop("links", [])
         if not isinstance(links, list) or len(links) > 100 or not all(isinstance(link, str) for link in links):
             raise ValueError("Memory links must be a list of memory IDs")
-        head, timestamp = self._head(), _now()
+        head, timestamp = self._head() if revision is _UNSET else revision, _now()
         rows = []
         chunks = [{"content": text, "metadata": {"start_line": first, "end_line": last}}
                   for first, last, text in self._chunks(cleaned)]
@@ -354,7 +381,9 @@ class ContextMemory:
                     self._insert(connection, [row])
             if kind == "code":
                 self._refresh_code_graph(connection)
-        return [{**self.get(row["id"]), "deduplicated": row["id"] in reused} for row in rows]
+            head, source_hashes = self._head(), {}
+            return [{**self._view(connection, connection.execute("SELECT * FROM memories WHERE id=?", (row["id"],)).fetchone(),
+                                  head, source_hashes), "deduplicated": row["id"] in reused} for row in rows]
 
     def _freshness(self, row: dict, head: str | None, source_hashes: dict[str, str | None] | None = None) -> str:
         if row["source_path"]:
@@ -365,10 +394,12 @@ class ContextMemory:
             if source not in source_hashes:
                 try:
                     path = self._path(source)
-                    source_hashes[source] = (None if not path.is_file() else "" if path.stat().st_size > self.max_file_bytes
-                                             else _digest(path.read_bytes()))
-                except (OSError, ValueError):
+                    source_hashes[source] = self._source_snapshot(path).sha256
+                except FileNotFoundError:
                     source_hashes[source] = None
+                except (OSError, ValueError):
+                    # An unreadable/unsafe source cannot verify saved evidence.
+                    source_hashes[source] = ""
             if source_hashes[source] is None:
                 return "source_missing"
             if source_hashes[source] != row["source_hash"]:
@@ -436,8 +467,9 @@ class ContextMemory:
 
     def list_memories(self, limit: int = 50) -> list[dict]:
         head = self._head()
+        source_hashes: dict[str, str | None] = {}
         with self._connection() as connection:
-            return [self._view(connection, row, head) for row in connection.execute("SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?", (max(0, min(int(limit), 200)),))]
+            return [self._view(connection, row, head, source_hashes) for row in connection.execute("SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?", (max(0, min(int(limit), 200)),))]
 
     def search(self, query: str, limit: int = 8, char_budget: int = 6000, task_id: str | None = None) -> list[dict]:
         _identifier(task_id)
@@ -687,10 +719,11 @@ class ContextMemory:
         budget, limit = max(0, min(int(char_budget), 50000)), max(0, min(int(limit), 500))
         query = _clean(str(query))[:4000].casefold()
         head, items, lines, seen, truncated = self._head(), [], [], set(), False
+        source_hashes: dict[str, str | None] = {}
         with self._connection() as connection:
             records = connection.execute('SELECT m.* FROM memories m JOIN code_symbols s ON s.memory_id=m.id ORDER BY m.source_path,s.qualified_name,m.updated_at DESC LIMIT 10000').fetchall()
             for record in records:
-                row = self._view(connection, record, head)
+                row = self._view(connection, record, head, source_hashes)
                 metadata = row['metadata']
                 anchor = metadata.get('anchor')
                 if not anchor or anchor in seen or row['freshness'] != 'fresh':
@@ -727,59 +760,68 @@ class ContextMemory:
     @staticmethod
     def _indexable(path: Path, root: Path) -> bool:
         relative = path.relative_to(root)
-        name = path.name.lower()
-        return (not any(part in SKIP_DIRS or part.startswith(".env") for part in relative.parts)
-                and name not in _PRIVATE_NAMES and path.suffix.lower() not in SKIP_EXTENSIONS | _PRIVATE_SUFFIXES
-                and not name.startswith(("secrets.", "credentials.")))
+        return (not _private_source(relative)
+                and not any(part in SKIP_DIRS or part.startswith(".env") for part in relative.parts)
+                and path.suffix.lower() not in SKIP_EXTENSIONS)
 
     def index_code(self, paths: list[str] | None = None) -> dict:
         if paths is not None and (not isinstance(paths, list) or len(paths) > self.max_index_files):
             raise ValueError("Index paths must be a bounded list")
         roots = [self._path(path) for path in paths] if paths is not None else [self.project_root]
-        candidates: list[Path] = []
+        candidates: set[Path] = set()
+        candidate_limit, truncated = self.max_index_files * 5, False
         for root in roots:
+            if len(candidates) >= candidate_limit:
+                truncated = True
+                break
             if root.is_file():
-                candidates.append(root)
+                candidates.add(root)
             elif root.is_dir():
+                if root.is_symlink() or is_private_source(root.relative_to(self.project_root)):
+                    continue
                 for directory, subdirs, files in os.walk(root, followlinks=False):
-                    subdirs[:] = sorted(name for name in subdirs if name not in SKIP_DIRS and not (Path(directory) / name).is_symlink() and not name.startswith(".env"))
-                    candidates.extend(Path(directory) / name for name in sorted(files))
-                    if len(candidates) >= self.max_index_files * 5:
+                    subdirs[:] = sorted(name for name in subdirs if name not in SKIP_DIRS and not (Path(directory) / name).is_symlink()
+                                        and not is_private_source((Path(directory) / name).relative_to(self.project_root)))
+                    for name in sorted(files):
+                        candidates.add(Path(directory) / name)
+                        if len(candidates) >= candidate_limit:
+                            truncated = True
+                            break
+                    if truncated:
                         break
         prepared, indexed_paths, skipped = [], set(), 0
         unchanged, removed, updated_paths = 0, set(), set()
+        revision = self._head()
         with self._connection() as connection:
             existing = {}
             for row in connection.execute("SELECT m.source_path,m.source_hash,v.backend FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE m.kind='code'"):
                 existing.setdefault(row["source_path"], set()).add((row["source_hash"], row["backend"]))
-        for path in sorted(set(candidates)):
+        for path in sorted(candidates):
             if len(indexed_paths) >= self.max_index_files:
+                truncated = True
                 break
             if path.is_symlink() or not self._indexable(path, self.project_root):
                 skipped += 1
                 continue
             try:
                 path = self._path(path)
-                if path.stat().st_size > self.max_file_bytes:
-                    skipped += 1
-                    continue
-                raw = path.read_bytes()
+                snapshot = self._source_snapshot(path)
+                raw = snapshot.data
                 if b"\x00" in raw:
                     skipped += 1
                     continue
                 content = raw.decode("utf-8")
                 relative = str(path.relative_to(self.project_root))
-                indexed_paths.add(relative)
-                if existing.get(relative) == {(_digest(raw), self.embedding_name)}:
+                if existing.get(relative) == {(snapshot.sha256, self.embedding_name)}:
+                    indexed_paths.add(relative)
                     unchanged += 1
                     continue
-                updated_paths.add(relative)
                 with self._connection() as connection:
                     cached = connection.execute("SELECT m.content_hash,v.value FROM memories m JOIN vectors v ON v.memory_id=m.id WHERE m.kind='code' AND m.source_path=? AND v.backend=? LIMIT 128", (relative, self.embedding_name)).fetchall()
                 vector_cache = {row["content_hash"]: json.loads(row["value"]) for row in cached}
-                rows = self._prepare("code", content, relative, None, {"indexed": True}, vector_cache)
-                for row in rows:
-                    row["source_hash"] = _digest(raw)
+                rows = self._prepare("code", content, relative, None, {"indexed": True}, vector_cache,
+                                     source_snapshot=snapshot, revision=revision)
+                updated_paths.add(relative)
                 prepared.extend(rows)
                 indexed_paths.add(relative)
             except (OSError, UnicodeError, ValueError):
@@ -811,14 +853,21 @@ class ContextMemory:
             # Only remove missing files in the requested scope. File changes are
             # independently invalidated at retrieval time, including partial runs.
             for row in connection.execute("SELECT id, source_path FROM memories WHERE kind='code'").fetchall():
-                source = self._path(row["source_path"]) if row["source_path"] else None
+                try:
+                    source = self._path(row["source_path"]) if row["source_path"] else None
+                except (OSError, ValueError):
+                    # An external symlink replacement must not abort unrelated
+                    # index updates. Retrieval independently excludes this row.
+                    continue
                 if source and not source.exists() and any(source == root or source.is_relative_to(root) for root in roots):
                     connection.execute("DELETE FROM memories WHERE id=?", (row["id"],))
                     removed.add(row["source_path"])
             self._insert(connection, pending)
-            self._refresh_code_graph(connection)
+            if updated_paths or removed:
+                self._refresh_code_graph(connection)
         return {"files": len(indexed_paths), "updated": len(indexed_paths) - unchanged, "unchanged": unchanged,
-                "removed": len(removed), "reused_chunks": reused_chunks, "chunks": len(prepared), "skipped": skipped, "max_files": self.max_index_files, "embedding_backend": self.embedding_name}
+                "removed": len(removed), "reused_chunks": reused_chunks, "chunks": len(prepared), "skipped": skipped,
+                "max_files": self.max_index_files, "truncated": truncated, "embedding_backend": self.embedding_name}
 
     def status(self) -> dict:
         with self._connection() as connection:
