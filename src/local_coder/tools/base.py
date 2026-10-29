@@ -373,6 +373,13 @@ class ToolRegistry:
             # Do not echo argument values (which can contain credentials).
             return ToolResult(success=False, output="Tool arguments failed schema validation: " +
                               ", ".join(sorted({str(error.validator) for error in errors})))
+        if name_enum == ToolName.READ_FILE:
+            from local_coder.context.privacy import private_read_path
+            root = getattr(self, "project_root", None) or getattr(tool, "project_root", None)
+            if private_read_path(arguments["path"], root):
+                return ToolResult(success=False,
+                    output="Generic file reads exclude credential files and private engine state. Use security_scan for redacted findings or recover_context for this role's registered archives.",
+                    data={"execution_outcome": "not_started", "private_read_blocked": True})
         scope_error = self._outside_write_scope(role, name_enum, tool, arguments)
         if scope_error:
             return ToolResult(

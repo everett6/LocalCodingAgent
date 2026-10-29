@@ -86,6 +86,9 @@ class Coordinator:
             safety_harness=self.safety_harness,
             code_index=code_index,
         )
+        from local_coder.context.privacy import bounded_known_secrets
+        self.tool_registry.model_visible_secrets = bounded_known_secrets(
+            model.resolve_api_key() for model in config.models.values())
         self.repo_context._index = self.tool_registry.get_tool(ToolName.CODE_SEARCH).index
         self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config, quota_guard=quota_guard)
@@ -369,8 +372,12 @@ class Coordinator:
         message, **kwargs) convenience signature used by the Coordinator
         itself. Sub-agents must be handed this method, not _emit directly.
         """
+        from local_coder.context.privacy import redact_diagnostic_value, redact_model_text
+        secrets = getattr(self.tool_registry, "model_visible_secrets", ())
+        visible = event.model_copy(update={"message": redact_model_text(event.message, secrets),
+                                           "data": redact_diagnostic_value(event.data, secrets)})
         for handler in self._event_handlers:
-            handler(event)
+            handler(visible)
 
     async def run(
         self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",

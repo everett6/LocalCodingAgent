@@ -284,17 +284,25 @@ def test_grep_clips_very_long_matching_lines(tmp_path):
     assert len(output) < 500 and "chars]" in output
 
 
-def test_agent_spills_truncated_output_where_read_file_can_reach_it(tmp_path):
+def test_agent_spills_local_output_and_recovers_only_through_role_owned_context(tmp_path):
     registry = create_tool_registry(str(tmp_path))
     agent = LoopAgent(ScriptedModel([]), registry, max_tool_output_chars=1000)
 
-    text = agent._fit_tool_output(call("abc", "run_tests"), "\n".join(str(i) for i in range(5000)))
+    original = "\n".join(str(i) for i in range(5000))
+    text = agent._fit_tool_output(call("abc", "run_tests"), original)
 
     spilled = tmp_path / ".local-coder" / "tool-output" / "run_tests-abc.txt"
     assert spilled.exists()
+    assert spilled.read_text() == original
     assert ".local-coder/tool-output/run_tests-abc.txt" in text
     page = run(registry.execute_tool(AgentRole.CODER, "read_file", {"path": ".local-coder/tool-output/run_tests-abc.txt"}))
-    assert page.success and page.output.startswith("0\n")
+    assert not page.success and page.data["private_read_blocked"]
+    reference = next(iter(registry.context_archives))
+    assert reference in text and "recover_context" in text
+    recovered = run(registry.execute_tool(AgentRole.CODER, "recover_context", {"reference": reference}))
+    assert recovered.success and "0\\n1\\n2" in recovered.output
+    foreign = run(registry.execute_tool(AgentRole.EXPLORER, "recover_context", {"reference": reference}))
+    assert not foreign.success
 
 
 def test_tool_call_arguments_are_sent_as_json():
