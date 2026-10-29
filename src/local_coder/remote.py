@@ -353,18 +353,22 @@ class RemoteControlServer(WorkbenchAPI):
 
             def _respond(self, status: int, payload: dict[str, Any]) -> None:
                 data = json.dumps(payload, default=str).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._write_response(status, data, "application/json")
+
+            def _write_response(self, status: int, data: bytes, content_type: str) -> None:
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+                    # Aborted UI polling is an expected disconnect, not an API
+                    # failure. Never attempt a second response on this socket.
+                    self.close_connection = True
 
             def _respond_html(self, status: int, html: bytes) -> None:
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
-                self.end_headers()
-                self.wfile.write(html)
+                self._write_response(status, html, "text/html; charset=utf-8")
 
             def _respond_asset(self, status: int, asset: Path, content_type: str) -> None:
                 try:
@@ -372,11 +376,7 @@ class RemoteControlServer(WorkbenchAPI):
                 except OSError:
                     self._respond(404, {"error": "ui asset not found"})
                     return
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._write_response(status, data, content_type)
 
             def do_GET(self) -> None:
                 path = urlsplit(self.path).path

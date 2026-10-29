@@ -786,6 +786,27 @@ class BaseAgent:
                 return self._build_response(task, visible, TaskStatus.BLOCKED,
                                             issues=[refusal.reason])
 
+            if response.finish_reason in {"length", "max_tokens"}:
+                # This host boundary applies even to custom/local backends that
+                # return syntactically closed arguments from a partial response.
+                # Do not repair, journal as started, or execute any such call.
+                messages.append(Message(role="assistant", content=response.content,
+                                        tool_calls=response.tool_calls or None,
+                                        reasoning_content=response.reasoning_content,
+                                        reasoning_details=getattr(response, "reasoning_details", None)))
+                for call in response.tool_calls:
+                    messages.append(Message(role="tool", tool_call_id=call.id, name=call.name,
+                                            content="Tool not executed: the model response was truncated."))
+                self.state.messages = list(messages)
+                self.state.phase = AgentPhase.FAILED
+                self.state.finished_at = datetime.now()
+                self._emit_event("model_output_truncated", "Truncated model response; no tools from this response executed",
+                                 task_id=task.task_id, data={"automatic_retry": False, "finish_reason": response.finish_reason})
+                await self._checkpoint_boundary({"output_truncated": True, "automatic_retry": False})
+                visible = response.model_copy(update={"content": response.content or "Model output was truncated; no tools from this response were executed."})
+                return self._build_response(task, visible, TaskStatus.FAILED,
+                                            issues=["Model output was truncated; increase the output budget before continuing"])
+
             response, repairs = self._repair_tool_calls(response, tool_schemas, task)
 
             # If no tool calls, we're done
@@ -794,10 +815,6 @@ class BaseAgent:
                                         reasoning_content=response.reasoning_content,
                                         reasoning_details=getattr(response, "reasoning_details", None)))
                 self.state.messages = list(messages)
-                if response.finish_reason in {"length", "max_tokens"}:
-                    self.state.phase = AgentPhase.FAILED
-                    return self._build_response(task, response, TaskStatus.FAILED,
-                                                issues=["Model output was truncated; increase the output budget"])
                 # A protected stop prevents retries, not observed completion
                 # checks. Scope language must never turn missing work into success.
                 feedback = await self._finalization_feedback(task, response)
