@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import re
 import stat
@@ -32,7 +33,48 @@ class SessionStore:
         self.state_root = self.root / relative
         self.path = self.state_root / "sessions.json"
         self.lock_path = self.path.with_suffix(".lock")
+        self._journal_cache: dict | None = None
+        self._journal_cache_identity: tuple[int, ...] | None = None
         self._guard(self.path, create=True)
+
+    def _clear_journal_cache(self) -> None:
+        self._journal_cache = None
+        self._journal_cache_identity = None
+
+    def _journal_fingerprint(self) -> tuple[int, ...]:
+        """Check current regular-file identity without reading its contents."""
+        self._guard(self.path)
+        descriptors = []
+        try:
+            relative = self.path.relative_to(self.root)
+            if hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                descriptors.append(os.open(self.root, flags))
+                for part in relative.parts[:-1]:
+                    descriptors.append(os.open(part, flags, dir_fd=descriptors[-1]))
+                descriptor = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=descriptors[-1])
+            else:
+                descriptor = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            descriptors.append(descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (os.name != "nt" and info.st_uid != os.getuid()):
+                raise SessionError("Session journal must remain an owned regular file")
+            self._guard(self.path)
+            current = self.path.stat(follow_symlinks=False)
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            identity = tuple(getattr(info, field) for field in fields)
+            if identity != tuple(getattr(current, field) for field in fields):
+                raise SessionError("Session journal changed while checking its identity")
+            return identity
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise SessionError("Session journal identity could not be checked safely") from None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def _guard(self, path: Path, *, create: bool = False) -> None:
         try:
@@ -96,25 +138,61 @@ class SessionStore:
             raise SessionError("Session data is unreadable, invalid or too large; preserve the file and restore a valid copy") from None
 
     def _write(self, path: Path, payload: Any, limit: int) -> None:
+        if path == self.path:
+            self._clear_journal_cache()
         self._guard(path, create=True)
         _write_json_atomic(path, payload, max_bytes=limit, guard=lambda: self._guard(path, create=True))
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        with self._open_private(self.lock_path, "a+") as lock_file:
-            with exclusive_lock(lock_file):
-                self._guard(self.lock_path)
-                if self.lock_path.stat(follow_symlinks=False).st_ino != os.fstat(lock_file.fileno()).st_ino:
-                    raise SessionError("Session journal lock changed while acquiring it")
-                yield
-
-    def _read_unlocked(self) -> dict[str, dict[str, Any]]:
         try:
-            sessions = self._read_json(self.path, MAX_JOURNAL_BYTES)
-        except FileNotFoundError:
-            return {}
-        _validate_index(sessions)
-        return sessions
+            with self._open_private(self.lock_path, "a+") as lock_file:
+                with exclusive_lock(lock_file):
+                    self._guard(self.lock_path)
+                    if self.lock_path.stat(follow_symlinks=False).st_ino != os.fstat(lock_file.fileno()).st_ino:
+                        raise SessionError("Session journal lock changed while acquiring it")
+                    yield
+        except BaseException:
+            self._clear_journal_cache()
+            raise
+
+    def _read_unlocked(self, *, copy_result: bool = True) -> dict[str, dict[str, Any]]:
+        """Return validated state; borrowed cache data must stay under the lock."""
+        observed_existing = False
+        try:
+            for _ in range(2):
+                try:
+                    identity = self._journal_fingerprint()
+                except FileNotFoundError:
+                    self._clear_journal_cache()
+                    if observed_existing:
+                        raise SessionError("Session journal disappeared while reading; retain saved history for recovery") from None
+                    return {}
+                observed_existing = True
+                if (identity[2] <= MAX_JOURNAL_CACHE_BYTES and self._journal_cache is not None
+                        and identity == self._journal_cache_identity):
+                    sessions = copy.deepcopy(self._journal_cache) if copy_result else self._journal_cache
+                    if self._journal_fingerprint() == identity:
+                        return sessions
+                    self._clear_journal_cache()
+                    continue
+                self._clear_journal_cache()
+                try:
+                    sessions = self._read_json(self.path, MAX_JOURNAL_BYTES)
+                    _validate_index(sessions)
+                    latest = self._journal_fingerprint()
+                except FileNotFoundError:
+                    continue
+                if latest != identity:
+                    continue
+                if identity[2] <= MAX_JOURNAL_CACHE_BYTES:
+                    self._journal_cache, self._journal_cache_identity = sessions, identity
+                    return copy.deepcopy(sessions) if copy_result else sessions
+                return sessions
+            raise SessionError("Session journal changed repeatedly while reading; retry after other writers finish")
+        except BaseException:
+            self._clear_journal_cache()
+            raise
 
     def _read(self) -> dict[str, dict[str, Any]]:
         with self._lock():
@@ -135,7 +213,10 @@ class SessionStore:
 
     def get(self, session_id: str) -> dict[str, Any] | None:
         validate_session_id(session_id)
-        return self._read().get(session_id)
+        with self._lock():
+            # Copy only the requested record; an unrelated large report should
+            # not be copied every time the active task's status is polled.
+            return copy.deepcopy(self._read_unlocked(copy_result=False).get(session_id))
 
     def list(self) -> list[dict[str, Any]]:
         return sorted(self._read().values(), key=lambda item: item.get("updated_at", ""), reverse=True)
@@ -207,6 +288,9 @@ HISTORY_TURNS = 5
 HISTORY_RESULT_CHARS = 1500
 HISTORY_REQUEST_CHARS = 2000
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+# Windows ctime currently represents creation time, so restored-mtime edits do
+# not support this metadata invalidation contract there. Keep reads uncached.
+MAX_JOURNAL_CACHE_BYTES = 0 if os.name == "nt" else 8 * 1024 * 1024
 MAX_SESSION_BYTES = 32 * 1024 * 1024
 MAX_EVENT_BYTES = 256 * 1024
 MAX_EVENT_FILE_BYTES = 32 * 1024 * 1024
