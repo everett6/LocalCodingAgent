@@ -16,6 +16,7 @@ async function component(name) {
   const location = new URL(`../src/components/${name}.tsx`, import.meta.url)
   const source = await readFile(location, 'utf8')
   let output = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText
+  output = output.replace(/^import ['"][^'"]+\.css['"];?\s*$/gm, '')
   for (const helper of ['runInspectorTabs', 'reportBlocks']) {
     output = output.replaceAll(`'./${helper}'`, JSON.stringify(new URL(`../src/components/${helper}.ts`, import.meta.url).href))
   }
@@ -57,4 +58,19 @@ test('rendered report escapes HTML and has safe explicit links and accessible co
   assert.ok(markup.includes('href="https://example.test/" target="_blank" rel="noopener noreferrer"'))
   assert.ok(markup.includes('aria-label="Copy sh code"'))
   assert.ok(markup.includes('Download full report'))
+})
+
+test('Undo has an accessible in-app confirmation and escapes untrusted task text', async () => {
+  const { UndoDialog } = await component('UndoDialog')
+  let confirmed = 0
+  const html = renderToStaticMarkup(createElement(UndoDialog, {
+    request: '<script>untrusted task text</script>', close: () => {}, confirm: () => { confirmed += 1 },
+  }))
+  assert.match(html, /<dialog[^>]*aria-labelledby="undo-title"[^>]*aria-describedby="undo-description"/)
+  assert.match(html, /Keep changes/)
+  assert.match(html, /Restore checkpoint/)
+  assert.match(html, /Newer edits or checkpoints prevent restoration/)
+  assert.match(html, /&lt;script&gt;untrusted task text&lt;\/script&gt;/)
+  assert.doesNotMatch(html, /<script>/)
+  assert.equal(confirmed, 0)
 })

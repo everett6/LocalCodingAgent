@@ -88,12 +88,18 @@ def test_profile_retrieval_share_reduces_user_budget_and_recovers_on_switch(monk
     agent, registry, task = make_agent()
     engine_limits(monkeypatch, registry)
     registry.context_memory = Memory()
+    # Keep the user ceiling above both profile shares so this phase measures
+    # switching, even when the default model window grows.
+    registry.memory_context_chars = agent._message_budget()
     registry.profile_limits = {"context_share_percent": 5}
     first = refresh(agent, task)
     assert registry.context_memory.budgets[-1] == agent._message_budget() * 5 // 100
     registry.profile_limits = {"context_share_percent": 20}
     refresh(agent, task, first)
     assert registry.context_memory.budgets[-1] == agent._message_budget() * 20 // 100
+    registry.memory_context_chars = 10000
+    refresh(agent, task, first)
+    assert registry.context_memory.budgets[-1] == min(10000, agent._message_budget() * 20 // 100)
     registry.memory_context_chars = 300
     refresh(agent, task, first)
     assert registry.context_memory.budgets[-1] == 300

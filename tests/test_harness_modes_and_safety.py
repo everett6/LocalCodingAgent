@@ -166,6 +166,8 @@ class TestOperatingModes:
         assert isinstance(agent, BugHunterAgent)
         assert agent.role == AgentRole.BUG_HUNTER
         assert "Bug Hunter" in agent.system_prompt
+        assert "map the state machine" in agent.system_prompt.lower()
+        assert "valid control sequence" in agent.system_prompt.lower()
         assert registry.has_permission(AgentRole.BUG_HUNTER, ToolName.WRITE_FILE)
         assert registry.has_permission(AgentRole.BUG_HUNTER, ToolName.RUN_TESTS)
 
@@ -183,6 +185,42 @@ class TestOperatingModes:
         # Verify undo method exists and works on coordinator
         cp = coordinator.checkpoints.create()
         assert "Rolled back" in coordinator.undo()
+
+    def test_investigation_fix_never_grants_arbitrary_commands(self, tmp_path: Path, monkeypatch):
+        from local_coder.orchestrator import coordinator as coordinator_module
+        from local_coder.types import TaskStatus
+
+        coordinator = coordinator_module.Coordinator(ProjectConfig(
+            mode=AgentMode.CYBERSECURITY,
+            safety_tier=SafetyTier.TIER_3_BALANCED,
+        ), str(tmp_path))
+        observed = {}
+
+        class CapturingAgent:
+            async def execute(self, task):
+                permissions = coordinator.tool_registry._permissions[AgentRole.SECURITY]
+                observed["permissions"] = set(permissions)
+                return SimpleNamespace(status=TaskStatus.COMPLETED, summary="fixed locally")
+
+        monkeypatch.setattr(coordinator_module, "create_agent", lambda *args, **kwargs: CapturingAgent())
+        coordinator.model_manager.get_model = AsyncMock(return_value=FakeAgentModel(""))
+
+        asyncio.run(coordinator.run("Fix the local issue", fix=True))
+
+        allowed = observed["permissions"]
+        assert {ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH, ToolName.RUN_TESTS} <= allowed
+        assert not {ToolName.RUN_COMMAND, ToolName.BUILD, ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT} & allowed
+
+    def test_read_only_tier_rejects_investigation_remediation(self, tmp_path: Path):
+        from local_coder.orchestrator.coordinator import Coordinator
+
+        coordinator = Coordinator(ProjectConfig(
+            mode=AgentMode.BUG_HUNTING,
+            safety_tier=SafetyTier.TIER_1_PARANOIA,
+        ), str(tmp_path))
+
+        with pytest.raises(ValueError, match="read-only safety tier"):
+            asyncio.run(coordinator.run("Fix the issue", fix=True))
 
 
 class TestCliHarnessCommands:

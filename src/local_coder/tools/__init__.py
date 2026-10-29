@@ -16,6 +16,7 @@ from local_coder.tools.repo_map import RepoMapTool
 from local_coder.types import ApprovalConfig
 from typing import Any
 from local_coder.tools.bugs import RunBugScanTool
+from local_coder.context.code_index import CodeIndex
 
 
 def create_tool_registry(
@@ -24,6 +25,7 @@ def create_tool_registry(
     approval_callback: ApprovalCallback | None = None,
     safety_harness: Any = None,
     improvement_evaluator: Any = None,
+    code_index: CodeIndex | None = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry and register all available tools.
 
@@ -70,6 +72,11 @@ def create_tool_registry(
     registry.profile_overrides = {}
     registry.auto_language_context = False
     registry.pre_edit_snapshots = True
+    registry.team_mailbox = None
+    from local_coder.tools.team_message import TeamMessageTool
+    from local_coder.tools.visual import VisualVerificationTool
+    registry.register(TeamMessageTool(registry))
+    registry.register(VisualVerificationTool(project_root, approval_callback, safety_harness=safety_harness))
     from local_coder.tools.exploit import GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool
     for cls in (GenerateExploitTool, PrivilegeEscalationAnalysisTool, GenerateFuzzCasesTool):
         registry.register(cls(project_root, safety_harness=safety_harness, approval_callback=approval_callback))
@@ -86,6 +93,10 @@ def create_tool_registry(
             allowed.update({ToolName.HARNESS_EVOLVE, ToolName.GENERATED_TOOL, ToolName.DELEGATE_TASK, ToolName.MCP_CALL})
         if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.REVIEWER}:
             allowed.add(ToolName.MCP_CALL)
+        if role in {AgentRole.EXPLORER, AgentRole.PLANNER, AgentRole.CODER, AgentRole.DEBUGGER, AgentRole.TESTER, AgentRole.REVIEWER}:
+            allowed.add(ToolName.TEAM_MESSAGE)
+        if role in {AgentRole.CODER, AgentRole.TESTER}:
+            allowed.add(ToolName.VERIFY_UI)
     registry._permissions[AgentRole.BUG_HUNTER].add(ToolName.DELEGATE_TASK)
     from local_coder.security_playbooks import SecurityPlaybookTool
     registry.register(SecurityPlaybookTool())
@@ -106,7 +117,7 @@ def create_tool_registry(
     # Search tools
     registry.register(SearchFilesTool(project_root))
     registry.register(GrepTool(project_root))
-    code_search = CodeSearchTool(project_root)
+    code_search = CodeSearchTool(project_root, index=code_index)
     registry.register(code_search)
     registry.register(RepoMapTool(project_root, index=code_search.index))
 

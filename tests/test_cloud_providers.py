@@ -30,6 +30,56 @@ def test_tool_arguments_use_valid_json():
     asyncio.run(backend.close())
 
 
+def test_native_qwen_profile_streams_and_reassembles_tool_calls_with_context_cap():
+    seen = []
+    frames = [
+        {"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": "read_file", "arguments": "{\"path\":\""}}
+        ]}}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "app.py\"}"}}
+        ]}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+         "usage": {"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48}},
+    ]
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        body = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body)
+
+    async def scenario():
+        config = ModelConfig(
+            name="native-qwen", model_id="qwen-local", backend="openai_compatible",
+            base_url="http://localhost:1234/v1", profile="qwen38",
+            context_length=1024, max_tokens=4096,
+        )
+        backend = OpenAICompatibleBackend(config)
+        await backend.client.aclose()
+        backend.client = httpx.AsyncClient(
+            base_url=config.base_url, transport=httpx.MockTransport(handler),
+        )
+        response = await backend.generate(
+            [Message(role="user", content="Inspect app.py")],
+            tools=[{"type": "function", "function": {
+                "name": "read_file", "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }}],
+        )
+        await backend.close()
+        return response
+
+    response = asyncio.run(scenario())
+
+    assert seen[0]["stream"] is True
+    assert seen[0]["stream_options"] == {"include_usage": True}
+    assert seen[0]["max_tokens"] == 512
+    assert response.tool_calls[0].name == "read_file"
+    assert response.tool_calls[0].arguments == {"path": "app.py"}
+    assert response.total_tokens == 48
+
+
 def test_anthropic_roundtrip_tool_results_and_usage():
     from local_coder.models.anthropic import AnthropicBackend
     seen = []
@@ -73,7 +123,7 @@ def test_anthropic_stream_and_error_does_not_expose_key():
         backend = AnthropicBackend(config)
         await backend.close()
         backend.client = httpx.AsyncClient(base_url="https://api.anthropic.com/v1", transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, content='data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}\n\n')))
+            lambda request: httpx.Response(200, content='data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}\n\ndata: {"type":"message_stop"}\n\n')))
         assert [x async for x in backend.stream([Message(role="user", content="Hi")])] == ["hello"]
         await backend.close()
     asyncio.run(scenario())

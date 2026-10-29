@@ -33,7 +33,8 @@ Scanner/imported findings, HTTP observations and recipes remain unverified.
 No project execution or detector telemetry exists here: detection is not_tested.
 Never invent evidence, tests, impacts, exploitability or detection. Do not use
 secrets, attack credentials, establish persistence, move laterally or perform
-destructive actions. No arbitrary shell or source writes. Report observed work,
+destructive actions. No arbitrary shell, source writes, exploit generation, credential harvesting or remote-target probes.
+Optional HTTP observations are limited to explicitly opted-in loopback origins. Report observed work,
 coverage gaps, counterevidence, prerequisites, remediation and unfinished work.
 Recommend separate reviewed sandbox validation for supported local findings.'''
 

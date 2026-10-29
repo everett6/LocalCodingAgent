@@ -1,10 +1,49 @@
 import asyncio
 import json
 
-from local_coder.core.runtime import AgentRuntime
+from local_coder.core.runtime import (
+    AgentRuntime,
+    validate_workspace_file_fingerprints,
+    workspace_file_fingerprints,
+)
 from local_coder.intelligence.context_engine import ContextEngine
 from local_coder.intelligence.indexer import CodeIndexer
 from local_coder.types import AgentPhase, AgentRole, AgentState, AgentTask, Message
+
+
+def test_workspace_context_fingerprints_detect_changed_and_missing_files(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("before\n")
+    fingerprints = workspace_file_fingerprints(str(tmp_path), ["app.py"])
+
+    validate_workspace_file_fingerprints(str(tmp_path), fingerprints)
+    source.write_text("after\n")
+    try:
+        validate_workspace_file_fingerprints(str(tmp_path), fingerprints)
+    except ValueError as exc:
+        assert "app.py" in str(exc)
+        assert "Start a new task" in str(exc)
+    else:
+        raise AssertionError("changed source should prevent stale-context resume")
+
+    source.unlink()
+    try:
+        validate_workspace_file_fingerprints(str(tmp_path), fingerprints)
+    except ValueError as exc:
+        assert "app.py" in str(exc)
+    else:
+        raise AssertionError("deleted source should prevent stale-context resume")
+
+
+def test_workspace_context_fingerprints_reject_workspace_escape(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.py"
+    outside.write_text("outside\n")
+    try:
+        workspace_file_fingerprints(str(tmp_path), [str(outside)])
+    except ValueError as exc:
+        assert "escapes workspace" in str(exc)
+    else:
+        raise AssertionError("workspace escape should be rejected")
 
 
 def test_checkpoint_survives_restart_with_full_task_and_history(tmp_path):

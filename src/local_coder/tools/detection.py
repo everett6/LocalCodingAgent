@@ -5,7 +5,13 @@ possible guards are evidence for human review, never a proof of exploitability.
 """
 from __future__ import annotations
 import ast
+import json
 from typing import Any
+
+MAX_CANDIDATE_SOURCE_BYTES = 256000
+MAX_CANDIDATE_AST_NODES = 40000
+MAX_CANDIDATE_FINDINGS = 1000
+MAX_CANDIDATE_BYTES = 1_000_000
 
 
 def dotted(node: ast.AST) -> str:
@@ -17,7 +23,15 @@ def dotted(node: ast.AST) -> str:
 
 
 def python_candidates(source: str, filename: str) -> list[dict[str, Any]]:
+    # Local import avoids a module cycle: security_analysis also reuses this
+    # detector after defining the common limit exception.
+    from local_coder.security_analysis import AnalysisLimit
+    if not isinstance(source, str) or len(source.encode('utf-8')) > MAX_CANDIDATE_SOURCE_BYTES:
+        raise AnalysisLimit('Python candidate source exceeds the byte limit')
     tree = ast.parse(source, filename=filename)
+    for index, _ in enumerate(ast.walk(tree)):
+        if index >= MAX_CANDIDATE_AST_NODES:
+            raise AnalysisLimit('Python candidate AST exceeds the node limit')
     lines = source.splitlines()
     aliases = {}
     for node in ast.walk(tree):
@@ -36,6 +50,7 @@ def python_candidates(source: str, filename: str) -> list[dict[str, Any]]:
         if isinstance(call, ast.Call):
             callers.setdefault(dotted(call.func).split('.')[-1], []).append(call.lineno)
     findings = []
+    finding_bytes = 0
 
     class Flow(ast.NodeVisitor):
         def __init__(self):
@@ -118,8 +133,11 @@ def python_candidates(source: str, filename: str) -> list[dict[str, Any]]:
             self.guards.pop()
 
         def add(self, node, rule, message, value, preconditions):
+            nonlocal finding_bytes
+            if len(findings) >= MAX_CANDIDATE_FINDINGS:
+                raise AnalysisLimit('Python candidate finding count exceeds the limit')
             trace = self.trace(value)
-            findings.append({"file": filename, "line": node.lineno, "severity": "HIGH",
+            finding = {"file": filename, "line": node.lineno, "severity": "HIGH",
                 "rule_id": rule, "message": message, "code": lines[node.lineno - 1].strip(),
                 "confidence": "source-linked" if any(t['kind'] == 'external_input' for t in trace) else "heuristic",
                 "verification": "unverified", "source_trace": trace,
@@ -127,7 +145,11 @@ def python_candidates(source: str, filename: str) -> list[dict[str, Any]]:
                 "function": self.function, "callers": callers.get(self.function, [])[:20],
                 "guards": list(self.guards), "decorators": list(self.decorators),
                 "preconditions": preconditions,
-                "coverage_limits": ["intraprocedural only", "guards and authorization not proven", "no code executed"]})
+                "coverage_limits": ["intraprocedural only", "guards and authorization not proven", "no code executed"]}
+            finding_bytes += len(json.dumps(finding).encode('utf-8'))
+            if finding_bytes > MAX_CANDIDATE_BYTES:
+                raise AnalysisLimit('Python candidate finding bytes exceed the limit')
+            findings.append(finding)
 
         def visit_Call(self, node):
             name = canonical(node.func)

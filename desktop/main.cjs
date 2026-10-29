@@ -34,8 +34,32 @@ async function startEngine(folder) {
   sidecar = new Sidecar({ command, token, args: app.isPackaged ? [] : ['-m', 'local_coder.desktop_engine'], cwd: folder,
     env: { ...process.env, PYTHONPATH: app.isPackaged ? '' : path.join(root, 'src'), LOCAL_CODER_DESKTOP_PROJECT: folder, LOCAL_CODER_REMOTE_TOKEN: token },
     onExit: () => { if (!quitting && !switching) { origin = null; dialog.showErrorBox('Local engine stopped', 'The engine exited unexpectedly. Close and reopen Clin. Saved task reports remain in your workspace.'); } } });
-  origin = await sidecar.start(); token = sidecar.token; project = folder;
+  origin = await startWithRecovery(sidecar, {cancelled: () => quitting,
+    onRetry: () => startupStatus('engine_start_retry transient_exit')});
+  token = sidecar.token; project = folder;
   startupStatus(sidecar.child ? 'engine_ready owned' : 'engine_ready shared');
+}
+async function startWithRecovery(engine, {cancelled = () => false, onRetry = () => {}, delay = ms => new Promise(resolve => setTimeout(resolve, ms))} = {}) {
+  try { return await engine.start(); }
+  catch (error) {
+    if (error.code !== 'engine_exited' || error.retryable !== true || cancelled()) throw error;
+    onRetry();
+    await delay(250);
+    if (cancelled()) throw error;
+    // start() checks authenticated discovery again before spawning. Retry only
+    // a failed startup, never an already-ready engine or any running task.
+    return engine.start();
+  }
+}
+async function showStartupFailure(error) {
+  startupStatus('startup_failed: ' + error.message);
+  try {
+    await dialog.showMessageBox({type: 'error', title: 'Cannot start Clin', message: 'Clin could not start its local engine',
+      detail: error.message + (app.isPackaged
+        ? '\nYour project files are retained. Retry opening Clin. If startup keeps failing, repair the application installation.'
+        : '\nFor development, install the Python project and build the web UI first.'),
+      buttons: ['Close'], defaultId: 0, cancelId: 0, noLink: true});
+  } finally { app.quit(); }
 }
 async function chooseProject() {
   if (switching) return;
@@ -161,9 +185,9 @@ app.whenReady().then(async () => {
     window.webContents.on('render-process-gone', (_event, details) => startupStatus(`renderer_stopped ${details.reason} ${details.exitCode}`));
     window.once('ready-to-show', () => { window.show(); startupStatus('window_ready'); });
     await window.loadURL(origin);
-  } catch (error) { startupStatus('startup_failed: ' + error.message); dialog.showErrorBox('Cannot start Clin', error.message + '\nFor development, install the Python project and build the web UI first.'); app.quit(); }
+  } catch (error) { await showStartupFailure(error); }
 });
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', event => { startupStatus('quit_requested'); if (!quitting) { event.preventDefault(); quitting = true; void sidecar?.stop().finally(() => app.quit()); } });
+app.on('before-quit', event => { startupStatus('quit_requested'); if (!quitting) { event.preventDefault(); quitting = true; void Promise.resolve(sidecar?.stop()).then(() => app.quit(), () => app.quit()); } });
 
-module.exports = { installedIDE, spawnIDE };
+module.exports = { installedIDE, spawnIDE, startWithRecovery, showStartupFailure };

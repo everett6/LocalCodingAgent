@@ -142,7 +142,7 @@ def test_missing_previous_engagement_does_not_block_local_review(tmp_path):
 def test_local_review_statement_cannot_authorize_http_by_accident(tmp_path):
     defaults = RedTeamDefaults(tmp_path)
     with pytest.raises(ValueError, match='authorization'):
-        defaults.update({'preset': 'api-review', 'settings': {'origins': ['example.com'], 'active_http': True}})
+        defaults.update({'preset': 'api-review', 'settings': {'origins': ['http://127.0.0.1:8000'], 'active_http': True}})
 
 
 def test_windows_defaults_without_posix_apis_replaces_readonly_file(tmp_path, monkeypatch):

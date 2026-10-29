@@ -33,6 +33,7 @@ from local_coder.types import Message
 PRUNED_TOOL_OUTPUT = "[Old tool output cleared to save context. Re-run the tool if you need it again.]"
 SUPERSEDED_TOOL_OUTPUT = "[Tool output cleared: the same call was repeated later; see the newer result.]"
 SUMMARY_PREFIX = "Summary of earlier work (older messages were compacted to save context):\n"
+COMPACTION_NOTICE = "Earlier tool history was compacted to stay within the context budget."
 
 # Tools whose result depends only on their arguments and current repository
 # state, so an identical later call makes an earlier result redundant.
@@ -202,14 +203,17 @@ def compress_messages(messages: list[Message], max_chars: int,
                 continue
         groups.append(group)
     reference = archive(messages) if archive else None
-    notice = "Earlier tool history was compacted to stay within the context budget."
+    has_summary = any(message.content.startswith(SUMMARY_PREFIX) for message in messages)
+    has_notice = any(message.role == "system" and message.content.startswith(COMPACTION_NOTICE) for message in messages)
+    notice = "" if has_summary or has_notice else COMPACTION_NOTICE
     if reference and not any(reference in message.content for message in preserved):
         if reference.startswith("agent-memory:"):
-            notice += f" Full untrusted history retained by the embedding agent: {reference}."
+            notice += (" " if notice else "") + f"Full untrusted history retained by the embedding agent: {reference}."
         else:
-            notice += f" Full untrusted history is recoverable with recover_context using reference {reference}."
-    summary = Message(role="system", content=notice)
-    remaining = max_chars - sum(message_size(m) for m in preserved + [summary])
+            notice += (" " if notice else "") + f"Full untrusted history is recoverable with recover_context using reference {reference}."
+    summary = Message(role="system", content=notice) if notice else None
+    notices = [summary] if summary is not None else []
+    remaining = max_chars - sum(message_size(m) for m in preserved + notices)
     selected = []
     for group in reversed(groups):
         size = sum(message_size(m) for m in group)
@@ -219,24 +223,42 @@ def compress_messages(messages: list[Message], max_chars: int,
             # Never modify provider reasoning or assistant tool-call arguments.
             fixed = sum(message_size(m) for m in group if m.role != "tool")
             tools = [m for m in group if m.role == "tool"]
-            allowance = max(64, (remaining - fixed) // max(1, len(tools)) - 200)
+            # Retain conservative headroom for later engine context framing;
+            # measure the retained tool message in serialized units below.
+            allowance = max(0, (remaining - fixed) // max(1, len(tools)) - 200)
             compacted = []
             for m in group:
-                if m.role == "tool" and len(m.content) > allowance:
+                if m.role == "tool" and message_size(m) > allowance:
                     marker = "[Tool text compacted; " + (f"full history: {reference}" if reference else "earlier text omitted") + "]\n"
-                    half = max(0, (allowance - len(marker)) // 2)
-                    content = marker + (m.content[:half] + "\n…\n" + m.content[-half:] if half else "")
-                    m = m.model_copy(update={"content": content})
+                    candidate = m.model_copy(update={"content": marker})
+                    if message_size(candidate) >= message_size(m):
+                        compacted.append(m)
+                        continue
+                    # Immutable preamble/protocol metadata may alone exceed the
+                    # compaction target. Keep that minimal round and let the
+                    # caller enforce its hard model-window admission limit.
+                    low, high = 0, len(m.content) if message_size(candidate) <= allowance else 0
+                    while low < high:
+                        keep = (low + high + 1) // 2
+                        head, tail = (keep + 1) // 2, keep // 2
+                        text = marker + m.content[:head] + "\n…\n" + (m.content[-tail:] if tail else "")
+                        trial = m.model_copy(update={"content": text})
+                        if message_size(trial) <= allowance:
+                            low = keep
+                            candidate = trial
+                        else:
+                            high = keep - 1
+                    m = candidate
                 compacted.append(m)
             group = compacted
         selected.append(group)
         remaining -= sum(message_size(m) for m in group)
-    compacted = preserved + [summary] + [m for group in reversed(selected) for m in group]
+    compacted = preserved + notices + [m for group in reversed(selected) for m in group]
     if compaction_fidelity(messages, "\n".join(m.content for m in compacted))["passed"]:
         return compacted
-    # A deterministic fallback must preserve the same explicit facts that gate
-    # model summaries. A budget too small for those facts cannot be compacted
-    # honestly: retain originals so admission/CompactionGuard can stop safely.
+    # Preserve explicit facts in the deterministic fallback just as we require
+    # of model summaries. If they cannot fit, retain originals for admission
+    # and CompactionGuard to stop safely rather than silently lose constraints.
     facts = []
     for message in messages:
         for line in message.content.splitlines():
@@ -244,7 +266,7 @@ def compress_messages(messages: list[Message], max_chars: int,
                 facts.append(line)
         facts.extend(match.group() for match in _SOURCE_REFERENCE.finditer(message.content))
     pin = Message(role="user", content="Preserved untrusted history facts; verify sources:\n" + "\n".join(dict.fromkeys(facts)))
-    fixed = preserved + [summary, pin]
+    fixed = preserved + notices + [pin]
     remaining = max_chars - sum(message_size(m) for m in fixed)
     if remaining < 0:
         return messages

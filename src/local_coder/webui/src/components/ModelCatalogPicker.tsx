@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
+import { Check, RefreshCw, Search } from 'lucide-react'
 import type { CatalogModel, ModelCatalog } from '../api'
 
 const pageSize = 25
-const controlStyle = { border: '1px solid #444', borderRadius: 5, padding: '7px 10px', fontSize: 11 } as const
 
 function price(value: number | null | undefined): string {
   return value == null ? 'Unknown' : `$${value.toLocaleString(undefined, { maximumFractionDigits: 8 })}`
@@ -31,29 +31,30 @@ export function ModelCatalogPicker({ catalog, selected, loading, error, choose, 
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
   const currentPage = Math.min(page, pages - 1)
   const visible = filtered.slice(currentPage * pageSize, (currentPage + 1) * pageSize)
-  const chosen = catalog?.models.find(model => model.id === selected)
 
-  return <section className="model-catalog" aria-label="Model catalog" style={{ margin: '16px 0', minWidth: 0 }}>
-    <label>Search all models<input value={query} placeholder="Model name, provider, NVIDIA, :free…" onChange={event => { setQuery(event.target.value); setPage(0) }} /></label>
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', marginBottom: 12 }}>
-      <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6, margin: 0 }}><input type="checkbox" checked={freeOnly} onChange={event => { setFreeOnly(event.target.checked); setPage(0) }} />Free only</label>
-      <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6, margin: 0 }}><input type="checkbox" checked={toolsOnly} onChange={event => { setToolsOnly(event.target.checked); setPage(0) }} />Tool calling</label>
-      {refresh && <button type="button" disabled={disabled || loading} style={controlStyle} onClick={refresh}>Refresh catalog</button>}
+  return <section className="model-catalog" aria-label="Model catalog" aria-busy={loading}>
+    <div className="catalog-heading"><h3>Choose a model</h3>{refresh && <button type="button" className="connection-secondary" disabled={disabled || loading} onClick={refresh}><RefreshCw size={13}/>Refresh catalog</button>}</div>
+    <label className="catalog-search"><span className="sr-only">Search all models</span><Search size={16}/><input value={query} placeholder="Search model names or providers…" onChange={event => { setQuery(event.target.value); setPage(0) }} /></label>
+    <div className="catalog-filters">
+      <label><input type="checkbox" checked={freeOnly} onChange={event => { setFreeOnly(event.target.checked); setPage(0) }} />Free only</label>
+      <label><input type="checkbox" checked={toolsOnly} onChange={event => { setToolsOnly(event.target.checked); setPage(0) }} />Tool calling</label>
+      {catalog && <span>{filtered.length.toLocaleString()} of {catalog.models.length.toLocaleString()} models</span>}
     </div>
     {loading && <p role="status" className="hint">Loading model metadata…</p>}
     {(error || catalog?.error) && <p role="alert" className="error-text">{error || catalog?.error}</p>}
-    {catalog && <p className="hint">{filtered.length.toLocaleString()} matching · {catalog.models.length.toLocaleString()} models in {catalog.source}. {catalog.stale ? 'Cached metadata may be out of date.' : 'Metadata is supplied by the provider.'}</p>}
-    {chosen && <p className="hint">Selected: <code>{chosen.id}</code> · {chosen.is_free === true ? 'Free according to catalog pricing' : chosen.is_free === false ? 'Metered model' : 'Pricing status unknown'}</p>}
-    {!loading && catalog && !filtered.length && <p className="hint">No models match these filters. Try another search or clear the filters.</p>}
-    <div style={{ maxHeight: 390, overflow: 'auto', border: '1px solid #3b3b3b', borderRadius: 6 }}>
-      {visible.map(model => <button className="catalog-model" key={model.id} type="button" disabled={disabled} aria-pressed={model.id === selected} onClick={() => choose(model)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px', borderBottom: '1px solid #363636', background: model.id === selected ? '#343b48' : undefined }}>
-        <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', fontSize: 12 }}><strong>{model.name || model.id}</strong><span className={`status-badge ${model.is_free === true ? 'free' : ''}`} style={{ color: model.is_free === true ? 'var(--green)' : 'var(--muted)', fontSize: 10 }}>{model.is_free === true ? 'FREE' : model.is_free === false ? 'METERED' : 'PRICE UNKNOWN'}</span>{model.id.endsWith(':free') && <span className="hint">Exact :free variant</span>}{model.id === selected && <span style={{ color: 'var(--accent)' }}>Selected</span>}</span>
-        <code style={{ display: 'block', margin: '5px 0', fontSize: 10, overflowWrap: 'anywhere' }}>{model.id}</code>
-        <span className="hint" style={{ display: 'block' }}>Context: {model.context_length ? `${model.context_length.toLocaleString()} tokens` : 'Not reported'} · Output: {model.max_output_tokens ? `${model.max_output_tokens.toLocaleString()} tokens` : 'Not reported'} · Tools: {model.supports_tools === true ? 'Yes' : model.supports_tools === false ? 'No' : 'Unknown'}</span>
-        <span className="hint" style={{ display: 'block' }}>USD / million tokens: input {price(model.input_cost_per_million)} · output {price(model.output_cost_per_million)}{model.request_cost_usd != null && model.request_cost_usd !== 0 ? ` · ${price(model.request_cost_usd)} / request` : ''}</span>
+    {catalog?.stale && <p className="catalog-stale" role="status">Cached model metadata may be out of date. Refresh for current availability and pricing.</p>}
+    {!loading && catalog && !filtered.length && <div className="catalog-empty"><Search size={23}/><strong>No matching models</strong><p>Try another name, or turn off a filter.</p><button type="button" className="connection-secondary" onClick={() => { setQuery(''); setFreeOnly(false); setToolsOnly(false); setPage(0) }}>Clear filters</button></div>}
+    {visible.length > 0 && <div className="catalog-results" aria-label="Available models">
+      {visible.map(model => <button className="catalog-model" key={model.id} type="button" disabled={disabled} aria-pressed={model.id === selected} onClick={() => choose(model)}>
+        <span className="catalog-choice-mark" aria-hidden="true">{model.id === selected && <Check size={12}/>}</span>
+        <span className="catalog-model-copy"><span className="catalog-model-name"><strong>{model.name || model.id}</strong><span className={`catalog-price-badge ${model.is_free === true ? 'free' : ''}`}>{model.is_free === true ? 'Free' : model.is_free === false ? 'Metered' : 'Price unknown'}</span></span>
+        <code>{model.id}</code>
+        <span className="catalog-model-facts"><span>{model.context_length ? `${model.context_length.toLocaleString()} context` : 'Context unknown'}</span><span>{model.max_output_tokens ? `${model.max_output_tokens.toLocaleString()} output` : 'Output unknown'}</span><span>{model.supports_tools === true ? 'Tool calling' : model.supports_tools === false ? 'No tools' : 'Tools unknown'}</span></span>
+        <span className="catalog-model-price">Per million tokens: {price(model.input_cost_per_million)} input / {price(model.output_cost_per_million)} output{model.request_cost_usd != null && model.request_cost_usd !== 0 ? ` + ${price(model.request_cost_usd)} per request` : ''}</span></span>
+        {model.id === selected && <span className="sr-only">Selected</span>}
       </button>)}
-    </div>
-    {filtered.length > pageSize && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 9 }}><button type="button" style={controlStyle} disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button><span className="hint">Page {currentPage + 1} of {pages} · {currentPage * pageSize + 1}–{Math.min((currentPage + 1) * pageSize, filtered.length)}</span><button type="button" style={controlStyle} disabled={currentPage >= pages - 1} onClick={() => setPage(currentPage + 1)}>Next</button></div>}
-    <p className="hint">Free labels follow the exact model ID and listed prices. Paid and :free variants are separate choices. Selecting a model never starts a model request.</p>
+    </div>}
+    {filtered.length > pageSize && <div className="catalog-pagination"><button type="button" className="connection-secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button><span>Page {currentPage + 1} of {pages}<small>{currentPage * pageSize + 1}–{Math.min((currentPage + 1) * pageSize, filtered.length)}</small></span><button type="button" className="connection-secondary" disabled={currentPage >= pages - 1} onClick={() => setPage(currentPage + 1)}>Next</button></div>}
+    <p className="hint catalog-pricing-note">Free labels use provider prices for the exact model ID. Paid and :free variants are separate choices. Selecting a model does not start a request.</p>
   </section>
 }

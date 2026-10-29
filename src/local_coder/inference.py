@@ -15,6 +15,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -24,6 +25,7 @@ import time
 import zipfile
 
 import httpx
+from local_coder.inference_discovery import open_regular_candidate
 
 
 DEFAULTS = {
@@ -34,6 +36,11 @@ DEFAULTS = {
 }
 
 
+def _guard_storage_directory(path: Path):
+    if any(candidate.is_symlink() for candidate in (path, *path.parents)):
+        raise ValueError("Inference storage cannot use linked directories.")
+
+
 def validate_model(value: str) -> Path:
     path = Path(value)
     if not path.is_absolute():
@@ -41,7 +48,7 @@ def validate_model(value: str) -> Path:
     path = path.resolve(strict=True)
     if path.suffix.lower() != ".gguf" or not path.is_file() or path.stat().st_size < 24:
         raise ValueError("Model must be a readable, nonempty GGUF file (at least 24 bytes).")
-    with path.open("rb") as stream:
+    with open_regular_candidate(path) as (stream, _info):
         if stream.read(4) != b"GGUF":
             raise ValueError("Selected file does not have a GGUF header.")
     return path
@@ -78,6 +85,7 @@ def _process_options() -> dict:
 class EmbeddedInferenceManager:
     def __init__(self, state_dir: Path | str):
         self.state_dir = Path(state_dir)
+        _guard_storage_directory(self.state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._operation = threading.RLock()
@@ -92,13 +100,23 @@ class EmbeddedInferenceManager:
         self._endpoint = None
         self._key = None
         self._settings = dict(DEFAULTS)
+        settings_error = None
         try:
-            saved = json.loads((self.state_dir / "inference.json").read_text())
+            with open_regular_candidate(self.state_dir / "inference.json") as (stream, info):
+                if info.st_nlink != 1 or info.st_size > 65536:
+                    raise ValueError("Invalid inference settings file.")
+                raw = stream.read(65537)
+                if len(raw) > 65536:
+                    raise ValueError("Inference settings exceed their size limit.")
+            _guard_storage_directory(self.state_dir)
+            saved = json.loads(raw)
             self._settings = self._validated(saved, validate_paths=False)
-        except (OSError, ValueError, TypeError):
+        except FileNotFoundError:
             pass
+        except (OSError, ValueError, TypeError, RecursionError):
+            settings_error = "Saved inference settings were ignored because the file was unsafe or invalid."
         self._state = "stopped"
-        self._error = None
+        self._error = settings_error
         self._capabilities = {}
         self._profile = {}
         self._prefetch = {"state": "idle", "bytes_read": 0, "files": 0}
@@ -166,12 +184,37 @@ class EmbeddedInferenceManager:
                 if self._state in ("starting", "running", "stopping", "installing"):
                     raise ValueError("Stop inference before changing its settings.")
                 selected = self._validated(settings)
-                temporary = self.state_dir / "inference.json.tmp"
-                temporary.write_text(json.dumps(selected, indent=2))
-                temporary.replace(self.state_dir / "inference.json")
+                self._save_settings(selected)
                 self._settings = selected
             self._start_prefetch()
             return self.status()
+
+    def _save_settings(self, settings):
+        target = self.state_dir / "inference.json"
+        temporary = None
+
+        def guard():
+            _guard_storage_directory(self.state_dir)
+            try:
+                info = target.lstat()
+            except FileNotFoundError:
+                return
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("Inference settings must be an ordinary file.")
+
+        guard()
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.state_dir,
+                                             prefix=".inference-", suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                json.dump(settings, output, indent=2, allow_nan=False)
+                output.flush()
+                os.fsync(output.fileno())
+            guard()
+            os.replace(temporary, target)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _cancel_prefetch(self):
         self._prefetch_cancel.set()
@@ -262,6 +305,8 @@ class EmbeddedInferenceManager:
         return env
 
     def _help(self, runtime, env):
+        if self._cancel.is_set():
+            raise RuntimeError("Runtime capability probe cancelled.")
         with tempfile.TemporaryFile() as output:
             proc = subprocess.Popen([runtime, "--help"], stdout=output, stderr=subprocess.STDOUT,
                                     env=env, **_process_options())
@@ -497,6 +542,7 @@ class EmbeddedInferenceManager:
 
     def _extract_runtime(self, archive: Path, destination: Path):
         """Extract regular files only, rejecting traversal, links and zip bombs."""
+        _guard_storage_directory(destination)
         limit = 4 * 1024 ** 3
         total = 0
         count = 0
@@ -514,7 +560,11 @@ class EmbeddedInferenceManager:
             count += 1
             if total > limit or count > 10000:
                 raise ValueError("Runtime archive exceeds extraction bounds.")
+            _guard_storage_directory(result.parent)
             result.parent.mkdir(parents=True, exist_ok=True)
+            _guard_storage_directory(result.parent)
+            if result.is_symlink():
+                raise ValueError("Unsafe runtime archive linked destination.")
             return result
 
         if zipfile.is_zipfile(archive):
@@ -566,7 +616,10 @@ class EmbeddedInferenceManager:
             path.chmod(0o755 if path.name == "llama-server" else 0o644)
 
     def _install(self, requested):
+        installed = None
+        published = False
         try:
+            _guard_storage_directory(self.state_dir)
             with httpx.Client(timeout=httpx.Timeout(10, read=5), follow_redirects=True,
                               headers={"User-Agent": "local-coder-runtime-installer"}) as client:
                 response = client.get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30")
@@ -575,6 +628,7 @@ class EmbeddedInferenceManager:
                 maximum = 2 * 1024 ** 3
                 if asset.get("size", maximum+1) > maximum:
                     raise ValueError("Runtime asset exceeds the 2 GiB download limit.")
+                _guard_storage_directory(self.state_dir)
                 with tempfile.TemporaryDirectory(prefix="runtime-install-", dir=self.state_dir) as temporary:
                     staging = Path(temporary)
                     archive = staging / "runtime.archive"
@@ -616,18 +670,24 @@ class EmbeddedInferenceManager:
                         raise ValueError("Runtime archive must contain exactly one llama-server executable.")
                     relative = matches[0].relative_to(extracted)
                     # Validate the downloaded executable before making it the selection.
+                    if self._cancel.is_set():
+                        raise RuntimeError("Runtime installation cancelled.")
                     help_text = self._help(str(matches[0]), self._environment(matches[0]))
                     if "--model" not in help_text or "--host" not in help_text:
                         raise ValueError("Downloaded runtime does not support llama-server flags.")
                     if self._cancel.is_set():
                         raise RuntimeError("Runtime installation cancelled.")
-                    installed = self.state_dir / ("runtime-" + secrets.token_hex(6))
-                    extracted.rename(installed)
+                    destination = self.state_dir / ("runtime-" + secrets.token_hex(6))
+                    _guard_storage_directory(self.state_dir)
+                    if destination.exists() or destination.is_symlink():
+                        raise ValueError("Runtime installation destination already exists; retry installation.")
+                    extracted.rename(destination)
+                    installed = destination
                     with self._lock:
-                        self._settings["runtime_path"] = str(installed / relative)
-                        temporary_config = self.state_dir / "inference.json.tmp"
-                        temporary_config.write_text(json.dumps(self._settings, indent=2))
-                        temporary_config.replace(self.state_dir / "inference.json")
+                        selected = {**self._settings, "runtime_path": str(installed / relative)}
+                        self._save_settings(selected)
+                        self._settings = selected
+                        published = True
                         self._installation.update(state="complete", checksum_verified=True)
                         self._state = "stopped"
         except Exception as exc:
@@ -635,3 +695,10 @@ class EmbeddedInferenceManager:
                 self._installation["state"] = "cancelled" if self._cancel.is_set() else "error"
                 self._state = "stopped" if self._cancel.is_set() else "error"
                 self._error = None if self._cancel.is_set() else str(exc)
+        finally:
+            if installed is not None and not published:
+                try:
+                    shutil.rmtree(installed)
+                except OSError:
+                    with self._lock:
+                        self._installation["cleanup_pending"] = True

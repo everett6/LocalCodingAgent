@@ -83,6 +83,30 @@ class TestFileReading:
         assert len(content) < 200  # Should be truncated
         assert "truncated" in content
 
+    def test_read_rejects_sensitive_files_and_symlink_escapes(self, sample_project, tmp_path):
+        outside = tmp_path.parent / "private-context-file.txt"
+        outside.write_text("outside workspace secret")
+        (sample_project / "outside.txt").symlink_to(outside)
+        (sample_project / ".env.local").write_text("API_KEY=not-for-context")
+
+        ctx = RepositoryContext(str(sample_project))
+
+        assert asyncio.run(ctx.read_file_safe("outside.txt")) is None
+        assert asyncio.run(ctx.read_file_safe(".env.local")) is None
+
+    def test_task_context_respects_total_file_budget(self, sample_project):
+        for name in ("one.py", "two.py", "three.py"):
+            (sample_project / name).write_text("x" * 8000)
+
+        ctx = RepositoryContext(str(sample_project))
+        task_ctx = asyncio.run(ctx.build_task_context(
+            "inspect", files=["one.py", "two.py", "three.py"], include_tree=False,
+            include_git=False, max_total_file_chars=5000,
+        ))
+
+        assert len(task_ctx.file_contents) == 1
+        assert sum(len(content) for content in task_ctx.file_contents.values()) <= 5100
+
 
 class TestContextBuilding:
     def test_build_context(self, sample_project):

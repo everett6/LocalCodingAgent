@@ -15,3 +15,13 @@ for (const [name, allow] of [['manager', isAllowedApiRequest], ['IDE', isAllowed
     for (const method of ['DELETE', 'PUT']) assert.equal(allow('/integrations/search/doctor', method), false, method);
   });
 }
+
+for (const [name, allow] of [['manager', isAllowedApiRequest], ['IDE', isAllowedEngineRequest]]) {
+  test(`${name} exposes only the exact Undo POST operation`, () => {
+    assert.equal(allow('/undo', 'POST'), true);
+    for (const route of ['/undo?force=1', '/undo/all', '/undo/../undo', '/%75ndo']) {
+      assert.equal(allow(route, 'POST'), false, route);
+    }
+    for (const method of ['GET', 'DELETE', 'PUT']) assert.equal(allow('/undo', method), false, method);
+  });
+}

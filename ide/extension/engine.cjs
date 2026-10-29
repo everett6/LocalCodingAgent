@@ -42,6 +42,7 @@ function validateProvider(provider) {
 function isAllowedEngineRequest(route, method) {
   if (typeof route !== 'string' || route.length > 4096 || /[\\#\r\n]/.test(route) || !['GET','POST'].includes(method)) return false;
   const pathname = route.split('?')[0];
+  if (pathname === '/undo') return route === pathname && method === 'POST';
   if (pathname === '/integrations/search/doctor') return route === pathname && ['GET', 'POST'].includes(method);
   if (pathname === '/context/debugger') return route === pathname && method === 'GET';
   if (pathname === '/status' && route.includes('?summary')) return route === '/status?summary=1' && method === 'GET';

@@ -261,7 +261,7 @@ export function HarnessPanel({ disabled = false, mode = 'coding' }: { disabled?:
       {status && <details open>
         <summary>Current runtime</summary>
         <p>{budget ? `${budget.requests.toLocaleString()}${budget.limits?.max_requests !== undefined ? ` / ${budget.limits.max_requests.toLocaleString()}` : ''} model calls · ${budget.tokens.toLocaleString()}${budget.limits?.max_tokens !== undefined ? ` / ${budget.limits.max_tokens.toLocaleString()}` : ''} reported or reserved tokens` : 'No active task budget is available.'}</p>
-        {budget && <p>{budget.cost_known ? `Tracked cost: $${budget.cost_usd.toFixed(4)}` : `Cost incomplete: $${budget.cost_usd.toFixed(4)} known; some model calls have no configured price.`}</p>}
+        {budget && <p>{budget.cost_known ? `Tracked cost: $${budget.cost_usd.toFixed(4)}` : `Cost incomplete: $${budget.cost_usd.toFixed(4)} tracked estimate; final charges are unknown for some calls.`}</p>}
         {budget?.limits?.max_cost_usd != null && <p className="hint">Active task dollar cap: ${budget.limits.max_cost_usd.toFixed(4)}</p>}
         <p>Sandbox: {status.sandbox.ready ? 'Available' : 'Unavailable or not yet checked'} · {status.sandbox.backend || 'No backend reported'}</p>
         <button type="button" disabled={locked} onClick={() => void checkSandbox()}>Check isolated runtime</button>

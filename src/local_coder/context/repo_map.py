@@ -101,7 +101,8 @@ class RepoMap:
         ranking toward them, and the code index's best files for it seed
         PageRank. ``focus_files`` are files the task is known to be about.
         """
-        files = self.index.file_chunks()
+        self.index.refresh_if_due()
+        files = self.index.file_chunks(refresh=False)
 
         defs: dict[tuple[str, str], Definition] = {}
         definers: dict[str, set[str]] = defaultdict(set)

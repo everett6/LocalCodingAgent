@@ -40,7 +40,7 @@ class OllamaBackend(BaseModelBackend):
         
         options = {
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "num_predict": max_tokens if max_tokens is not None else self.config.max_tokens,
+            "num_predict": self.config.output_budget(max_tokens),
             "num_ctx": self.config.context_length,
         }
         if stop:
@@ -99,7 +99,7 @@ class OllamaBackend(BaseModelBackend):
         api_messages = self._build_messages(messages)
         options = {
             "temperature": temperature if temperature is not None else self.config.temperature,
-            "num_predict": max_tokens if max_tokens is not None else self.config.max_tokens,
+            "num_predict": self.config.output_budget(max_tokens),
             "num_ctx": self.config.context_length,
         }
 

@@ -13,8 +13,52 @@ from datetime import datetime
 from pathlib import Path
 
 from local_coder.types import AgentMetrics, AgentPhase, AgentResponse, AgentState, AgentTask
+from local_coder.workspace import Workspace
+from local_coder.context.source_snapshot import read_source_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+def workspace_file_fingerprints(project_root: str, paths) -> dict[str, str]:
+    """Hash readable files from an agent's context using workspace-relative paths."""
+    workspace = Workspace(project_root)
+    fingerprints = {}
+    paths = sorted(set(paths))
+    if len(paths) > 4096:
+        raise ValueError("Checkpoint context exceeds the 4096-file fingerprint limit")
+    used = 0
+    for path in paths:
+        target = workspace.resolve(path)
+        if target.is_dir():
+            continue
+        relative = workspace.relative_path(target)
+        try:
+            snapshot = read_source_snapshot(workspace.root, relative, max_bytes=16 * 1024 * 1024)
+        except FileNotFoundError:
+            continue
+        except IsADirectoryError:
+            continue
+        used += snapshot.size
+        if used > 64 * 1024 * 1024:
+            raise ValueError("Checkpoint context exceeds the 64 MiB fingerprint byte limit")
+        fingerprints[relative] = snapshot.sha256
+    return fingerprints
+
+
+def validate_workspace_file_fingerprints(project_root: str, fingerprints: dict[str, str]) -> None:
+    """Reject resume when any file represented in the saved conversation has drifted."""
+    current = workspace_file_fingerprints(project_root, fingerprints)
+    changed = sorted(
+        path for path, digest in fingerprints.items()
+        if current.get(path) != digest
+    )
+    if changed:
+        preview = ", ".join(changed[:5])
+        more = f" and {len(changed) - 5} more" if len(changed) > 5 else ""
+        raise ValueError(
+            "Workspace files read by this task changed after its checkpoint "
+            f"({preview}{more}). Start a new task to refresh its context."
+        )
 
 
 def _write_json(path: Path, data: dict) -> None:

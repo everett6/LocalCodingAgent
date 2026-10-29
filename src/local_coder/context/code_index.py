@@ -21,21 +21,25 @@ import os
 import re
 import subprocess
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Thread
 
 from local_coder.statedir import state_path, write_state_file
+from local_coder.context.source_snapshot import is_private_source, read_source_snapshot
 
 logger = logging.getLogger(__name__)
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 INDEX_RELPATH = Path(".local-coder") / "index" / "code_index.json"
 
 MAX_FILE_BYTES = 512 * 1024
 MAX_FILES = 20000
 MAX_CHUNK_LINES = 80
 WINDOW_LINES = 50
+REFRESH_INTERVAL_SECONDS = 1.0
 
 # BM25 parameters and field boosts
 K1 = 1.2
@@ -161,6 +165,7 @@ class SearchHit:
     kind: str
     symbol: str
     score: float
+    source_hash: str = ""
     snippet: list[tuple[int, str]] = field(default_factory=list)
 
     def location(self) -> str:
@@ -298,6 +303,12 @@ class CodeIndex:
         self._df: Counter[str] = Counter()
         self._avgdl = 1.0
         self._loaded = False
+        self._last_refresh_at = 0.0
+        self._generation = ""
+        self._watch_stop: Event | None = None
+        self._watch_thread: Thread | None = None
+        self._watch_ready: Event | None = None
+        self._watch_error: str | None = None
         # Parallel agents share one index and search it from worker threads.
         self._lock = threading.RLock()
 
@@ -326,48 +337,76 @@ class CodeIndex:
         out = []
         for rel in files:
             rel = rel.replace(os.sep, "/")
-            parts = rel.split("/")
-            if any(p in SKIP_DIRS or p.endswith(".egg-info") or p.startswith('.env') for p in parts[:-1]):
-                continue
-            if parts[-1].lower().startswith(('.env', 'secrets.', 'credentials.')) or parts[-1].lower() in {'.netrc', '.npmrc', '.pypirc', 'credentials', 'id_rsa', 'id_ed25519'}:
-                continue
-            if os.path.splitext(rel)[1].lower() in SKIP_EXTENSIONS | {'.pem', '.key', '.p12', '.pfx', '.keystore'}:
+            if not self._eligible_relative(rel):
                 continue
             out.append(rel)
             if len(out) >= MAX_FILES:
                 break
         return out
 
+    @staticmethod
+    def _eligible_relative(rel: str) -> bool:
+        path = Path(rel)
+        return (not path.is_absolute() and bool(path.parts) and ".." not in path.parts
+                and not is_private_source(path)
+                and not any(part in SKIP_DIRS or part.endswith(".egg-info") for part in path.parts)
+                and not path.name.lower().startswith(("secrets.", "credentials."))
+                and path.suffix.lower() not in SKIP_EXTENSIONS | {".pem", ".key", ".p12", ".pfx", ".keystore"})
+
     def _inside(self, full: Path) -> bool:
         """False for a committed symlink that points outside the project."""
         return Path(os.path.realpath(full)).is_relative_to(self.project_root)
 
     def _read_text(self, full: Path) -> str | None:
-        if not self._inside(full):
-            return None
+        source = self._read_source(full)
+        return source[0] if source is not None else None
+
+    def _read_source(self, full: Path) -> tuple[str, str] | None:
         try:
-            data = full.read_bytes()
-        except OSError:
+            relative = full.relative_to(self.project_root).as_posix()
+            if not self._eligible_relative(relative):
+                return None
+            snapshot = read_source_snapshot(self.project_root, relative, max_bytes=MAX_FILE_BYTES)
+            data = snapshot.data
+        except (OSError, ValueError):
             return None
         if b"\0" in data[:4096]:
             return None
-        return data.decode("utf-8", errors="replace")
+        return data.decode("utf-8", errors="replace"), snapshot.sha256
 
     # --- persistence ---
 
     def _load(self) -> None:
         self._loaded = True
-        if not self.persist or not self.index_path.is_file():
+        if not self.persist or not self.index_path.exists():
             return
         try:
-            data = json.loads(self.index_path.read_text("utf-8"))
+            cached = read_source_snapshot(self.project_root, INDEX_RELPATH, max_bytes=64 * 1024 * 1024)
+            data = json.loads(cached.data)
         except (OSError, ValueError):
             return
-        if data.get("version") != INDEX_VERSION:
+        if not isinstance(data, dict) or data.get("version") != INDEX_VERSION:
             return
         files = data.get("files")
-        if isinstance(files, dict):
-            self._files = files
+        if not isinstance(files, dict) or len(files) > MAX_FILES:
+            return
+        for rel, entry in files.items():
+            if not isinstance(rel, str) or not self._eligible_relative(rel) or not isinstance(entry, dict):
+                continue
+            chunks = entry.get("chunks")
+            digest = entry.get("content_hash")
+            if (type(entry.get("mtime_ns")) is not int or type(entry.get("size")) is not int
+                    or not 0 <= entry["size"] <= MAX_FILE_BYTES
+                    or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or not isinstance(chunks, list)):
+                continue
+            if not all(isinstance(row, list) and len(row) == 5
+                       and type(row[0]) is int and type(row[1]) is int and 1 <= row[0] <= row[1] <= MAX_FILE_BYTES
+                       and isinstance(row[2], str) and isinstance(row[3], str) and len(row[3]) <= MAX_FILE_BYTES
+                       and isinstance(row[4], dict) and all(isinstance(term, str) and type(count) is int and count > 0
+                                                          for term, count in row[4].items()) for row in chunks):
+                continue
+            self._files[rel] = entry
 
     def _save(self) -> None:
         if not self.persist:
@@ -391,6 +430,14 @@ class CodeIndex:
         with self._lock:
             return self._refresh()
 
+    def refresh_if_due(self) -> dict[str, int]:
+        """Refresh at most once per second during repeated interactive searches."""
+        with self._lock:
+            now = time.monotonic()
+            if self._loaded and now - self._last_refresh_at < REFRESH_INTERVAL_SECONDS:
+                return {"updated": 0, "removed": 0, "unchanged": 0}
+            return self._refresh()
+
     def _refresh(self) -> dict[str, int]:
         if not self._loaded:
             self._load()
@@ -405,20 +452,23 @@ class CodeIndex:
                 continue
             if full.is_symlink() or not full.is_file() or st.st_size > MAX_FILE_BYTES or not self._inside(full):
                 continue
-            text = self._read_text(full)
-            if text is None:
+            source = self._read_source(full)
+            if source is None:
                 continue
             seen.add(rel)
-            digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            text, content_hash = source
             entry = self._files.get(rel)
-            if entry and entry.get("content_hash") == digest:
+            if entry and entry.get("content_hash") == content_hash:
                 stats["unchanged"] += 1
                 continue
             chunks = chunk_file(rel, text)
             self._files[rel] = {
-                "content_hash": digest,
                 "mtime_ns": st.st_mtime_ns,
                 "size": st.st_size,
+                "ctime_ns": st.st_ctime_ns,
+                "inode": st.st_ino,
+                "device": st.st_dev,
+                "content_hash": content_hash,
                 "chunks": [c.to_json() for c in chunks],
             }
             stats["updated"] += 1
@@ -432,13 +482,173 @@ class CodeIndex:
             self._rebuild_stats()
         if stats["updated"] or stats["removed"]:
             self._save()
+        self._last_refresh_at = time.monotonic()
         return stats
+
+    def update_paths(self, paths: set[str | os.PathLike[str]]) -> dict[str, int]:
+        """Re-index only changed paths received from the filesystem watcher."""
+        with self._lock:
+            if not self._loaded:
+                self._load()
+            stats = {"updated": 0, "removed": 0, "unchanged": 0}
+            for path in paths:
+                full = Path(path)
+                if not full.is_absolute():
+                    full = self.project_root / full
+                full = Path(os.path.abspath(full))
+                try:
+                    rel = full.relative_to(self.project_root).as_posix()
+                except ValueError:
+                    continue
+                if not self._eligible_relative(rel):
+                    continue
+                try:
+                    stat = full.stat()
+                    eligible = (
+                        full.is_file()
+                        and not full.is_symlink()
+                        and stat.st_size <= MAX_FILE_BYTES
+                        and self._inside(full)
+                    )
+                except OSError:
+                    eligible = False
+                    stat = None
+
+                if not eligible:
+                    removed = [
+                        indexed for indexed in self._files
+                        if indexed == rel or (not full.exists() and indexed.startswith(rel + "/"))
+                    ]
+                    for indexed in removed:
+                        del self._files[indexed]
+                    stats["removed"] += len(removed)
+                    continue
+                if rel not in self._files and len(self._files) >= MAX_FILES:
+                    continue
+
+                source = self._read_source(full)
+                if source is None:
+                    if self._files.pop(rel, None) is not None:
+                        stats["removed"] += 1
+                    continue
+                text, content_hash = source
+                chunks = chunk_file(rel, text)
+                self._files[rel] = {
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "inode": stat.st_ino,
+                    "device": stat.st_dev,
+                    "content_hash": content_hash,
+                    "chunks": [chunk.to_json() for chunk in chunks],
+                }
+                stats["updated"] += 1
+
+            if stats["updated"] or stats["removed"]:
+                self._rebuild_stats()
+                self._save()
+                self._last_refresh_at = time.monotonic()
+            return stats
+
+    def start_watching(self) -> None:
+        """Start a native filesystem watcher; explicit refresh remains available."""
+        with self._lock:
+            if self._watch_thread is not None and self._watch_thread.is_alive():
+                if self._watch_stop is not None and self._watch_stop.is_set():
+                    raise RuntimeError("Code index watcher is stopping")
+            else:
+                self._watch_stop = Event()
+                self._watch_ready = Event()
+                self._watch_error = None
+                self._watch_thread = Thread(
+                    target=self._watch_loop,
+                    name=f"local-coder-index-{self.project_root.name}",
+                    daemon=True,
+                )
+                self._watch_thread.start()
+            ready = self._watch_ready
+        if ready is None or not ready.wait(timeout=5):
+            self.stop_watching()
+            raise RuntimeError("Code index watcher did not initialize before the timeout")
+        if self._watch_error:
+            error = self._watch_error
+            self.stop_watching()
+            raise RuntimeError(f"Code index watcher failed to initialize: {error}")
+
+    def stop_watching(self, timeout: float = 5.0) -> None:
+        """Stop the native watcher and wait for its thread to exit."""
+        with self._lock:
+            stop = self._watch_stop
+            thread = self._watch_thread
+        if stop is None or thread is None:
+            return
+        stop.set()
+        thread.join(timeout=max(0.0, timeout))
+        if thread.is_alive():
+            raise RuntimeError("Code index watcher did not stop before the timeout")
+        with self._lock:
+            self._watch_thread = None
+            self._watch_stop = None
+            self._watch_ready = None
+
+    @property
+    def watcher_error(self) -> str | None:
+        return self._watch_error
+
+    def _watch_loop(self) -> None:
+        try:
+            from watchfiles import watch
+
+            ready = self._watch_ready
+            stop = self._watch_stop
+            if stop is None:
+                return
+
+            def include_change(_change, path: str) -> bool:
+                candidate = Path(path)
+                try:
+                    relative = candidate.resolve().relative_to(self.project_root)
+                except (OSError, ValueError):
+                    return False
+                return self._eligible_relative(relative.as_posix())
+
+            for changes in watch(
+                self.project_root,
+                watch_filter=include_change,
+                stop_event=stop,
+                debounce=250,
+                step=50,
+                rust_timeout=500,
+                yield_on_timeout=True,
+                raise_interrupt=False,
+            ):
+                if stop.is_set():
+                    break
+                # The first yielded batch proves the native subscription is
+                # active. Refresh after subscribing so edits during startup
+                # cannot fall in a refresh-to-subscription gap.
+                if ready is not None and not ready.is_set():
+                    self.refresh()
+                    ready.set()
+                self.update_paths({path for _change, path in changes})
+        except Exception as exc:
+            self._watch_error = str(exc)
+            logger.exception("Code index filesystem watcher stopped")
+        finally:
+            ready = self._watch_ready
+            if ready is not None:
+                ready.set()
 
     def _rebuild_stats(self) -> None:
         self._chunks = []
         self._df = Counter()
         total = 0
-        for rel, entry in self._files.items():
+        revision = hashlib.sha256()
+        for rel, entry in sorted(self._files.items()):
+            revision.update(rel.encode("utf-8", errors="surrogateescape"))
+            revision.update(b"\0")
+            revision.update(entry.get("content_hash", "").encode("ascii"))
+            revision.update(b"\0")
             path_terms = frozenset(tokenize(rel))
             for start, end, kind, symbol, tf in entry.get("chunks", []):
                 chunk = Chunk(
@@ -451,14 +661,32 @@ class CodeIndex:
                 self._df.update(tf.keys())
                 total += chunk.length
         self._avgdl = (total / len(self._chunks)) if self._chunks else 1.0
+        self._generation = revision.hexdigest()
+
+    @property
+    def generation(self) -> str:
+        """Content-derived identity for caches that must not outlive source changes."""
+        with self._lock:
+            return self._generation
 
     @property
     def file_count(self) -> int:
-        return len(self._files)
+        with self._lock:
+            return len(self._files)
+
+    def contains_file(self, path: str) -> bool:
+        with self._lock:
+            return path in self._files
 
     @property
     def chunk_count(self) -> int:
-        return len(self._chunks)
+        with self._lock:
+            return len(self._chunks)
+
+    def file_hashes(self, paths) -> dict[str, str]:
+        """Snapshot provenance for indexed text, without blessing newer bytes."""
+        with self._lock:
+            return {path: self._files[path]["content_hash"] for path in paths if path in self._files}
 
     # --- search ---
 
@@ -510,13 +738,13 @@ class CodeIndex:
         scored.sort(key=lambda sc: (-sc[0], sc[1].path, sc[1].start))
         return [
             SearchHit(path=c.path, start=c.start, end=c.end, kind=c.kind,
-                      symbol=c.symbol, score=round(s, 2))
+                      symbol=c.symbol, score=round(s, 2), source_hash=self._files[c.path]["content_hash"])
             for s, c in scored[:max_results]
         ]
 
-    def search_files(self, query: str, max_files: int = 10) -> list[str]:
+    def search_files(self, query: str, max_files: int = 10, refresh: bool = True) -> list[str]:
         """Rank whole files: a file scores its best chunk plus a share of the rest."""
-        hits = self.search(query, max_results=max(50, max_files * 5))
+        hits = self.search(query, max_results=max(50, max_files * 5), refresh=refresh)
         by_file: dict[str, list[float]] = {}
         for hit in hits:
             by_file.setdefault(hit.path, []).append(hit.score)
@@ -529,12 +757,17 @@ class CodeIndex:
     def add_snippets(self, hits: list[SearchHit], query: str, max_lines: int = 4) -> None:
         """Attach the lines of each hit that best match the query."""
         terms = set(tokenize(query))
-        cache: dict[str, list[str]] = {}
+        cache: dict[str, tuple[list[str], str]] = {}
+        current_hits = []
         for hit in hits:
             if hit.path not in cache:
-                text = self._read_text(self.project_root / hit.path) or ""
-                cache[hit.path] = text.splitlines()
-            lines = cache[hit.path]
+                source = self._read_source(self.project_root / hit.path)
+                text, digest = source if source is not None else ("", "")
+                cache[hit.path] = (text.splitlines(), digest)
+            lines, digest = cache[hit.path]
+            if hit.source_hash and hit.source_hash != digest:
+                continue
+            current_hits.append(hit)
             ranked = []
             for n in range(hit.start, min(hit.end, len(lines)) + 1):
                 line = lines[n - 1]
@@ -546,6 +779,7 @@ class CodeIndex:
             best = [n for _, n in sorted(ranked) if n != hit.start][: max_lines - 1]
             chosen = sorted({hit.start, *best}) if hit.start <= len(lines) else sorted(best)
             hit.snippet = [(n, lines[n - 1].rstrip()[:200]) for n in chosen]
+        hits[:] = current_hits
 
     def file_chunks(self, refresh: bool = True) -> dict[str, list[list]]:
         """Snapshot of every indexed file's chunks, for the repo map.

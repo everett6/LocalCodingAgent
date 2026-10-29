@@ -17,8 +17,14 @@ def fake_process(monkeypatch, path, *, returncode=1, error=None):
     calls = []
 
     class Process:
+        def __init__(self, dry_run):
+            self.dry_run = dry_run
+            self.returncode = 0 if dry_run else returncode
+
         async def communicate(self, data):
             assert data == PATCH.encode()
+            if self.dry_run:
+                return b'checking app.txt', b''
             path.write_text('new\n')
             if error:
                 raise error
@@ -26,9 +32,7 @@ def fake_process(monkeypatch, path, *, returncode=1, error=None):
 
     async def start(*args, **kwargs):
         calls.append(args)
-        process = Process()
-        process.returncode = returncode
-        return process
+        return Process('--dry-run' in args)
 
     monkeypatch.setattr('local_coder.tools.filesystem.asyncio.create_subprocess_exec', start)
     return calls
@@ -40,9 +44,10 @@ def test_partial_patch_exit_or_exception_is_unknown(tmp_path, monkeypatch, error
     target.write_text('old\n')
     calls = fake_process(monkeypatch, target, error=error)
     result = asyncio.run(ApplyPatchTool(str(tmp_path)).execute(PATCH))
-    assert target.read_text() == 'new\n' and len(calls) == 1
+    assert target.read_text() == 'old\n' and len(calls) == 2
     assert not result.success and result.files_changed == []
     assert result.data == {'execution_outcome': 'unknown', 'potential_targets': ['app.txt']}
+    assert 'all affected files were restored' in result.output
 
 
 def test_successful_patch_retains_known_completion(tmp_path, monkeypatch):
@@ -102,8 +107,10 @@ def test_scheduler_blocks_duplicate_after_real_patch_partial_failure(tmp_path, m
     agent = Coder(Model(PATCH), registry)
     with pytest.raises(AgentBlocked):
         asyncio.run(agent.execute(AgentTask(role=AgentRole.CODER, objective='Patch fixture')))
-    assert target.read_text() == 'new\n'
-    assert len(calls) == 1
+    assert target.read_text() == 'old\n'
+    # Read-only preflight + one mutating attempt; the duplicate is never run,
+    # even though the local backup restoration succeeded.
+    assert len(calls) == 2
 
 
 def test_registry_rejects_malformed_patch_without_false_recovery_block(tmp_path, monkeypatch):

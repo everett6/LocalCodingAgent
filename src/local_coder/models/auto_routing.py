@@ -6,7 +6,8 @@ import json
 import math
 import re
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Mapping
+from itertools import chain
+from typing import Any, Iterable, Iterator, Mapping
 
 
 @dataclass(frozen=True)
@@ -59,18 +60,47 @@ _SMALL_DOC = re.compile(
 )
 
 
-def _values(value: Any) -> list[str]:
+def _values(value: Any) -> Iterator[str]:
     if value is None:
-        return []
+        return
     if isinstance(value, str):
-        return [value]
+        yield value
+        return
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")
     if isinstance(value, Mapping):
-        return [text for key, item in value.items() for text in [str(key), *_values(item)]]
-    if isinstance(value, (list, tuple)):
-        return [text for item in value for text in _values(item)]
-    return [str(value)]
+        for key, item in value.items():
+            yield str(key)
+            yield from _values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _values(item)
+    else:
+        yield str(value)
+
+
+def _fingerprint(parts: Iterable[str]) -> tuple[str, str, int]:
+    """Hash every source byte while retaining only the routing policy's allowance.
+
+    Large source observations already exist in task memory; routing must not
+    duplicate them into an unbounded joined string and UTF-8 byte allocation.
+    Newline-separated digest semantics are retained for existing telemetry.
+    """
+    digest = hashlib.sha256()
+    retained: list[str] = []
+    length = 0
+    for index, part in enumerate(parts):
+        if index:
+            digest.update(b"\n")
+            if length < 2400:
+                retained.append("\n")
+            length += 1
+        if length < 2400:
+            retained.append(part[:2400 - length])
+        length += len(part)
+        for offset in range(0, len(part), 8192):
+            digest.update(part[offset:offset + 8192].encode("utf-8"))
+    return digest.hexdigest(), "".join(retained), length
 
 
 def classify_task(
@@ -91,10 +121,10 @@ def classify_task(
     # Empty context keys (including security_lessons) are not task instructions.
     if hasattr(context, "model_dump"):
         context = context.model_dump(mode="json", exclude_defaults=True)
-    parts = [objective, *_values(field("constraints", [])), *_values(files),
-             *_values(context), *_values(field("success_criteria", []))]
-    prompt = "\n".join(parts)
-    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    digest, prompt, prompt_length = _fingerprint(chain(
+        (objective,), _values(field("constraints", [])), _values(files),
+        _values(context), _values(field("success_criteria", [])),
+    ))
 
     def decision(reason: str, tier: str = "selected", eligible: bool = False) -> RoutingDecision:
         return RoutingDecision(tier, reason, "rules", eligible, digest)
@@ -109,16 +139,16 @@ def classify_task(
         return decision("protected_workflow")
     if mode_name != "coding" or role_name not in {"explorer", "coder"}:
         return decision("unsupported_workflow")
+    if not objective.strip() or prompt_length > 2400 or len(objective) > 300:
+        return decision("ambiguous_or_long")
     if _RISK.search(prompt):
         return decision("security_sensitive")
-    if not objective.strip() or len(prompt) > 2400 or len(objective) > 300:
-        return decision("ambiguous_or_long")
     if not prompt.isascii() or _INSTRUCTION.search(prompt):
         return decision("untrusted_or_unknown_language")
     if _COMPLEX.search(prompt) or len(files) > 1:
         return decision("complex_task")
     # Additional context is untrusted and can materially change a short objective.
-    extra = "\n".join(parts[1:])
+    extra = prompt[len(objective) + 1:]
     if _EDIT.search(extra) or re.search(r"[;\n]", objective.strip()):
         return decision("additional_instructions")
     if role_name == "coder" and _SMALL_DOC.fullmatch(objective.strip()):

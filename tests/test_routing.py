@@ -82,6 +82,18 @@ def test_manager_uses_fallback_when_primary_is_unreachable():
     assert strong.probes == 1, "reachability is probed once, then cached"
 
 
+def test_manager_reports_when_every_configured_model_is_unreachable():
+    config = make_config(fallbacks={"strong": ["fast"]})
+    manager = ModelManager(config)
+    manager._models = {
+        "strong": StubModel("strong", available=False),
+        "fast": StubModel("fast", available=False),
+    }
+
+    with pytest.raises(RuntimeError, match="No reachable model.*strong, fast"):
+        asyncio.run(manager.get_model(AgentRole.PLANNER))
+
+
 def test_manager_does_not_probe_models_without_fallbacks():
     manager = ModelManager(make_config())
     fast = StubModel("fast", available=False)
@@ -89,6 +101,115 @@ def test_manager_does_not_probe_models_without_fallbacks():
 
     assert asyncio.run(manager.get_model(AgentRole.CODER)) is fast
     assert fast.probes == 0
+
+
+def test_unreachable_primary_can_recover_after_negative_cache_expires(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("local_coder.models.manager.monotonic", lambda: clock[0])
+    manager = ModelManager(make_config(fallbacks={"strong": ["fast"]}))
+    strong, fast = StubModel("strong", available=False), StubModel("fast")
+    manager._models = {"strong": strong, "fast": fast}
+
+    async def go():
+        assert await manager.get_model(AgentRole.PLANNER) is fast
+        strong.available = True
+        clock[0] += 1
+        assert await manager.get_model(AgentRole.PLANNER) is fast
+        assert strong.probes == 1
+        clock[0] += 5
+        assert await manager.get_model(AgentRole.PLANNER) is strong
+        clock[0] += 100
+        assert await manager.get_model(AgentRole.PLANNER) is strong
+
+    asyncio.run(go())
+    assert strong.probes == 2 and fast.probes == 1
+
+
+def test_unreachable_probe_failures_have_bounded_retry_rate(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("local_coder.models.manager.monotonic", lambda: clock[0])
+    manager = ModelManager(make_config(fallbacks={"strong": ["fast"]}))
+    calls = []
+
+    async def failing():
+        calls.append(True)
+        raise RuntimeError("fixture unavailable")
+
+    manager._models = {"strong": SimpleNamespace(is_available=failing), "fast": StubModel("fast")}
+
+    async def go():
+        for _ in range(20):
+            assert await manager.get_model(AgentRole.PLANNER) is manager._models["fast"]
+        assert len(calls) == 1
+        clock[0] += 5
+        for _ in range(20):
+            await manager.get_model(AgentRole.PLANNER)
+        assert len(calls) == 2
+
+    asyncio.run(go())
+
+
+def test_simultaneous_fallback_checks_share_one_probe(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("local_coder.models.manager.monotonic", lambda: clock[0])
+    manager = ModelManager(make_config(fallbacks={"strong": ["fast"]}))
+    calls = []
+
+    async def unavailable():
+        calls.append(True)
+        await asyncio.sleep(0)
+        return False
+
+    manager._models = {"strong": SimpleNamespace(is_available=unavailable), "fast": StubModel("fast")}
+
+    async def go():
+        for _ in range(2):
+            results = await asyncio.gather(*(manager.get_model(AgentRole.PLANNER) for _ in range(8)))
+            assert all(result is manager._models["fast"] for result in results)
+            clock[0] += 5
+
+    asyncio.run(go())
+    assert len(calls) == 2
+
+
+def test_cancelled_reachability_probe_releases_waiters_without_negative_cache():
+    manager = ModelManager(make_config(fallbacks={"strong": ["fast"]}))
+
+    async def go():
+        entered = asyncio.Event()
+
+        async def blocked():
+            entered.set()
+            await asyncio.Event().wait()
+
+        manager._models = {"strong": SimpleNamespace(is_available=blocked), "fast": StubModel("fast")}
+        first = asyncio.create_task(manager.get_model(AgentRole.PLANNER))
+        await entered.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        recovered = StubModel("strong")
+        manager._models["strong"] = recovered
+        assert await manager.get_model(AgentRole.PLANNER) is recovered
+        assert recovered.probes == 1
+
+    asyncio.run(go())
+
+
+def test_closing_manager_clears_reachability_before_new_backends_are_loaded():
+    manager = ModelManager(make_config(fallbacks={"strong": ["fast"]}))
+
+    async def go():
+        old = StubModel("strong")
+        manager._models = {"strong": old, "fast": StubModel("fast")}
+        assert await manager.get_model(AgentRole.PLANNER) is old
+        await manager.close_all()
+        new, fallback = StubModel("strong", available=False), StubModel("fast")
+        manager._models = {"strong": new, "fast": fallback}
+        assert await manager.get_model(AgentRole.PLANNER) is fallback
+        assert new.probes == 1
+
+    asyncio.run(go())
 
 
 def test_failed_plan_task_is_retried_on_escalation_model(tmp_path):

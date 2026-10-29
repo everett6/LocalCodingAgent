@@ -73,6 +73,7 @@ def test_real_parallel_agents_cannot_write_sibling_scope_or_run_unconfined_comma
     instance.config.agentic.max_parallel_agents = 2
     observed = []
     tool_outputs = []
+    sibling_written = asyncio.Event()
     instance.on_event(observed.append)
     class Model:
         config = SimpleNamespace(context_length=131072, max_tokens=1000, temperature=0.0)
@@ -81,10 +82,16 @@ def test_real_parallel_agents_cannot_write_sibling_scope_or_run_unconfined_comma
         async def generate(self, messages, **kwargs):
             self.calls += 1
             if self.calls > 1:
+                if self.identity == "b":
+                    sibling_written.set()
                 tool_outputs.extend(message.content for message in messages if message.role == "tool")
                 return ModelResponse(content="Observed results")
             if self.identity == "a":
+                await asyncio.wait_for(sibling_written.wait(), 2)
                 return ModelResponse(tool_calls=[
+                    # Reading first bypasses the separate unread-overwrite
+                    # guard, so this deterministically tests the host scope.
+                    ToolCall(name="read_file", arguments={"path": "b.py"}),
                     ToolCall(name="write_file", arguments={"path": "nested/../b.py", "content": "wrong = True\n"}),
                     ToolCall(name="run_command", arguments={"command": "echo local-test"}),
                 ])

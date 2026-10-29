@@ -1,5 +1,5 @@
 export type Mode = 'coding' | 'cybersecurity' | 'bug_hunting' | 'red_team'
-export interface Session { session_id: string; request: string; status?: string; phase: string; result?: string; error?: string; mode?: Mode; checkpoint?: string; engagement_id?: string; goal_id?: string | null; quota_notice?: ProviderQuota; updated_at?: string; events?: AgentEvent[]; observed_state?: string; state_explanation?: string; recovery?: { kind: string; explanation: string } }
+export interface Session { session_id: string; request: string; status?: string; phase: string; result?: string; error?: string; mode?: Mode; checkpoint?: string; pre_run_checkpoint_id?: string; undo_applied?: boolean; rollback_applied?: boolean; started_at?: number; engagement_id?: string; goal_id?: string | null; quota_notice?: ProviderQuota; updated_at?: string; events?: AgentEvent[]; observed_state?: string; state_explanation?: string; recovery?: { kind: string; explanation: string } }
 export interface AgentEvent { seq: number; source: string; event_type: string; message: string; data: Record<string, unknown> }
 export interface Provider { name?: string; backend: string; model_id: string; base_url: string; profile: string; api_key_env?: string; key_set?: boolean; max_tokens?: number; context_length?: number; strategy_attempt_limit?: number; input_cost_per_million?: number | null; output_cost_per_million?: number | null; request_cost_usd?: number | null; auto_context?: boolean; context_source?: string }
 export interface CatalogModel { id: string; name: string; context_length?: number | null; max_output_tokens?: number | null; input_cost_per_million?: number | null; output_cost_per_million?: number | null; request_cost_usd?: number | null; is_free?: boolean; free_variant?: boolean; supports_tools?: boolean | null; profile?: string }
@@ -8,7 +8,7 @@ export interface ProviderUsage { available: boolean; free_model_daily_requests: 
 export interface ContextPolicy { model_limit?: number; mode?: string; prompt_tokens?: number; completion_tokens?: number; memory_chars?: number; source?: string }
 export interface ProviderQuota { blocked: boolean; model_id?: string; reason?: string; reset_at?: string | number | null }
 export interface SavedProviderProfile { id: string; name: string; provider: Provider }
-export interface Workspace { branch: string; files: { path: string; additions: number; deletions: number }[]; total_additions: number; total_deletions: number }
+export interface Workspace { branch: string; files: { path: string; additions: number; deletions: number; untracked?: boolean }[]; total_additions: number; total_deletions: number }
 declare global { interface Window { localCoder?: { request: (path: string, method: string, body?: unknown) => Promise<{ status: number; data: unknown }>; saveReport?: (text: string, suggestedName?: string) => Promise<{ saved: boolean }>; loadTaskPins?: () => Promise<string[]>; saveTaskPins?: (ids: string[]) => Promise<void>; chooseInferenceFile?: (purpose: 'runtime' | 'model' | 'draft') => Promise<string | null>; chooseProject: () => Promise<void>; openIDE: () => Promise<void> } } }
 let token = ''
 export function setToken(value: string) { token = value }
@@ -30,4 +30,9 @@ export const presets = {
   openai: { label: 'OpenAI-compatible', backend: 'openai_compatible', model_id: '', base_url: 'https://api.openai.com/v1', profile: 'generic', api_key_env: 'OPENAI_API_KEY', max_tokens: 4096 },
   local: { label: 'Local OpenAI-compatible server', backend: 'openai_compatible', model_id: '', base_url: 'http://localhost:8090/v1', profile: 'generic', api_key_env: '', max_tokens: 4096 },
   ollama: { label: 'Ollama', backend: 'ollama', model_id: '', base_url: 'http://localhost:11434', profile: 'generic', api_key_env: '', max_tokens: 4096 },
+}
+
+export function canUndoSession(session: Session | undefined, busy = false): boolean {
+  return Boolean(session && !busy && ['completed', 'cancelled', 'failed'].includes(session.status || '')
+    && session.pre_run_checkpoint_id && !session.undo_applied && !session.rollback_applied)
 }

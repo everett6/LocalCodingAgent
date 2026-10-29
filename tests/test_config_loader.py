@@ -80,6 +80,8 @@ def test_load_config_falls_back_to_defaults_with_no_file(tmp_path):
 
     assert config.models == {}
     assert config.approval.require_approval_for_commands is True
+    assert config.agentic.context_window_chars == 180000
+    assert config.agentic.compact_context_chars == 90000
 
 
 # --- Layered config, env-var API keys, --set overrides, tools, routing ---
@@ -127,6 +129,14 @@ def test_root_level_dotfile_is_found(tmp_path):
     (tmp_path / ".local-coder.yaml").write_text("verification:\n  max_fix_iterations: 4\n")
 
     assert load_config(project_root=str(tmp_path)).verification.max_fix_iterations == 4
+
+
+def test_failed_task_rollback_is_opt_in(tmp_path):
+    assert load_config(project_root=str(tmp_path)).verification.rollback_on_failure is False
+    (tmp_path / ".local-coder.yaml").write_text(
+        "verification:\n  rollback_on_failure: true\n"
+    )
+    assert load_config(project_root=str(tmp_path)).verification.rollback_on_failure is True
 
 
 def test_model_defaults_apply_to_every_model(tmp_path):

@@ -6,7 +6,10 @@ never sourced as shell code, and is not a tool capability to read external files
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
+from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -21,6 +24,8 @@ _SKIP = {'proc', 'sys', 'dev', 'run'}
 _SKIP_NAMES = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.npm', '.rustup', '.cargo', '.mypy_cache', '.pytest_cache'}
 _SCALARS = {0: ('B', 1), 1: ('b', 1), 2: ('H', 2), 3: ('h', 2), 4: ('I', 4), 5: ('i', 4), 6: ('f', 4), 7: ('?', 1), 10: ('Q', 8), 11: ('q', 8), 12: ('d', 8)}
 _WINDOWS = os.name == 'nt'
+MAX_DISCOVERY_CACHE_ENTRIES = 4096
+MAX_DISCOVERY_CACHE_BYTES = 4 * 1024 * 1024
 
 
 def protected_manifest_path() -> Path:
@@ -83,13 +88,37 @@ def _regular(path: str | Path) -> Path:
     return candidate
 
 
+@contextmanager
+def open_regular_candidate(path: Path):
+    """Open an already-resolved candidate without blocking on a replacement.
+
+    Discovery intentionally supports selected model-file symlinks by resolving
+    them before this helper. The final candidate must remain the same regular
+    file throughout inspection. This is not an OS-level filesystem sandbox.
+    """
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('Candidate must be a regular local file')
+        yield stream, before
+        after, current = os.fstat(stream.fileno()), path.stat(follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        if (not stat.S_ISREG(current.st_mode)
+                or any(getattr(before, field) != getattr(after, field) or getattr(after, field) != getattr(current, field)
+                       for field in fields)):
+            raise ValueError('Candidate changed during metadata inspection')
+
+
 def inspect_gguf(path: str | Path) -> dict:
     """Read at most 1 MiB and traverse at most 16 MiB of GGUF metadata, no tensors."""
     full = _regular(path)
     size = full.stat().st_size
     result = {'path': str(full), 'name': full.name, 'size_bytes': size, 'valid': False, 'validity': 'invalid', 'metadata_partial': False, 'context_length': None, 'architecture': None, 'model_name': None, 'metadata_bytes_read': 0, 'trusted': False}
     consumed = 0
-    with full.open('rb') as stream:
+    with open_regular_candidate(full) as (stream, info):
+        size = info.st_size
+        result['size_bytes'] = size
         def read(count):
             nonlocal consumed
             if count < 0 or consumed + count > 1048576 or stream.tell() + count > min(size, 16 * 1048576):
@@ -200,7 +229,8 @@ def recommend_context(model: dict, available_bytes: int | None = None) -> int:
 
 def inspect_runtime(path: str | Path) -> dict:
     full = _regular(path)
-    with full.open('rb') as stream:
+    with open_regular_candidate(full) as (stream, info):
+        size = info.st_size
         header = stream.read(64)
         kind = None
         architecture = None
@@ -234,11 +264,15 @@ def inspect_runtime(path: str | Path) -> dict:
                     pass
                 if len(libraries) >= 200:
                     break
-    return {'path': str(full), 'name': full.name, 'size_bytes': full.stat().st_size, 'format': kind, 'architecture': architecture, 'executable': executable, 'platform_compatible': compatible, 'valid': bool(kind and executable and compatible), 'validity': 'detected_not_trusted' if kind and executable and compatible else 'incompatible_or_invalid', 'trusted': False, 'health': 'not_started', 'libraries': libraries, 'note': 'Binary header only; health and required flags are checked only when you explicitly start the runtime.'}
+    return {'path': str(full), 'name': full.name, 'size_bytes': size, 'format': kind, 'architecture': architecture, 'executable': executable, 'platform_compatible': compatible, 'valid': bool(kind and executable and compatible), 'validity': 'detected_not_trusted' if kind and executable and compatible else 'incompatible_or_invalid', 'trusted': False, 'health': 'not_started', 'libraries': libraries, 'note': 'Binary header only; health and required flags are checked only when you explicitly start the runtime.'}
 
 
 class DiscoveryManager:
     def __init__(self, state_dir=None, manifest_path=None, max_entries=10000000, max_seconds=180):
+        if (type(max_entries) is not int or not 1 <= max_entries <= 10000000
+                or type(max_seconds) not in (int, float) or not math.isfinite(max_seconds)
+                or not 0 < max_seconds <= 3600):
+            raise ValueError('Discovery bounds must be positive finite limits within supported allowances')
         self.state_dir = Path(state_dir) if state_dir else None
         self.manifest_path = Path(manifest_path) if manifest_path else protected_manifest_path()
         self.max_entries, self.max_seconds = int(max_entries), float(max_seconds)
@@ -246,7 +280,8 @@ class DiscoveryManager:
         self._cancel = threading.Event()
         self._worker = None
         self._state = {'state': 'idle', 'started': False, 'models': [], 'runtimes': [], 'scanned_entries': 0, 'scanned_directories': 0, 'errors': 0, 'skipped': 0, 'truncated': False, 'limits': {'max_entries': self.max_entries, 'max_seconds': self.max_seconds}, 'manifest_path': str(self.manifest_path), 'computer_roots': computer_roots()}
-        self._cache = {}
+        self._cache = OrderedDict()
+        self._cache_bytes = 0
         self._selection = {}
         try:
             saved = read_locations_manifest(self.manifest_path)
@@ -277,6 +312,32 @@ class DiscoveryManager:
         return self.status()
 
     close = cancel
+
+    def _inspect_cached(self, full, model):
+        def fingerprint():
+            info = full.stat()
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        identity, key = fingerprint(), str(full)
+        cached = self._cache.pop(key, None)
+        if cached is not None:
+            self._cache_bytes -= cached[2]
+            if cached[0] == identity:
+                self._cache[key] = cached
+                self._cache_bytes += cached[2]
+                return cached[1]
+        record = inspect_gguf(full) if model else inspect_runtime(full)
+        if fingerprint() != identity:
+            raise ValueError('Candidate changed during metadata inspection')
+        size = len(json.dumps(record, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+        if size <= MAX_DISCOVERY_CACHE_BYTES:
+            self._cache[key] = (identity, record, size)
+            self._cache_bytes += size
+            while (len(self._cache) > MAX_DISCOVERY_CACHE_ENTRIES
+                   or self._cache_bytes > MAX_DISCOVERY_CACHE_BYTES):
+                _, removed = self._cache.popitem(last=False)
+                self._cache_bytes -= removed[2]
+        return record
 
     def _scan(self, roots, cancelled):
         started = time.monotonic()
@@ -329,12 +390,7 @@ class DiscoveryManager:
                                 if str(full) in paths:
                                     continue
                                 paths.add(str(full))
-                                info = full.stat()
-                                key = (str(full), info.st_size, info.st_mtime_ns)
-                                record = self._cache.get(key)
-                                if record is None:
-                                    record = inspect_gguf(full) if entry.name.lower().endswith('.gguf') else inspect_runtime(full)
-                                    self._cache[key] = record
+                                record = self._inspect_cached(full, entry.name.lower().endswith('.gguf'))
                                 target = models if entry.name.lower().endswith('.gguf') else runtimes
                                 target.append(record)
                                 with self._lock:
