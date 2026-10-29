@@ -7,13 +7,16 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from local_coder.workspace import Workspace
+from local_coder.context.source_snapshot import read_source_snapshot
 from local_coder.processes import OUTPUT_TRUNCATION_MARKER, communicate as _communicate, process_options
-from local_coder.tools.scan_scope import scan_files
+from local_coder.tools.scan_scope import read_scan_source, record_scan_skip, scan_files
 from local_coder.tools.base import Tool
 from local_coder.types import ToolName, ToolResult
 from dataclasses import dataclass
@@ -28,6 +31,24 @@ from local_coder.tools.quality import EXCLUDED_DIRS, find_executable, run_bounde
 # Structured scanner JSON is not an ordinary human-readable log tail. Retain
 # complete bounded streams and archive the original bytes before parsing them.
 MAX_SCANNER_STREAM_BYTES = 16 * 1024 * 1024
+MAX_SAST_RESULT_BYTES = 4_000_000
+MAX_SAST_FINDINGS = 2000
+MAX_SAST_OBSERVATIONS = 4000
+
+
+def _retain_sast_observation(coverage: dict, value: Any, *, finding: bool = False) -> bool:
+    size = len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    if (coverage.get("result_bytes", 0) + size > MAX_SAST_RESULT_BYTES
+            or coverage.get("result_records", 0) >= MAX_SAST_OBSERVATIONS
+            or (finding and coverage.get("finding_records", 0) >= MAX_SAST_FINDINGS)):
+        record_scan_skip(coverage, ".", "Static result budget reached; narrow the target to inspect remaining evidence")
+        coverage["result_limit_reached"] = True
+        return False
+    coverage["result_bytes"] = coverage.get("result_bytes", 0) + size
+    coverage["result_records"] = coverage.get("result_records", 0) + 1
+    if finding:
+        coverage["finding_records"] = coverage.get("finding_records", 0) + 1
+    return True
 
 
 @dataclass(frozen=True)
@@ -276,6 +297,8 @@ class RunSASTTool(Tool):
         """Builtin AST-based and pattern security scanner for Python and JS/TS."""
         findings: list[dict[str, Any]] = []
         coverage.update(reviewed=[], failed=[], unknown=[])
+        coverage["result_limits"] = {"bytes": MAX_SAST_RESULT_BYTES, "findings": MAX_SAST_FINDINGS,
+                                     "records": MAX_SAST_OBSERVATIONS}
         coverage["local_analysis"] = {"entry_points": [], "authorization_traces": [],
                                       "vulnerability_classes": [], "gaps": []}
         for file_path in files:
@@ -284,10 +307,17 @@ class RunSASTTool(Tool):
                 findings.extend(self._scan_python_file(file_path, coverage))
             else:
                 if file_path.suffix in (".js", ".jsx", ".ts", ".tsx"):
-                    findings.extend(self._scan_js_file(file_path))
+                    for finding in self._scan_js_file(file_path, coverage):
+                        if not _retain_sast_observation(coverage, finding, finding=True):
+                            break
+                        findings.append(finding)
                 coverage["unknown"].append({"path": relative,
                     "reason": "Semantic tracing supports Python only; other languages and formats require review"})
                 coverage["status"] = "partial"
+            if coverage.get("result_limit_reached") or len(findings) >= MAX_SAST_FINDINGS:
+                record_scan_skip(coverage, ".", "Static result limit reached; remaining files were not analyzed")
+                coverage["result_limit_reached"] = True
+                break
         if not coverage["reviewed"]:
             coverage["status"] = "partial"
         return findings
@@ -300,12 +330,11 @@ class RunSASTTool(Tool):
         findings: list[dict[str, Any]] = []
         try:
             rel_path = str(file_path.relative_to(self.project_root))
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            content = read_scan_source(self.project_root, file_path, coverage=coverage, errors="replace")
             ast.parse(content, filename=str(file_path))
         except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError) as exc:
             coverage.setdefault("failed", []).append({"path": str(file_path.relative_to(self.project_root)), "reason": type(exc).__name__})
-            coverage["skipped"].append(f"{file_path.name}: {type(exc).__name__}")
-            coverage["status"] = "partial"
+            record_scan_skip(coverage, file_path, type(exc).__name__)
             return findings
 
         from local_coder.tools.detection import python_candidates
@@ -325,25 +354,38 @@ class RunSASTTool(Tool):
         for key in aggregated:
             for observation in analysis[key]:
                 if observation not in aggregated[key]:
+                    if not _retain_sast_observation(coverage, observation):
+                        return []
                     aggregated[key].append(observation)
+        retained = []
         for finding in findings:
             function = analysis["functions"].get(finding.get("function"), {})
             finding["semantic_trace"] = {"language": "python", "sources": finding.get("source_trace", []),
                 "transforms": [item for item in function.get("transforms", []) if item["line"] < finding["line"]],
                 "guards": function.get("guards", []), "sink": finding["sink"],
                 "gaps": analysis["gaps"], "verification": "unverified"}
-        return findings
+            if not _retain_sast_observation(coverage, finding, finding=True):
+                break
+            retained.append(finding)
+        return retained
 
-    def _scan_js_file(self, file_path: Path) -> list[dict[str, Any]]:
+    def _scan_js_file(self, file_path: Path, coverage: dict | None = None) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
         try:
             rel_path = str(file_path.relative_to(self.project_root))
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+            content = read_scan_source(self.project_root, file_path, coverage=coverage, errors="replace")
+        except (OSError, UnicodeError, ValueError) as exc:
+            if coverage is not None:
+                record_scan_skip(coverage, file_path, type(exc).__name__)
             return findings
 
         in_block_comment = False
         for i, line in enumerate(content.splitlines(), start=1):
+            if len(findings) >= MAX_SAST_FINDINGS:
+                if coverage is not None:
+                    record_scan_skip(coverage, rel_path, "JavaScript finding limit reached; narrow the target")
+                    coverage["result_limit_reached"] = True
+                break
             # A lexical fallback, not a JavaScript parser. Ignore standalone
             # comments and report the remaining syntax limitations explicitly.
             stripped = line.strip()
@@ -575,25 +617,35 @@ class AuditConfigTool(Tool):
             duration_ms=duration_ms,
         )
 
-    def _scan_configs(self, target: Path) -> list[dict[str, Any]]:
+    def _scan_configs(self, target: Path) -> tuple[list[dict[str, Any]], dict]:
         findings: list[dict[str, Any]] = []
         files, coverage = scan_files(self.project_root, target)
 
         for file_path in files:
             name = file_path.name.lower()
             rel_path = str(file_path.relative_to(self.project_root))
+            secret_text = file_path.suffix in (".py", ".js", ".ts", ".env", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf") or name.startswith(".env")
+            dockerfile = "dockerfile" in name
+            settings = name.startswith(".env") or file_path.suffix in (".yaml", ".yml", ".json")
+            if not (secret_text or dockerfile or settings):
+                continue
+            try:
+                content = read_scan_source(self.project_root, file_path, coverage=coverage, errors="replace")
+            except (OSError, UnicodeError, ValueError) as exc:
+                record_scan_skip(coverage, file_path, type(exc).__name__)
+                continue
 
             # 1. Secret Scanning across text files
-            if file_path.suffix in (".py", ".js", ".ts", ".env", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf") or name.startswith(".env"):
-                findings.extend(self._scan_for_secrets(file_path, rel_path))
+            if secret_text:
+                findings.extend(self._scan_for_secrets(file_path, rel_path, content=content))
 
             # 2. Dockerfile security checks
-            if "dockerfile" in name:
-                findings.extend(self._scan_dockerfile(file_path, rel_path))
+            if dockerfile:
+                findings.extend(self._scan_dockerfile(file_path, rel_path, content=content))
 
             # 3. Environment & config settings
-            if name.startswith(".env") or file_path.suffix in (".yaml", ".yml", ".json"):
-                findings.extend(self._scan_config_settings(file_path, rel_path))
+            if settings:
+                findings.extend(self._scan_config_settings(file_path, rel_path, content=content))
 
         return findings, coverage
 
@@ -601,10 +653,11 @@ class AuditConfigTool(Tool):
         ignore_parts = {".git", ".venv", "venv", "node_modules", "__pycache__", ".local-coder", "build", "dist"}
         return any(part in ignore_parts for part in path.parts)
 
-    def _scan_for_secrets(self, file_path: Path, rel_path: str) -> list[dict[str, Any]]:
+    def _scan_for_secrets(self, file_path: Path, rel_path: str, *, content: str | None = None) -> list[dict[str, Any]]:
         findings = []
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            if content is None:
+                content = read_scan_source(self.project_root, file_path, errors="replace")
         except Exception:
             return findings
 
@@ -627,10 +680,11 @@ class AuditConfigTool(Tool):
                     break
         return findings
 
-    def _scan_dockerfile(self, file_path: Path, rel_path: str) -> list[dict[str, Any]]:
+    def _scan_dockerfile(self, file_path: Path, rel_path: str, *, content: str | None = None) -> list[dict[str, Any]]:
         findings = []
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            if content is None:
+                content = read_scan_source(self.project_root, file_path, errors="replace")
         except Exception:
             return findings
 
@@ -674,10 +728,11 @@ class AuditConfigTool(Tool):
 
         return findings
 
-    def _scan_config_settings(self, file_path: Path, rel_path: str) -> list[dict[str, Any]]:
+    def _scan_config_settings(self, file_path: Path, rel_path: str, *, content: str | None = None) -> list[dict[str, Any]]:
         findings = []
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            if content is None:
+                content = read_scan_source(self.project_root, file_path, errors="replace")
         except Exception:
             return findings
 
@@ -706,6 +761,7 @@ class AuditConfigTool(Tool):
 SCANNERS = ("secrets", "bandit", "semgrep")
 SEMGREP_CONFIGS = (".semgrep.yml", ".semgrep.yaml", ".semgrep")
 MAX_FILE_BYTES = 1_000_000
+MAX_SECRET_SCAN_ENTRIES = 20_000
 MAX_FINDINGS = 200
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
 
@@ -754,16 +810,38 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _iter_files(root: Path, targets: list[Path]):
+    seen, enumerated = set(), 0
     for target in targets:
-        for path in [target] if target.is_file() else sorted(target.rglob("*")):
+        if target in seen:
+            continue
+        enumerated += 1
+        if enumerated > MAX_SECRET_SCAN_ENTRIES:
+            raise ValueError("Secret scan enumeration limit reached; narrow the target paths")
+        pending = [target]
+        while pending:
+            path = pending.pop()
             rel = path.relative_to(root)
-            if any(part in EXCLUDED_DIRS for part in rel.parts) or not path.is_file():
+            if any(part in EXCLUDED_DIRS for part in rel.parts) or path in seen:
                 continue
-            # A committed symlink can point anywhere (~/.aws/credentials); the
-            # scan must not read, or leak redacted prefixes of, files outside.
-            if not path.resolve().is_relative_to(root):
+            seen.add(path)
+            try:
+                info = path.lstat()
+            except OSError:
                 continue
-            yield path, str(rel)
+            # Prune before descending, rather than materializing an entire
+            # dependency tree and excluding its paths only afterward.
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    with os.scandir(path) as entries:
+                        children = list(islice(entries, MAX_SECRET_SCAN_ENTRIES - enumerated + 1))
+                except OSError:
+                    continue
+                if len(children) > MAX_SECRET_SCAN_ENTRIES - enumerated:
+                    raise ValueError("Secret scan enumeration limit reached; narrow the target paths")
+                enumerated += len(children)
+                pending.extend(Path(entry.path) for entry in sorted(children, key=lambda entry: entry.name, reverse=True))
+            elif stat.S_ISREG(info.st_mode):
+                yield path, str(rel)
 
 
 def scan_secrets(root: Path, targets: list[Path]) -> list[Finding]:
@@ -771,10 +849,8 @@ def scan_secrets(root: Path, targets: list[Path]) -> list[Finding]:
     findings: list[Finding] = []
     for path, rel in _iter_files(root, targets):
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                continue
-            data = path.read_bytes()
-        except OSError:
+            data = read_source_snapshot(root, path, max_bytes=MAX_FILE_BYTES).data
+        except (OSError, ValueError):
             continue
         if b"\0" in data[:8192]:
             continue  # binary
