@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from local_coder.types import TaskContext
+from local_coder.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class RepositoryContext:
         entries = [
             e for e in entries
             if e.name not in EXCLUDED_DIRS
+            and not e.name.startswith(".env")
             and not any(e.name.endswith(ext) for ext in BINARY_EXTENSIONS)
         ]
 
@@ -143,7 +145,9 @@ class RepositoryContext:
         Falls back to grep-based search if the index finds nothing.
         """
         try:
-            ranked = await asyncio.to_thread(self._code_index().search_files, query, max_files)
+            index = self._code_index()
+            index.refresh_if_due()
+            ranked = await asyncio.to_thread(index.search_files, query, max_files, False)
         except Exception as e:  # never let retrieval break context building
             logger.debug("Code index search failed: %s", e)
             ranked = []
@@ -236,11 +240,22 @@ class RepositoryContext:
         return matches
 
     async def read_file_safe(self, path: str, max_chars: int = 10000) -> str | None:
-        """Read a file safely with size limits."""
-        full_path = self.project_root / path
-        if not full_path.is_file():
+        """Read bounded, non-sensitive workspace files without following escapes."""
+        try:
+            workspace = Workspace(self.project_root)
+            full_path = workspace.resolve(path)
+            relative = full_path.relative_to(workspace.root)
+        except (OSError, ValueError):
+            return None
+        if (not full_path.is_file() or max_chars <= 0
+                or any(part in {".git", ".local-coder"} for part in relative.parts)
+                or full_path.name.startswith(".env")
+                or full_path.suffix.lower() in {".pem", ".key"}
+                or full_path.suffix.lower() in BINARY_EXTENSIONS):
             return None
         try:
+            if full_path.stat().st_size > max(max_chars * 4, 1_000_000):
+                return f"... (file exceeds the {max_chars}-character context read limit)"
             content = await asyncio.to_thread(full_path.read_text, "utf-8")
             if len(content) > max_chars:
                 content = content[:max_chars] + f"\n... (truncated, {len(content)} total chars)"
@@ -358,6 +373,7 @@ class RepositoryContext:
         files: list[str] | None = None,
         include_tree: bool = True,
         include_git: bool = True,
+        max_total_file_chars: int = 40000,
     ) -> TaskContext:
         """Build a TaskContext for an agent task."""
         ctx = TaskContext()
@@ -387,19 +403,26 @@ class RepositoryContext:
                 )
 
         # Read specified files
+        remaining_chars = max(0, max_total_file_chars)
         if files:
             for f in files[:10]:  # Limit files to read
-                content = await self.read_file_safe(f)
+                if remaining_chars <= 0:
+                    break
+                content = await self.read_file_safe(f, max_chars=min(10000, remaining_chars))
                 if content:
                     ctx.file_contents[f] = content
+                    remaining_chars -= len(content)
 
         # Find relevant files if no specific files given
         if not files and objective:
             relevant = await self.get_relevant_files(objective, max_files=5)
             for f in relevant:
-                content = await self.read_file_safe(f)
+                if remaining_chars <= 0:
+                    break
+                content = await self.read_file_safe(f, max_chars=min(10000, remaining_chars))
                 if content:
                     ctx.file_contents[f] = content
+                    remaining_chars -= len(content)
             ctx.relevant_symbols = relevant
 
         return ctx

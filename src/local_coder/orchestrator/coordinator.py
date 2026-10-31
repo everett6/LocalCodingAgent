@@ -60,6 +60,7 @@ class Coordinator:
         config: ProjectConfig,
         project_root: str,
         approval_callback: ApprovalCallback | None = None,
+        code_index=None,
         quota_guard=None,
     ):
         self.config = config
@@ -83,7 +84,12 @@ class Coordinator:
             approval=config.approval,
             approval_callback=approval_callback,
             safety_harness=self.safety_harness,
+            code_index=code_index,
         )
+        from local_coder.context.privacy import bounded_known_secrets
+        self.tool_registry.model_visible_secrets = bounded_known_secrets(
+            model.resolve_api_key() for model in config.models.values())
+        self.repo_context._index = self.tool_registry.get_tool(ToolName.CODE_SEARCH).index
         self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config, quota_guard=quota_guard)
         from local_coder.core.budgets import BudgetLedger
@@ -266,6 +272,19 @@ class Coordinator:
                 return result
             recovered.validate_resume()
             await recovered.validate_pending_batch()
+            from local_coder.core.runtime import validate_workspace_file_fingerprints
+            fingerprints = recovered.notes.get("workspace_file_fingerprints")
+            if fingerprints is not None:
+                if not isinstance(fingerprints, dict) or not all(
+                    isinstance(path, str) and isinstance(digest, str)
+                    for path, digest in fingerprints.items()
+                ):
+                    raise ValueError("Checkpoint workspace context fingerprints are invalid")
+                await asyncio.to_thread(
+                    validate_workspace_file_fingerprints,
+                    self.project_root,
+                    fingerprints,
+                )
             from local_coder.types import ToolName
             allowed = recovered.notes.get("allowed_tools")
             if allowed is not None:
@@ -353,8 +372,12 @@ class Coordinator:
         message, **kwargs) convenience signature used by the Coordinator
         itself. Sub-agents must be handed this method, not _emit directly.
         """
+        from local_coder.context.privacy import redact_diagnostic_value, redact_model_text
+        secrets = getattr(self.tool_registry, "model_visible_secrets", ())
+        visible = event.model_copy(update={"message": redact_model_text(event.message, secrets),
+                                           "data": redact_diagnostic_value(event.data, secrets)})
         for handler in self._event_handlers:
-            handler(event)
+            handler(visible)
 
     async def run(
         self, request: str, checkpoint: RunCheckpoint | None = None, history: str = "",
@@ -420,7 +443,11 @@ class Coordinator:
         if self.safety_harness.should_checkpoint_before_request():
             try:
                 cp = self.checkpoints.create()
-                self._emit("ORCHESTRATOR", "checkpoint_created", f"Created pre-run checkpoint: {cp.checkpoint_id}")
+                self._emit(
+                    "ORCHESTRATOR", "checkpoint_created",
+                    f"Created pre-run checkpoint: {cp.checkpoint_id}",
+                    data={"checkpoint_id": cp.checkpoint_id},
+                )
             except Exception as e:
                 self._emit("ORCHESTRATOR", "checkpoint_warning", f"Could not create pre-run checkpoint: {e}")
 
@@ -430,9 +457,17 @@ class Coordinator:
         if mode in (AgentMode.CYBERSECURITY, AgentMode.BUG_HUNTING):
             from local_coder.workspace import Workspace
             Workspace(self.project_root).resolve(target_path)
+            if fix and self.config.safety_tier == SafetyTier.TIER_1_PARANOIA:
+                raise ValueError("Remediation is disabled by the read-only safety tier")
             role = AgentRole.SECURITY if mode == AgentMode.CYBERSECURITY else AgentRole.BUG_HUNTER
             # Permission changes belong to this investigation, not later reviews.
             original_permissions = set(self.tool_registry._permissions[role])
+            # Investigation and fix modes both avoid arbitrary shell commands and
+            # repository-level Git mutations; fixes use the bounded file/test tools.
+            self.tool_registry._permissions[role].difference_update({
+                ToolName.RUN_COMMAND, ToolName.BUILD, ToolName.FORMAT_CODE,
+                ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT,
+            })
             explorer_permissions = set(self.tool_registry._permissions[AgentRole.EXPLORER])
             planner_permissions = set(self.tool_registry._permissions[AgentRole.PLANNER])
             # Investigations are read-only unless the caller explicitly requests remediation.
@@ -441,8 +476,7 @@ class Coordinator:
             else:
                 self.tool_registry._permissions[role].difference_update({
                     ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH,
-                    ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
-                    ToolName.FORMAT_CODE, ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT,
+                    ToolName.RUN_TESTS,
                 })
             self.tool_registry._permissions[AgentRole.EXPLORER].intersection_update(self.tool_registry._permissions[role])
             try:
@@ -582,10 +616,10 @@ class Coordinator:
         return value
 
     def _session_cache_filename(self) -> str:
-        """Stable per-project filename for the disk-backed slot cache, so
-        different projects sharing one llama-server don't collide."""
+        """Bind cached prompt state to both the project and indexed source."""
         digest = hashlib.sha256(os.path.abspath(self.project_root).encode()).hexdigest()[:16]
-        return f"local-coder-{digest}.bin"
+        index = self.repo_context._code_index()
+        return f"local-coder-{digest}-{index.generation[:16] or 'unindexed'}.bin"
 
     async def _repo_map(self, query: str, files: list[str] | None = None) -> str:
         """Ranked repo map for a task's context, or "" if it is off or fails."""
@@ -622,6 +656,8 @@ class Coordinator:
     async def _explore(self, request: str) -> str:
         routing_task = AgentTask(role=AgentRole.EXPLORER, objective=request)
         model = await self._model_for(AgentRole.EXPLORER, task=routing_task)
+        architecture = await self._repo_map(request)
+        slot_filename = self._session_cache_filename()
 
         # Exploration's prefix (system prompt + repository structure) is the
         # part of the conversation most likely to be identical across
@@ -632,7 +668,7 @@ class Coordinator:
         if self.config.agentic.session_cache:
             restore = getattr(model, "restore_slot", None)
             if restore is not None:
-                await restore(self._session_cache_filename())
+                await restore(slot_filename)
 
         explorer = create_agent(
             AgentRole.EXPLORER,
@@ -646,14 +682,14 @@ class Coordinator:
             task = AgentTask(
                 role=AgentRole.EXPLORER,
                 objective=request,
-                context=TaskContext(architecture=await self._repo_map(request)),
+                context=TaskContext(architecture=architecture),
             )
             response = await explorer.execute(task)
             self._raise_if_blocked(response)
             if self.config.agentic.session_cache:
                 save = getattr(model, "save_slot", None)
                 if save is not None:
-                    await save(self._session_cache_filename())
+                    await save(slot_filename)
             return response.summary
         return "Exploration fallback: Checked repository structure."
 
@@ -755,6 +791,10 @@ class Coordinator:
         if planned is not None:
             task = planned.model_copy(deep=True)
             task.context.previous_findings.append(exploration)
+        return await self._with_task_deadline(task, lambda: self._execute_simple_task(task))
+
+    async def _execute_simple_task(self, task: AgentTask) -> AgentResponse:
+        role = task.role
         # Route against the full inherited task before adding a potentially large
         # repository map. Neither selected context nor tool permissions are removed.
         model = await self._model_for(role, task.model_name, task=task)
@@ -776,7 +816,7 @@ class Coordinator:
             self._emit_task_status(task.task_id, "failed" if response.status == TaskStatus.FAILED else "completed", response.summary[:200])
             return response
         return AgentResponse(
-            task_id=task_id or "simple_task",
+            task_id=task.task_id,
             status=TaskStatus.FAILED,
             summary="No agent is available to execute this task.",
             files_changed=[],
@@ -787,6 +827,30 @@ class Coordinator:
         )
 
     async def _execute_plan(self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None) -> AgentResponse:
+        from local_coder.orchestrator.mailbox import MailboxError, PlanMailbox
+        identities = [task.task_id for task in plan.tasks]
+        if len(identities) != len(set(identities)):
+            return AgentResponse(task_id="plan_execution", status=TaskStatus.FAILED,
+                                 summary="Task plan contains duplicate task IDs.", tests_passed=False,
+                                 issues=["Duplicate task IDs"], follow_up_required=True)
+        # A fresh channel belongs to this plan only. Larger valid plans still
+        # execute through the DAG, with messaging explicitly unavailable.
+        previous = getattr(self.tool_registry, "team_mailbox", None)
+        secrets = tuple({value for model in self.config.models.values()
+                         if (value := model.resolve_api_key()) and len(value) <= 4096})[:64]
+        try:
+            broker = PlanMailbox(identities, secrets=secrets) if 1 <= len(identities) <= 64 else None
+        except MailboxError:
+            broker = None  # Valid legacy DAG IDs need not fit the messaging schema.
+        self.tool_registry.team_mailbox = broker
+        try:
+            return await self._execute_plan_tasks(plan, checkpoint)
+        finally:
+            if broker is not None:
+                broker.close()
+            self.tool_registry.team_mailbox = previous
+
+    async def _execute_plan_tasks(self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None) -> AgentResponse:
         dag = TaskDAG()
         dag.add_tasks(plan.tasks)
         # Plan tasks that finished before an interruption stay finished; only
@@ -855,16 +919,71 @@ class Coordinator:
                 await asyncio.gather(*running, return_exceptions=True)
                 raise
 
-        return AgentResponse(
-            task_id="plan_execution",
-            status=TaskStatus.COMPLETED if not dag.has_failures() else TaskStatus.FAILED,
-            summary=dag.get_summary(),
-            files_changed=[],
-            tests_run=[],
-            tests_passed=not dag.has_failures(),
-            issues=[],
-            follow_up_required=dag.has_failures()
-        )
+        return self._aggregate_plan_results(dag)
+
+    @staticmethod
+    def _aggregate_plan_results(dag: TaskDAG) -> AgentResponse:
+        """Keep child evidence in the handoff without growing it with the plan.
+
+        Child observations remain untrusted report data. Completion and an empty
+        check list must not be presented as independent verification.
+        """
+        results = dag.get_all_results()
+        abbreviated = False
+
+        def bounded(values, *, count=200, characters=16000, item_limit=4096, clip=False):
+            nonlocal abbreviated
+            items, seen, used = [], set(), 0
+            for value in values:
+                if len(value) > item_limit:
+                    abbreviated = True
+                    if not clip:
+                        continue  # Never invent a truncated file path/check ID.
+                    value = value[:item_limit - 1] + "…"
+                if value in seen:
+                    continue
+                if len(items) >= count or used + len(value) > characters:
+                    abbreviated = True
+                    break
+                seen.add(value)
+                items.append(value)
+                used += len(value)
+            return items
+
+        files = bounded(path for result in results for path in result.files_changed)
+        checks = bounded(check for result in results for check in result.tests_run)
+        issues = bounded((f"{result.task_id}: {issue}" for result in results for issue in result.issues),
+                         count=100, characters=12000, item_limit=2000, clip=True)
+        discoveries = bounded((detail for result in results for detail in result.discoveries),
+                              count=100, characters=12000, item_limit=2000, clip=True)
+        failed = dag.has_failures()
+        if failed and not issues:
+            issues = ["One or more plan tasks failed; inspect their task observations."]
+        overview = dag.get_summary()
+        if len(overview) > 4000:
+            abbreviated = True
+            overview = overview[:4000]
+        verification = (f"Child task results recorded {len(checks)} distinct checks; "
+                        "these observations are not independent verification."
+                        if checks else "No checks recorded; task completion does not establish verification.")
+        summary = overview + "\n\n" + verification
+        for result in results:
+            text = result.summary[:2000]
+            if len(result.summary) > len(text):
+                abbreviated = True
+            observation = f"\n\nTask {result.task_id[:128]} observations (untrusted):\n{text}"
+            if len(summary) + len(observation) > 15800:
+                abbreviated = True
+                break
+            summary += observation
+        if abbreviated:
+            summary += "\n\nDetails abbreviated to fit the handoff budget; inspect individual task records for the complete evidence."
+        return AgentResponse(task_id="plan_execution",
+            status=TaskStatus.FAILED if failed else TaskStatus.COMPLETED,
+            summary=summary, files_changed=files, tests_run=checks,
+            tests_passed=not failed and all(result.tests_passed for result in results),
+            issues=issues, discoveries=discoveries,
+            follow_up_required=failed or any(result.follow_up_required for result in results))
 
     def _parallelism_for_wave(self, tasks: list[AgentTask]) -> int:
         """Only parallelize mutations when their file scopes are explicit and disjoint."""
@@ -894,9 +1013,14 @@ class Coordinator:
         from local_coder.workspace import Workspace
         scope = tuple(str(Workspace(self.project_root).resolve(path)) for path in task.files) if parallel else None
         token = _parallel_scope.set(scope)
+        broker = getattr(self.tool_registry, "team_mailbox", None)
+        context = self.tool_registry.task_context
+        identity_token = context.set({**(context.get() or {}), "task_id": task.task_id,
+                                      "team_run_id": broker.run_id if broker else None})
         try:
             return await self._run_dag_task(dag, task, semaphore, checkpoint)
         finally:
+            context.reset(identity_token)
             _parallel_scope.reset(token)
 
     async def _run_dag_task(
@@ -963,6 +1087,34 @@ class Coordinator:
             return False
 
     async def _attempt_dag_task(self, task: AgentTask, escalate: bool) -> AgentResponse:
+        return await self._with_task_deadline(task, lambda: self._execute_dag_agent(task, escalate))
+
+    async def _with_task_deadline(self, task: AgentTask, execute: Callable) -> AgentResponse:
+        """Bound preparation and execution; an expired attempt is never replayed.
+
+        Cancellation remains cooperative: await the agent/tool cleanup before
+        reporting the blocked outcome. This does not roll back external effects
+        or claim that interrupted mutations completed or were undone.
+        """
+        deadline = asyncio.timeout(task.timeout_seconds)
+        try:
+            async with deadline:
+                response = await execute()
+        except TimeoutError:
+            if not deadline.expired():
+                raise  # A backend timeout is not the host task deadline.
+        else:
+            if not deadline.expired():
+                return response
+        self._emit("ORCHESTRATOR", "task_deadline_exceeded", "Task deadline reached; automatic replay is blocked",
+                   task_id=task.task_id, data={"timeout_seconds": task.timeout_seconds,
+                                             "automatic_retry": False, "recovery_required": True})
+        return AgentResponse(task_id=task.task_id, status=TaskStatus.BLOCKED,
+            summary=(f"Task exceeded its {task.timeout_seconds}-second deadline. Execution was cancelled and cleanup was awaited. "
+                     "Inspect the workspace and pending tool journal before resuming; automatic retry and model escalation are disabled."),
+            tests_passed=False, issues=["Task deadline exceeded; explicit recovery is required"], follow_up_required=True)
+
+    async def _execute_dag_agent(self, task: AgentTask, escalate: bool) -> AgentResponse:
         try:
             drafter = await self._get_drafter() if task.role in (AgentRole.CODER, AgentRole.DEBUGGER) else None
             agent = create_agent(
@@ -1015,6 +1167,31 @@ class Coordinator:
         return "Fallback review: looks good."
 
     async def _run_tests(self) -> AgentResponse:
+        response = await self._run_project_tests()
+        settings = self.config.verification
+        if not settings.visual_url or not response.tests_passed or response.status != TaskStatus.COMPLETED:
+            return response
+        result = await self.tool_registry.execute_tool(AgentRole.TESTER, "verify_ui", {
+            "url": settings.visual_url, "assertions": settings.visual_assertions,
+            "timeout_seconds": settings.visual_timeout_seconds,
+            **({"viewport": settings.visual_viewport} if settings.visual_viewport is not None else {}),
+        })
+        report = result.data.get("visual_verification", {})
+        passed = result.success and report.get("status") == "verified"
+        unavailable = not report.get("navigation_started") or report.get("status") in {"unavailable", "captured"}
+        self._emit("ORCHESTRATOR", "verification_result", "Local UI verification finished", task_id=response.task_id,
+                   data={"passed": passed, "command": "verify_ui", "tool": "verify_ui",
+                         "source": "tool_result", "status": report.get("status", "not_started"),
+                         "artifact": report.get("artifact"), "vision_assessment": "not_run"})
+        return response.model_copy(update={
+            "status": TaskStatus.COMPLETED if passed else TaskStatus.BLOCKED if unavailable else TaskStatus.FAILED,
+            "tests_passed": passed, "follow_up_required": not passed,
+            "tests_run": response.tests_run + (["local UI assertions"] if report.get("navigation_started") else []),
+            "summary": response.summary + "\n\nLocal UI verification:\n" + result.output,
+            "issues": response.issues + ([] if passed else ["Configured local UI verification did not pass"]),
+        })
+
+    async def _run_project_tests(self) -> AgentResponse:
         # Running a known framework needs no model: call the tool directly and
         # save the tester's round trips. Its compact report is what the
         # debugger sees if anything failed.

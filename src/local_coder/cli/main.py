@@ -500,6 +500,9 @@ def show_config(ctx):
             "tools": {
                 "disabled": list(config.tools.disabled),
                 "command_timeout": config.tools.command_timeout,
+                "command_sandbox": config.tools.command_sandbox,
+                "sandbox_runtime": config.tools.sandbox_runtime,
+                "sandbox_image": config.tools.sandbox_image,
                 "role_overrides": dict(config.tools.roles),
             },
             "problems": validate_config(config),
@@ -535,6 +538,8 @@ def show_config(ctx):
     console.print(
         f"[bold]Tools:[/bold] disabled={', '.join(tools.disabled) or 'none'}; "
         f"command_timeout={tools.command_timeout or 'default (60s)'}; "
+        f"command_sandbox={'on' if tools.command_sandbox else 'off'} "
+        f"({tools.sandbox_runtime}, {tools.sandbox_image}); "
         f"role overrides={', '.join(tools.roles) or 'none'}"
     )
 
@@ -1212,6 +1217,17 @@ def _interactive_mode(ctx_obj: dict):
                         console.print("[red]Please provide a checkpoint ID.[/red]")
                 elif cmd == "/sessions":
                     _list_sessions(ctx_obj)
+                elif cmd == "/progress":
+                    parts = user_input.split(maxsplit=1)
+                    _run_operator_command(cmd, parts[1] if len(parts) == 2 else "", ctx_obj)
+                elif cmd == "/learn":
+                    lesson = user_input[len("/learn"):].strip()
+                    _run_operator_command(cmd, lesson, ctx_obj)
+                elif cmd == "/lessons":
+                    _run_operator_command(cmd, "", ctx_obj)
+                elif cmd == "/forget":
+                    parts = user_input.split(maxsplit=1)
+                    _run_operator_command(cmd, parts[1].strip() if len(parts) == 2 else "", ctx_obj)
                 elif cmd == "/new":
                     ctx_obj["session_id"] = None
                     ctx_obj["resume"] = False
@@ -1237,7 +1253,7 @@ def _interactive_mode(ctx_obj: dict):
             if ui.is_cancellation(exc):
                 console.print("[yellow]Request cancelled.[/yellow] Back at the prompt.")
             elif isinstance(exc, click.ClickException):
-                pass  # already reported by the command; keep the REPL alive
+                console.print(f"[red]{exc.message}[/red]")
             elif isinstance(exc, Exception):
                 console.print(f"[bold red]Error:[/bold red] {exc}")
             else:
@@ -1707,21 +1723,27 @@ def _show_models(ctx_obj: dict):
 
 def _load_custom_commands(ctx_obj: dict, warn: bool = False):
     from local_coder import custom_commands
+    from local_coder.builtin_skills import discover as discover_builtin_skills
 
-    commands, warnings = custom_commands.discover(ctx_obj["project_root"], reserved=ui.builtin_names())
+    skills = discover_builtin_skills()
+    reserved = ui.builtin_names() | {skill.name for skill in skills}
+    commands, warnings = custom_commands.discover(ctx_obj["project_root"], reserved=reserved)
     if warn:
         for warning in warnings:
-            console.print(f"[yellow]Custom command skipped:[/yellow] {warning}")
-    return {c.name: c for c in commands}
+            console.print(f"[yellow]Command skipped:[/yellow] {warning}")
+    return {c.name: c for c in [*skills, *commands]}
 
 
 def _run_extension_command(user_input: str, ctx_obj: dict) -> bool:
-    """Run a custom command or /hooks. False if ``user_input`` is neither."""
+    """Run an operator command, built-in skill, or custom command."""
     from local_coder import custom_commands
 
     name, arguments = custom_commands.split_invocation(user_input)
     if name == "/hooks":
         _show_hooks(ctx_obj)
+        return True
+    if name in {"/learn", "/lessons", "/forget", "/progress"}:
+        _run_operator_command(name, arguments, ctx_obj)
         return True
     # Re-read on every use so edits to a command file apply without a restart.
     command = _load_custom_commands(ctx_obj).get(name)
@@ -1733,6 +1755,29 @@ def _run_extension_command(user_input: str, ctx_obj: dict) -> bool:
     else:
         _run_request(prompt, ctx_obj)
     return True
+
+
+def _run_operator_command(name: str, arguments: str, ctx_obj: dict) -> None:
+    from local_coder.memory.lessons import LessonStoreError
+    from local_coder.orchestrator.sessions import SessionError
+
+    try:
+        if name == "/learn":
+            if arguments:
+                _learn_lesson(ctx_obj, arguments)
+            else:
+                console.print("[red]Usage: /learn <reusable project lesson>[/red]")
+        elif name == "/lessons":
+            _show_lessons(ctx_obj)
+        elif name == "/forget":
+            if arguments:
+                _forget_lesson(ctx_obj, arguments.split(maxsplit=1)[0])
+            else:
+                console.print("[red]Usage: /forget <lesson-id>[/red]")
+        elif name == "/progress":
+            _show_progress(ctx_obj, arguments or None)
+    except (LessonStoreError, SessionError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _setup_interactive_extensions(ctx_obj: dict) -> None:
@@ -1846,17 +1891,12 @@ def hooks_untrust(ctx):
 @cli.command(name="commands")
 @click.pass_context
 def commands_cmd(ctx):
-    """List custom slash commands from .local-coder/commands/."""
-    from local_coder import custom_commands
-
+    """List built-in skills and custom slash commands."""
     commands = _load_custom_commands(ctx.obj, warn=True)
     if not commands:
-        console.print(
-            f"No custom commands. Add Markdown files to {custom_commands.project_commands_dir(ctx.obj['project_root'])}"
-            f" or {custom_commands.user_commands_dir()}."
-        )
+        console.print("No built-in skills or custom commands are available.")
         return
-    table = Table(title="Custom commands", title_justify="left")
+    table = Table(title="Skills and custom commands", title_justify="left")
     table.add_column("Command", style="bold cyan", no_wrap=True)
     table.add_column("Description")
     table.add_column("Mode", style="dim")
@@ -1864,3 +1904,127 @@ def commands_cmd(ctx):
     for c in commands.values():
         table.add_row(f"{c.name} {c.argument_hint}".rstrip(), c.description, c.mode, f"{c.path} ({c.scope})")
     console.print(table)
+
+
+def _learn_lesson(ctx_obj: dict, text: str) -> None:
+    from local_coder.memory.lessons import ProjectLessonStore
+
+    lesson = ProjectLessonStore(ctx_obj["project_root"]).add(text)
+    console.print(f"[green]Saved project lesson[/green] [cyan]{lesson['id']}[/cyan]: {lesson['text']}")
+
+
+def _show_lessons(ctx_obj: dict) -> None:
+    from local_coder.memory.lessons import ProjectLessonStore
+
+    lessons = ProjectLessonStore(ctx_obj["project_root"]).list()
+    if not lessons:
+        console.print("No project lessons saved. Add one with `local-coder learn <lesson>`.")
+        return
+    table = Table(title="Operator-approved project lessons", title_justify="left")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Lesson")
+    table.add_column("Created", style="dim")
+    for lesson in lessons:
+        table.add_row(lesson["id"], lesson["text"], lesson.get("created_at", ""))
+    console.print(table)
+
+
+def _forget_lesson(ctx_obj: dict, lesson_id: str) -> None:
+    from local_coder.memory.lessons import ProjectLessonStore
+
+    if ProjectLessonStore(ctx_obj["project_root"]).delete(lesson_id):
+        console.print(f"[green]Removed project lesson[/green] [cyan]{lesson_id}[/cyan]")
+    else:
+        console.print(f"[yellow]No project lesson found with ID {lesson_id!r}.[/yellow]")
+
+
+def _show_progress(ctx_obj: dict, session_id: str | None = None) -> None:
+    from local_coder.orchestrator.sessions import SessionError, SessionStore
+
+    store = SessionStore(ctx_obj["project_root"])
+    if session_id:
+        session = store.open(session_id)
+    elif ctx_obj.get("session_id"):
+        try:
+            session = store.open(ctx_obj["session_id"])
+        except SessionError:
+            session = store.latest()
+    else:
+        session = store.latest()
+    if session is None:
+        console.print("No persistent session progress is available yet.")
+        return
+    progress = session.progress()
+    if progress is None:
+        console.print(f"Session {session.session_id} has no turns.")
+        return
+    console.print(
+        f"[bold]Session[/bold] {progress['session_id']}  "
+        f"[bold]Turn[/bold] {progress['turn_index'] + 1}  "
+        f"[bold]Status[/bold] {progress['status']}"
+    )
+    console.print(f"[bold]Request:[/bold] {progress['request']}")
+    console.print(f"[bold]Current phase:[/bold] {progress['current_phase'] or 'not started'}")
+    if progress["completed_phases"]:
+        console.print("[bold]Saved phases:[/bold] " + ", ".join(progress["completed_phases"]))
+    if progress["tasks"]:
+        table = Table(title="Task progress", title_justify="left")
+        table.add_column("Status", style="cyan", no_wrap=True)
+        table.add_column("Task")
+        table.add_column("Objective")
+        for task in progress["tasks"]:
+            table.add_row(task["status"], task["task_id"], task["objective"])
+        console.print(table)
+    if progress["error"]:
+        console.print(f"[red]Last error:[/red] {progress['error']}")
+
+
+@cli.command(name="learn")
+@click.argument("lesson")
+@click.pass_context
+def learn_cmd(ctx, lesson):
+    """Save an explicit reusable project lesson for future agent runs."""
+    from local_coder.memory.lessons import LessonStoreError
+
+    try:
+        _learn_lesson(ctx.obj, lesson)
+    except LessonStoreError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="lessons")
+@click.pass_context
+def lessons_cmd(ctx):
+    """List operator-approved project lessons."""
+    from local_coder.memory.lessons import LessonStoreError
+
+    try:
+        _show_lessons(ctx.obj)
+    except LessonStoreError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="forget")
+@click.argument("lesson_id")
+@click.pass_context
+def forget_cmd(ctx, lesson_id):
+    """Remove a project lesson by ID."""
+    from local_coder.memory.lessons import LessonStoreError
+
+    try:
+        _forget_lesson(ctx.obj, lesson_id)
+    except LessonStoreError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="progress")
+@click.argument("session_id", required=False)
+@click.pass_context
+def progress_cmd(ctx, session_id):
+    """Show durable phase and task progress for a session."""
+    from local_coder.orchestrator.sessions import SessionError
+
+    try:
+        _show_progress(ctx.obj, session_id)
+    except SessionError as exc:
+        raise click.ClickException(str(exc)) from exc

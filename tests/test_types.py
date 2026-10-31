@@ -38,7 +38,8 @@ class TestEnums:
         assert AgentRole.BUG_HUNTER.value == "bug_hunter"
         assert AgentRole.RED_TEAM.value == "red_team"
         assert AgentRole.EXPLOIT_VALIDATOR.value == "exploit_validator"
-        assert len(AgentRole) == 11
+        assert AgentRole.EXPLOIT_GENERATOR.value == "exploit_generator"
+        assert len(AgentRole) == 12
 
     def test_task_status(self):
         assert TaskStatus.PENDING.value == "pending"
@@ -118,6 +119,18 @@ class TestModelTypes:
         )
         assert config.backend == ModelBackend.OPENAI_COMPAT
         assert config.estimated_vram_mb == 2000
+
+    def test_model_output_budget_reserves_half_the_context_for_prompt(self):
+        config = ModelConfig(
+            name="small-native",
+            model_id="small",
+            context_length=1024,
+            max_tokens=4096,
+        )
+
+        assert config.output_budget() == 512
+        assert config.output_budget(900) == 512
+        assert config.output_budget(128) == 128
 
 
 class TestAgentProtocol:

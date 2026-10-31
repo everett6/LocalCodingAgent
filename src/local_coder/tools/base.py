@@ -160,7 +160,8 @@ class ToolRegistry:
     def get_tools_for_role(self, role: AgentRole) -> list[Tool]:
         """Get all tools available for a given role."""
         allowed_names = self._permissions.get(role, set())
-        return [tool for name, tool in self._tools.items() if name in allowed_names]
+        return [tool for name, tool in self._tools.items() if name in allowed_names
+                and (name != ToolName.TEAM_MESSAGE or getattr(self, "team_mailbox", None) is not None)]
     
     def get_schemas_for_role(self, role: AgentRole) -> list[dict]:
         """Get OpenAI-compatible function schemas for tools available to a role."""
@@ -218,6 +219,11 @@ class ToolRegistry:
             for tool in self._tools.values():
                 if hasattr(tool, "default_timeout"):
                     tool.default_timeout = settings.command_timeout
+        command_tool = self._tools.get(ToolName.RUN_COMMAND)
+        if command_tool is not None:
+            command_tool.sandbox_enabled = settings.command_sandbox
+            command_tool.sandbox_runtime = settings.sandbox_runtime
+            command_tool.sandbox_image = settings.sandbox_image
 
     async def evaluate_revision(self, revision):
         """Measure local contract checks; never trust model-reported test success."""
@@ -295,6 +301,10 @@ class ToolRegistry:
                 raise ValueError('File mutation exceeds the parallel worker write scope')
         # Process tools, dynamic tools and unclassified effects can mutate paths
         # outside their arguments. They must run at a serialized boundary.
+        if name == ToolName.TEAM_MESSAGE:
+            from local_coder.tools.team_message import TeamMessageTool
+            if type(self.get_tool(name)) is TeamMessageTool:
+                return  # This concrete tool changes only bounded plan mailboxes.
         if not targets and self.effects_for(name.value).mutating:
             raise ValueError('Unconfined mutation requires a serialized task scope')
 
@@ -363,6 +373,13 @@ class ToolRegistry:
             # Do not echo argument values (which can contain credentials).
             return ToolResult(success=False, output="Tool arguments failed schema validation: " +
                               ", ".join(sorted({str(error.validator) for error in errors})))
+        if name_enum == ToolName.READ_FILE:
+            from local_coder.context.privacy import private_read_path
+            root = getattr(self, "project_root", None) or getattr(tool, "project_root", None)
+            if private_read_path(arguments["path"], root):
+                return ToolResult(success=False,
+                    output="Generic file reads exclude credential files and private engine state. Use security_scan for redacted findings or recover_context for this role's registered archives.",
+                    data={"execution_outcome": "not_started", "private_read_blocked": True})
         scope_error = self._outside_write_scope(role, name_enum, tool, arguments)
         if scope_error:
             return ToolResult(
@@ -402,6 +419,10 @@ class ToolRegistry:
             if name_enum == ToolName.DELEGATE_TASK:
                 current = self.task_context.get() or {}
                 arguments = {**arguments, "_delegation_depth": current.get("depth", 0)}
+            if name_enum == ToolName.TEAM_MESSAGE:
+                current = self.task_context.get() or {}
+                arguments = {**arguments, "_caller_task_id": current.get("task_id"),
+                             "_caller_run_id": current.get("team_run_id")}
             execution_started = True
             result = await tool.execute(**arguments)
             if result.success and name_enum == ToolName.READ_FILE:

@@ -56,6 +56,45 @@ local-coder rollback <checkpoint-id>
 local-coder --version
 ```
 
+### Test-verified coding benchmark
+
+Compare real model task success—not just inference speed or fake-model
+orchestration—with the repeatable coding tasks in
+[`benchmarks/coding_tasks.json`](benchmarks/coding_tasks.json):
+
+```sh
+PYTHONPATH=src python benchmarks/run_coding_benchmark.py --runs 3
+```
+
+Compare a candidate model/config against a baseline with the exact same
+task manifest and repetitions (repeat `--compare` for additional candidates):
+
+```sh
+PYTHONPATH=src python benchmarks/run_coding_benchmark.py \
+  --config config/local.yaml \
+  --compare config/frontier.yaml \
+  --runs 3
+```
+
+Each attempt starts from a fresh temporary project, confirms its tests fail
+before the task, runs the normal Coordinator workflow, then copies only the
+expected implementation outputs into a second clean workspace with the
+original benchmark tests for independent scoring. Success requires passing
+validation tests, changing every expected implementation file, and leaving
+the trusted tests untouched. The JSON report records per-attempt results and
+aggregate success rate and latency in
+`benchmark_task_results.json`; it may contain local paths and test output, so
+keep it local. Use the same task set, model configuration, and repetition
+count when comparing configurations. Setup and execution errors are recorded
+as failed attempts instead of being omitted from the score. This small starter
+suite currently covers whitespace normalization, merging sorted sequences,
+CSV parsing, and pagination; expand it with representative tasks from your own
+projects before drawing broad performance conclusions. Comparison reports
+include overall and per-task success-rate deltas and median-latency ratios
+(below `1.0` means the candidate was faster). A zero exit code means the
+benchmark ran and produced measurements; task failures remain in the report
+and do not make a valid comparison an execution error.
+
 ### JSON output for scripts
 
 Add `--json` to any command (before or after the subcommand) to get a single
@@ -152,7 +191,9 @@ map), a model named after the role, a model named `default`, then the first
 model. With `escalate_to` set, a plan task that fails is rerun once on that
 model (seeing whatever files the first attempt already changed), and the
 second and later fix-loop attempts use it for the debugger. `fallbacks` are
-only probed for models that list them, once per run.
+only probed for models that list them. Successful availability checks are cached
+for the model manager; failures are cached for five seconds so restarted servers
+can recover. Concurrent checks of the same model share one probe.
 
 ## Custom commands
 
@@ -179,6 +220,15 @@ replace a built-in command. Outside interactive mode run one with
 `local-coder run "/review-auth src/auth.py"`, and list them with
 `local-coder commands`. A command file is only a prompt: nothing in it is
 executed, and the request goes through the usual approval prompts.
+
+The harness also includes model-agnostic `/implement`, `/debug`, `/add-tests`,
+`/refactor`, `/handoff`, and `/reflect` skills. Inspect the available built-ins
+and custom prompts with `local-coder commands`; built-in names are reserved.
+For explicit, reusable project guidance, use `local-coder learn "Prefer the
+existing parser helpers"` and review or remove it with `local-coder lessons`
+and `local-coder forget <lesson-id>`. Only lessons entered by an operator are
+saved, under the ignored `.local-coder/lessons.json`; agents are instructed to
+verify them against the current code before applying them.
 
 ## Hooks
 
@@ -234,6 +284,7 @@ local-coder -s auth "Add OAuth login"  # run in a named session (created if new)
 local-coder resume auth                # pick up auth's unfinished request
 local-coder sessions                   # list sessions
 local-coder sessions auth              # show a session's requests and finished phases
+local-coder progress auth               # show the latest phase and task-DAG status
 ```
 
 The coordinator checkpoints each phase as it finishes (exploration, plan, each
@@ -245,7 +296,8 @@ five, each trimmed) as context. `state.json` in the session folder holds the
 turns and checkpoints, and `events.jsonl` logs every agent event. A lock stops
 two terminals from running the same session at once. In the interactive
 prompt, all requests share one session; `/sessions`, `/resume [id]` and `/new`
-manage it. `POST /run` on the remote server uses the same sessions, so repeating
+manage it; `/progress [id]` shows its durable phase and task-DAG status.
+`POST /run` on the remote server uses the same sessions, so repeating
 a `session_id` there continues it too.
 
 ## Local model server
@@ -331,13 +383,18 @@ task DAG, and each task may select a different configured model with
 
 ```yaml
 agentic:
-	context_window_chars: 24000
-	compact_context_chars: 12000
+  context_window_chars: 180000
+  compact_context_chars: 90000
 ```
 
 Long tool histories are compacted automatically while the system and task
 context remain available. Use `local-coder --model coding-model "..."` to route
-one run to a selected model.
+one run to a selected model. The context character budget defaults to 180000
+and is capped against each selected model's configured token window and output
+reserve, so the same harness works with short- and long-context providers
+without relying on a provider-specific profile name. Token usage reported by
+the provider triggers earlier compaction when the real prompt approaches its
+window.
 
 **Stagnation guard:** a small local model is far likelier than a frontier one
 to retry an identical failing tool call instead of changing approach. The
@@ -637,12 +694,20 @@ step first (`context/compression.py`):
    stay verbatim. The cut never leaves a tool result without its tool call.
    If summarization fails, the old character-budget trimming is the fallback.
 
+Context reads now reject paths that escape the workspace, symlinks outside it,
+credential/state files, binary files and oversized sources. Initial context
+loading is capped across files instead of allowing ten maximum-size reads to
+crowd out the task. Repository text and tool output are explicitly treated as
+untrusted data, not instructions.
+
 Compaction triggers when history passes `context_window_chars`, **or** when
 the prompt size the server reported last turn passes 85% of the model's
 `context_length` minus `max_tokens`. Chars per token varies a lot between
 code and prose, so the real count is the reliable signal. History is only
 rewritten when a trigger fires. Between compactions the prompt is
 append-only, so llama-server's prefix cache is reused on every turn.
+Generation output is capped at half of the configured context window to reserve
+room for the prompt, tool schemas and the ongoing conversation.
 
 Past tool calls are now sent back as real JSON (compact separators) instead
 of a Python `repr`, so the model sees its own calls in the shape it wrote
@@ -666,11 +731,18 @@ PYTHONPATH=src pytest -q
 ### Red team mode
 
 The manager and Code OSS IDE include a dedicated **Red Team** engagement workflow:
-saved scope/exclusions, phased checklists, bounded opt-in HTTP observations,
+saved local scope/exclusions, bounded opt-in loopback-only HTTP observations,
 SARIF/Nuclei artifact import, attack-path hypotheses, and persistent evidence.
 Use `lc redteam --target src 'Review trust boundaries'` for local source review.
 See [engagement setup and limits](docs/harness.md#red-team-engagements) and the
 [upstream methodology reference](docs/references/pentest-harness.md).
+
+Red Team mode is for evidence-led review of the selected local repository.
+Optional HTTP observations are restricted to localhost/loopback; remote hosts
+are rejected. It does not generate or run exploits, payloads, fuzzing campaigns,
+or arbitrary commands. Security and bug-hunting investigations remain read-only
+unless remediation is explicitly enabled; remediation uses bounded file and
+test tools, not arbitrary shell commands or Git mutations.
 
 **Small-model guardrails:** three more checks in the same loop, for mistakes
 local models make far more often than frontier ones.

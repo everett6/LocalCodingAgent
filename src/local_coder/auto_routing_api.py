@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 
 from local_coder.harness_api import _object
 from local_coder.integrations.mcp import redact_data
 from local_coder.providers.catalog import is_openrouter
 from local_coder.models.manager import ModelManager, is_local_model
 from local_coder.types import ModelBackend
-from local_coder.statedir import state_path, write_state_file
+from local_coder.statedir import state_path
 
 SETTINGS_PATH = ".local-coder/routing/settings.json"
 ECONOMY_ID = "deepseek/deepseek-v4.1-flash-1017"
@@ -54,7 +56,23 @@ class AutoRoutingAPI:
         _validated(body)
         with self._harness_idle():
             preferences = self._routing_preferences() | body
-            write_state_file(self.project_root, SETTINGS_PATH, json.dumps(preferences, allow_nan=False))
+            path = state_path(self.project_root, SETTINGS_PATH)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                                 prefix=".routing-", suffix=".tmp", delete=False) as output:
+                    temporary = output.name
+                    json.dump(preferences, output, allow_nan=False)
+                    output.flush()
+                    os.fsync(output.fileno())
+                state_path(self.project_root, SETTINGS_PATH)
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
             return self._routing_settings_status()
 
     def _routing_settings_status(self):
@@ -76,7 +94,7 @@ class AutoRoutingAPI:
         if routing.auto_enabled:
             if routing.economy_model:
                 economy = config.models.get(routing.economy_model)
-                reason = "Configured economy model is available." if economy else "Configured economy model key was not found."
+                reason = "Configured economy model is eligible; reachability is checked when used." if economy else "Configured economy model key was not found."
             else:
                 reason = "No eligible economy candidate: select an official paid OpenRouter model and cache its catalog."
                 if (selected is not None and selected.backend == ModelBackend.OPENAI_COMPAT
@@ -109,21 +127,34 @@ class AutoRoutingAPI:
                         config.models[economy.name] = economy
                         routing.economy_model = economy.name
                         reason = "Cached prices support an economy candidate; uncertain and security tasks keep the selected model."
+        economy_eligible = False
+        if economy is not None and selected is not None:
+            blocker = ModelManager.economy_blocker(selected, economy, "explorer",
+                                                   allow_cross_provider=routing.allow_cross_provider)
+            economy_eligible = blocker is None
+            if blocker:
+                reason = {
+                    "invalid_endpoint": "Economy routing blocked: a configured endpoint is invalid.",
+                    "local_to_cloud_blocked": "Economy routing blocked: on-device tasks cannot move to a cloud model.",
+                    "cross_provider_blocked": "Economy routing blocked: enable cross-provider routing to use this endpoint.",
+                    "tools_unsupported": "Economy routing blocked: the model does not advertise tool support.",
+                }[blocker]
         classifier = config.models.get(routing.local_classifier) if routing.local_classifier else None
-        if classifier is not None and not is_local_model(classifier):
+        classifier_supported = ModelManager.supports_local_classifier(classifier)
+        if not classifier_supported:
             classifier = None
         configured = bool(routing.local_classifier)
         classifier_ready = False
         if classifier is not None:
             loaded = self.local_inference_provider()
-            classifier_ready = bool(loaded is not None
+            classifier_ready = bool(ModelManager.supports_local_classifier(loaded)
                 and loaded.model_id == classifier.model_id
-                and loaded.base_url.rstrip("/") == classifier.base_url.rstrip("/"))
+                and ModelManager._endpoint(loaded) == ModelManager._endpoint(classifier))
         use_loaded = preferences.get("use_loaded_local_classifier", False)
         if routing.auto_enabled and not configured and use_loaded and selected is not None:
             if not is_local_model(selected):
                 local = self.local_inference_provider()
-                if local is not None and is_local_model(local):
+                if ModelManager.supports_local_classifier(local):
                     classifier = local.model_copy(update={
                         "name": "_routing_classifier", "max_tokens": min(128, local.max_tokens),
                         "auto_context": False, "input_cost_per_million": 0,
@@ -140,10 +171,10 @@ class AutoRoutingAPI:
         settings["local_classifier"] = alias(settings["local_classifier"]) if settings["local_classifier"] != "_routing_classifier" else None
         settings["use_loaded_local_classifier"] = use_loaded
         return {"settings": settings, "status": {
-            "economy_available": economy is not None,
-            "economy_model_id": ECONOMY_ID if economy is not None and economy.name == "_routing_economy" else None,
+            "economy_available": economy_eligible,
+            "economy_model_id": ECONOMY_ID if economy_eligible and economy.name == "_routing_economy" else None,
             "classifier_configured": configured, "classifier_ready": classifier_ready,
             "classifier_local_configured": classifier is not None,
-            "classifier_state": "ready" if classifier_ready else "configured_unverified" if configured else "not_configured",
+            "classifier_state": "ready" if classifier_ready else "unsupported" if configured and not classifier_supported else "configured_unverified" if configured else "not_configured",
             "reason": reason,
         }}

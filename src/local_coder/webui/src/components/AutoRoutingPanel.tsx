@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { classifierStatusLabel } from '../routingStatus'
 
 type Settings = {
   auto_enabled: boolean
@@ -46,7 +47,7 @@ export function AutoRoutingPanel({ disabled = false }: { disabled?: boolean }) {
     {data && <>
       <p>{data.status.reason}</p>
       {data.status.economy_model_id && <p>Economy candidate: {data.status.economy_model_id}</p>}
-      <p className="hint">Local classifier: {data.status.classifier_ready ? 'Ready' : data.status.classifier_configured ? 'Configured; readiness unverified' : 'Not ready or not configured'}.</p>
+      <p className="hint">Local classifier: {classifierStatusLabel(data.status.classifier_state)}.</p>
     </>}
     {draft && <form onSubmit={event => { event.preventDefault(); void refresh(true) }}>
       <fieldset disabled={disabled || busy}>

@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import hashlib
 import ipaddress
 import json
+import subprocess
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -25,11 +28,46 @@ from local_coder.providers.quota import ProviderQuotaExhausted
 from local_coder.orchestrator.blocked import AgentBlocked
 
 
+def workspace_fingerprint(project_root: str) -> str:
+    """Fingerprint workspace edits so undo can refuse to discard newer work."""
+    workspace = Workspace(project_root)
+    root = workspace.root
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True, timeout=10,
+        ).stdout
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--binary", "HEAD", "--", ".", ":(exclude).local-coder/**"],
+            cwd=root, capture_output=True, check=True, timeout=10,
+        ).stdout
+        tracked = subprocess.run(
+            ["git", "diff", "--binary", "--", ".", ":(exclude).local-coder/**"],
+            cwd=root, capture_output=True, check=True, timeout=10,
+        ).stdout
+        listing = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=root, capture_output=True, check=True, timeout=10,
+        ).stdout.decode("utf-8", errors="strict")
+        digest = hashlib.sha256(head + staged + tracked)
+        for relative in sorted(path for path in listing.splitlines() if path and not path.startswith(".local-coder/")):
+            file = workspace.resolve(relative)
+            if file.is_file():
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(file.read_bytes())
+                digest.update(b"\0")
+        return digest.hexdigest()
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Unable to verify workspace state before undo: {exc}") from exc
+
+
 class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAuditAPI,
                    FindingsAPI, ContextAccountingAPI, DependencyUpdatesAPI, InferenceTuningAPI, DoctorAPI):
     def _init_workbench(self):
         from local_coder.redteam import EngagementStore
         self.engagements = EngagementStore(self.project_root)
+        from local_coder.context.code_index import CodeIndex
+        self.code_index = CodeIndex(self.project_root)
         from local_coder.inference import EmbeddedInferenceManager
         from local_coder.statedir import state_path
         inference_state = state_path(self.project_root, '.local-coder/inference/runtime-state').parent
@@ -227,7 +265,7 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 self._jobs[session_id] = job
             record = self.sessions.save(session_id, request=request.strip(), mode=mode.value,
                                         phase=action, target_path=target, status="queued", result="", engagement_id=engagement_id,
-                                        goal_id=goal_id)
+                                        goal_id=goal_id, started_at=time.time())
             thread = threading.Thread(target=self._job_thread,
                 args=(session_id, job, prepared, mode, action, target, body.get("fix", False), body.get("resume_checkpoint"), engagement_id, allow_model_change), daemon=True)
             with self.lock:
@@ -274,6 +312,13 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                     result = await coordinator.run(request, **options)
                 failed = job.get("failed", False)
                 status = "failed" if failed else "completed"
+                rollback_error = None
+                if failed:
+                    rollback_error = self._auto_rollback_failed_run(job, coordinator, mode)
+                    if job.get("rollback_applied"):
+                        result += "\n\nWorkspace restored to the pre-run checkpoint because verification failed."
+                    elif rollback_error:
+                        result += f"\n\nAutomatic rollback was not applied: {rollback_error}"
                 if resume_checkpoint and mode == AgentMode.CODING and not failed:
                     status = "requires_continuation"
                     result = "Saved agent step completed. The enclosing coding workflow was not resumed; planning, implementation, review or verification may still be needed.\n\n" + result
@@ -288,6 +333,11 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 event_type, event_message = "provider_quota_exhausted", error
             except Exception as exc:
                 status, error = "failed", str(exc)
+                rollback_error = self._auto_rollback_failed_run(job, coordinator, mode) if coordinator else None
+                if job.get("rollback_applied"):
+                    error += "\nWorkspace restored to the pre-run checkpoint because the task failed."
+                elif rollback_error:
+                    error += f"\nAutomatic rollback was not applied: {rollback_error}"
                 event_type, event_message = "job_failed", error
             finally:
                 if coordinator is not None:
@@ -315,6 +365,9 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 final = self._redact({"status": status, "result": result, "error": error,
                                       "quota_notice": notice, "checkpoint": job.get("checkpoint"),
                                       "verification": job.get("verification"),
+                                      "pre_run_checkpoint_id": job.get("pre_run_checkpoint_id"),
+                                      "workspace_fingerprint": self._workspace_fingerprint() if job.get("pre_run_checkpoint_id") else None,
+                                      "rollback_applied": job.get("rollback_applied", False),
                                       "events": job.get("events", [])})
                 self.sessions.save(session_id, **final)
         try:
@@ -324,11 +377,72 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 self._jobs.pop(session_id, None)
             self._job_lock.release()
 
+    def _auto_rollback_failed_run(self, job, coordinator, mode):
+        verification = getattr(getattr(coordinator, "config", None), "verification", None)
+        if mode != AgentMode.CODING or not getattr(verification, "rollback_on_failure", False):
+            return None
+        checkpoint_id = job.get("pre_run_checkpoint_id")
+        if not checkpoint_id:
+            return "the task has no pre-run workspace checkpoint"
+        try:
+            from local_coder.git.checkpoints import CheckpointManager
+            manager = CheckpointManager(self.project_root)
+            checkpoint = manager.get(checkpoint_id)
+            checkpoints = manager.list()
+            if not checkpoints or checkpoints[0].checkpoint_id != checkpoint_id:
+                return "a newer checkpoint exists"
+            current_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=self.project_root,
+                capture_output=True, check=True, timeout=10,
+            ).stdout.decode().strip()
+            if current_head != checkpoint.head:
+                return "the Git HEAD changed during the task"
+            manager.rollback(checkpoint_id)
+            job["rollback_applied"] = True
+            return None
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            return str(exc)
+
+    def _workspace_fingerprint(self):
+        try:
+            return workspace_fingerprint(self.project_root)
+        except RuntimeError as exc:
+            self._event(AgentEvent(source="SERVER", event_type="undo_unavailable", message=str(exc)))
+            return None
+
     def workbench_handle(self, method, raw_path, body):
         parsed = urlsplit(raw_path)
         path, query = parsed.path, parse_qs(parsed.query)
         body = body or {}
         try:
+            if path == "/undo" and method == "POST":
+                session_id = body.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    return 400, {"error": "Select the task run to undo"}
+                if not self._job_lock.acquire(blocking=False):
+                    return 409, {"error": "Stop the active task before undoing workspace changes"}
+                try:
+                    from local_coder.git.checkpoints import CheckpointManager
+                    record = self.sessions.get(session_id)
+                    if not record or record.get("status") not in {"completed", "cancelled", "failed"}:
+                        return 409, {"error": "This task does not have a finished workspace snapshot to undo"}
+                    checkpoint_id = record.get("pre_run_checkpoint_id")
+                    expected_fingerprint = record.get("workspace_fingerprint")
+                    if not checkpoint_id or not expected_fingerprint:
+                        return 409, {"error": "This task has no verified pre-run checkpoint"}
+                    if workspace_fingerprint(self.project_root) != expected_fingerprint:
+                        return 409, {"error": "Workspace changed after this task finished. Review the current diff; undo was not applied."}
+                    manager = CheckpointManager(self.project_root)
+                    checkpoints = manager.list()
+                    if not checkpoints or checkpoints[0].checkpoint_id != checkpoint_id:
+                        return 409, {"error": "A newer checkpoint exists. Undo it from its own task instead."}
+                    checkpoint = manager.rollback(checkpoint_id)
+                    self.sessions.save(session_id, undo_applied=True)
+                    return 200, {"checkpoint_id": checkpoint.checkpoint_id}
+                except (ValueError, RuntimeError) as exc:
+                    return 409, {"error": str(exc)}
+                finally:
+                    self._job_lock.release()
             if method == "GET" and path == "/status" and query:
                 if query != {"summary": ["1"]}:
                     raise ValueError("Use summary=1 for lightweight task status")
@@ -495,6 +609,28 @@ class WorkbenchAPI(HarnessAPI, ProviderAPI, ResearchAPI, EvaluationAPI, MemoryAu
                 return 200, {"path": str(file.relative_to(Workspace(self.project_root).root)), "content": file.read_text(encoding="utf-8")}
             if method == "GET" and path == "/diff":
                 from local_coder.remote import _git
+                target = query.get("path", [None])[0]
+                if target:
+                    workspace = Workspace(self.project_root)
+                    relative = workspace.relative_path(target)
+                    file = workspace.resolve(relative)
+                    if ".local-coder" in file.relative_to(workspace.root).parts or file.name.startswith(".env"):
+                        raise ValueError("Credential and state files are not displayed")
+                    diff = _git(self.project_root, "diff", "HEAD", "--", relative)
+                    is_untracked = _git(
+                        self.project_root, "status", "--porcelain", "--untracked-files=normal", "--", relative
+                    ).startswith("??")
+                    if not diff and is_untracked and file.is_file():
+                        if file.stat().st_size > 500_000:
+                            raise ValueError("Choose a file smaller than 500 KB")
+                        try:
+                            content = file.read_text(encoding="utf-8").splitlines(keepends=True)
+                        except UnicodeError as exc:
+                            raise ValueError("Binary files cannot be previewed as text") from exc
+                        diff = "".join(difflib.unified_diff(
+                            [], content, fromfile="/dev/null", tofile=f"b/{relative}"
+                        ))
+                    return 200, {"path": relative, "diff": diff[:500000]}
                 return 200, {"diff": _git(self.project_root, "diff", "HEAD", "--", ".", ":(exclude).local-coder/**")[:500000]}
         except ResearchRequestError as exc:
             return 400, {"error": str(exc)}

@@ -19,7 +19,13 @@ _LOCK = threading.RLock()
 
 
 def _number(value: Any) -> float | None:
-    return float(value) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    if type(value) not in (int, float) or value < 0:
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _identifier(value: str | None) -> str | None:
@@ -82,7 +88,7 @@ class ContextTelemetry:
             if target.stat().st_nlink != 1 or not target.is_file():
                 raise ValueError('Context diagnostic storage must be a regular private file')
             target.chmod(0o600)
-        write_state_file(self.root, _PATH, json.dumps(rows[-100:]))
+        write_state_file(self.root, _PATH, json.dumps(rows[-100:], allow_nan=False))
 
     def record_request(self, messages: Sequence[Any], tools: Sequence[dict[str, Any]] | None,
                        output_reserved: int, *, task_id: str | None = None,
@@ -106,7 +112,7 @@ class ContextTelemetry:
         return record
 
     def record_usage(self, request_id: str, usage: Mapping[str, Any] | None,
-                     *, pricing: Mapping[str, Any] | None = None) -> None:
+                     *, pricing: Mapping[str, Any] | None = None, cost_known: bool = True) -> None:
         _identifier(request_id)
         usage, pricing = usage or {}, pricing or {}
         prompt = _number(usage.get('prompt_tokens'))
@@ -115,8 +121,10 @@ class ContextTelemetry:
         output_rate = _number(pricing.get('output_cost_per_million'))
         fixed_cost = _number(pricing.get('request_cost_usd'))
         cost = None
-        if all(value is not None for value in (prompt, completion, input_rate, output_rate, fixed_cost)):
+        if cost_known is True and all(value is not None for value in (prompt, completion, input_rate, output_rate, fixed_cost)):
             cost = round((prompt * input_rate + completion * output_rate) / 1000000 + fixed_cost, 12)
+            if not math.isfinite(cost):
+                cost = None
         with _LOCK:
             rows = self._load()
             for row in rows:

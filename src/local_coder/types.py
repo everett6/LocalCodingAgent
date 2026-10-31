@@ -3,8 +3,8 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Literal
-from pydantic import BaseModel, Field, SecretStr
+from typing import Annotated, Any, Literal
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from local_coder.context.allocation import ContextAllocation
 
 
@@ -22,6 +22,7 @@ class AgentRole(str, enum.Enum):
     BUG_HUNTER = "bug_hunter"
     RED_TEAM = "red_team"
     EXPLOIT_VALIDATOR = "exploit_validator"
+    EXPLOIT_GENERATOR = "exploit_generator"
 
 
 class SafetyTier(str, enum.Enum):
@@ -86,6 +87,8 @@ class ToolName(str, enum.Enum):
     GIT_COMMIT = "git_commit"
     GIT_CHECKOUT = "git_checkout"
     RUN_COMMAND = "run_command"
+    TEAM_MESSAGE = "team_message"
+    VERIFY_UI = "verify_ui"
     RUN_TESTS = "run_tests"
     BUILD = "build"
     LINT = "lint"
@@ -155,6 +158,8 @@ class ToolResult(BaseModel):
 
 # === Model Interface ===
 
+MAX_REPORTED_TOKENS = 1_000_000_000_000
+
 class ModelResponse(BaseModel):
     """Response from a model."""
     content: str = ""
@@ -163,6 +168,12 @@ class ModelResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    usage_reported: bool = Field(default=False, strict=True)
+    usage_cost_known: bool = Field(default=True, strict=True)
+    usage_details: dict[
+        Literal["uncached_input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
+        Annotated[int, Field(strict=True, ge=0, le=MAX_REPORTED_TOKENS)],
+    ] | None = Field(default=None, max_length=3)
     latency_ms: float = 0.0
     model: str = ""
     reasoning_content: str | None = Field(default=None, repr=False)
@@ -199,6 +210,12 @@ class ModelConfig(BaseModel):
         if env is None and self.backend == ModelBackend.ANTHROPIC:
             env = "ANTHROPIC_API_KEY"
         return os.environ.get(env) if env else None
+
+    def output_budget(self, requested: int | None = None) -> int:
+        """Keep generation within the model's context while reserving prompt space."""
+        limit = max(1, self.context_length // 2)
+        desired = self.max_tokens if requested is None else requested
+        return max(1, min(int(desired), limit))
 
 
 # === Agent Protocol ===
@@ -368,13 +385,31 @@ class VerificationConfig(BaseModel):
     max_fix_iterations: int = 3
     run_tests_after_changes: bool = True
     require_review: bool = True
+    rollback_on_failure: bool = False
+    visual_url: str | None = Field(default=None, max_length=2048)
+    visual_assertions: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    visual_viewport: dict[str, int] | None = None
+    visual_timeout_seconds: int = Field(default=15, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def validate_visual_check(self):
+        if self.visual_url is None:
+            if self.visual_assertions:
+                raise ValueError("Visual assertions require an explicit local UI URL")
+            return self
+        from local_coder.verification.visual import validate_visual_request
+        validate_visual_request(self.visual_url, assertions=self.visual_assertions,
+                                viewport=self.visual_viewport, timeout_seconds=self.visual_timeout_seconds)
+        if not self.visual_assertions:
+            raise ValueError("Automatic UI verification requires explicit assertions")
+        return self
 
 
 class AgenticConfig(BaseModel):
     """Controls routing, context compaction, and resumable sessions."""
     role_models: dict[str, str] = Field(default_factory=dict)
-    context_window_chars: int = 24000
-    compact_context_chars: int = 12000
+    context_window_chars: int = 180000
+    compact_context_chars: int = 90000
     max_parallel_agents: int = 1
     # Disk-backed KV cache for the exploration prefix (llama-server's
     # /slots save/restore API; requires the server to be started with
@@ -412,6 +447,9 @@ class ToolSettings(BaseModel):
     """
     disabled: list[str] = Field(default_factory=list)
     command_timeout: int | None = None
+    command_sandbox: bool = False
+    sandbox_runtime: Literal["auto", "docker", "podman"] = "auto"
+    sandbox_image: str = Field(default="python:3.12-slim", min_length=1)
     # role -> the complete list of tools that role may use (replaces the
     # built-in default for that role).
     roles: dict[str, list[str]] = Field(default_factory=dict)

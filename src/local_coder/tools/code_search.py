@@ -29,9 +29,9 @@ class CodeSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, index: CodeIndex | None = None):
         self.project_root = project_root
-        self.index = CodeIndex(project_root)
+        self.index = index or CodeIndex(project_root)
 
     async def execute(
         self,
@@ -49,10 +49,11 @@ class CodeSearchTool(Tool):
                 prefix = workspace.relative_path(path)
             limit = max(1, min(int(max_results), 30))
 
-            def _search() -> str:
-                hits = self.index.search(query, max_results=limit, path_prefix=prefix)
+            def _search() -> tuple[str, dict[str, str]]:
+                self.index.refresh_if_due()
+                hits = self.index.search(query, max_results=limit, path_prefix=prefix, refresh=False)
                 if not hits:
-                    return "No matching code found. Try other words, or grep for exact text."
+                    return "No matching code found. Try other words, or grep for exact text.", {}
                 if snippets:
                     self.index.add_snippets(hits, query)
                 out = []
@@ -61,9 +62,14 @@ class CodeSearchTool(Tool):
                     out.append(f"{hit.location()}  [{label}]  score={hit.score}")
                     for n, line in hit.snippet:
                         out.append(f"  {n}: {line}")
-                return "\n".join(out)
+                return "\n".join(out), {hit.path: hit.source_hash for hit in hits if hit.source_hash}
 
-            content = await asyncio.to_thread(_search)
-            return ToolResult(success=True, output=content, duration_ms=int((time.time() - start_t) * 1000))
+            content, hashes = await asyncio.to_thread(_search)
+            return ToolResult(
+                success=True,
+                output=content,
+                data={"files_read": sorted(hashes), "source_hashes": hashes},
+                duration_ms=int((time.time() - start_t) * 1000),
+            )
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time() - start_t) * 1000))

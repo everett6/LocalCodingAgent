@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import math
 import os
 import subprocess
 import mimetypes
@@ -36,6 +37,46 @@ _WEBUI_ASSETS = {
     "/sw.js": (Path(__file__).parent / "webui" / "public" / "sw.js", "application/javascript"),
     "/icon.svg": (Path(__file__).parent / "webui" / "public" / "icon.svg", "image/svg+xml"),
 }
+
+
+def _request_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate request key")
+        result[key] = value
+    return result
+
+
+def _request_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Nonfinite request number")
+    return number
+
+
+def _invalid_json_constant(value):
+    raise ValueError("Nonfinite request constant")
+
+
+def _validate_request_depth(data: bytes) -> None:
+    depth, quoted, escaped = 0, False, False
+    for character in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == 92:  # Backslash inside a JSON string.
+                escaped = True
+            elif character == 34:
+                quoted = False
+        elif character == 34:
+            quoted = True
+        elif character in (91, 123):
+            depth += 1
+            if depth > 64:
+                raise ValueError("Request JSON exceeds the nesting limit")
+        elif character in (93, 125):
+            depth -= 1
 
 
 def _git(project_root: str, *args: str) -> str:
@@ -142,6 +183,8 @@ class RemoteControlServer(WorkbenchAPI):
                 job["events"] = job["events"][-600:]
                 if event.event_type == "checkpoint_saved":
                     job["checkpoint"] = event.data.get("path")
+                if event.event_type == "checkpoint_created":
+                    job["pre_run_checkpoint_id"] = event.data.get("checkpoint_id")
                 if event.event_type == "verification_result" and event.source == "ORCHESTRATOR":
                     data = event.data
                     if (type(data.get("passed")) is bool and isinstance(data.get("command"), str)
@@ -152,6 +195,12 @@ class RemoteControlServer(WorkbenchAPI):
         if job is not None and event.event_type == "checkpoint_saved":
             # Make Resume available even when the process dies before the job finalizer.
             self.sessions.save(payload["session_id"], checkpoint=job["checkpoint"], events=list(job["events"]))
+        elif job is not None and event.event_type == "checkpoint_created":
+            self.sessions.save(
+                payload["session_id"],
+                pre_run_checkpoint_id=job["pre_run_checkpoint_id"],
+                events=list(job["events"]),
+            )
 
     def _coordinator(self) -> Coordinator:
         config = load_config(
@@ -201,7 +250,7 @@ class RemoteControlServer(WorkbenchAPI):
         if safety_tier is not None:
             config.safety_tier = safety_tier
         coordinator = Coordinator(config=config, project_root=self.project_root, approval_callback=self.approvals.request,
-                                  quota_guard=self.free_quota_guard)
+                                  quota_guard=self.free_quota_guard, code_index=self.code_index)
         if hasattr(coordinator, "tool_registry"):
             coordinator.tool_registry.goal_id = getattr(self._context, "goal_id", None)
         self.current_budget = getattr(coordinator, "budget", None)
@@ -336,6 +385,9 @@ class RemoteControlServer(WorkbenchAPI):
         control = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Bound idle socket reads/writes, not the duration of a model task.
+            # This is an inactivity timeout, not a total request deadline.
+            timeout = 30
             def end_headers(self):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
@@ -345,18 +397,22 @@ class RemoteControlServer(WorkbenchAPI):
 
             def _respond(self, status: int, payload: dict[str, Any]) -> None:
                 data = json.dumps(payload, default=str).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._write_response(status, data, "application/json")
+
+            def _write_response(self, status: int, data: bytes, content_type: str) -> None:
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+                    # Aborted UI polling is an expected disconnect, not an API
+                    # failure. Never attempt a second response on this socket.
+                    self.close_connection = True
 
             def _respond_html(self, status: int, html: bytes) -> None:
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
-                self.end_headers()
-                self.wfile.write(html)
+                self._write_response(status, html, "text/html; charset=utf-8")
 
             def _respond_asset(self, status: int, asset: Path, content_type: str) -> None:
                 try:
@@ -364,11 +420,7 @@ class RemoteControlServer(WorkbenchAPI):
                 except OSError:
                     self._respond(404, {"error": "ui asset not found"})
                     return
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._write_response(status, data, content_type)
 
             def do_GET(self) -> None:
                 path = urlsplit(self.path).path
@@ -414,8 +466,19 @@ class RemoteControlServer(WorkbenchAPI):
                     if length < 0 or length > 100000:
                         self._respond(413, {"error": "Request body exceeds 100 KB"})
                         return
-                    body = json.loads(self.rfile.read(length) or b"{}")
-                except (ValueError, UnicodeError):
+                    raw_body = self.rfile.read(length)
+                    if len(raw_body) != length:
+                        self.close_connection = True
+                        self._respond(400, {"error": "incomplete JSON request body"})
+                        return
+                    _validate_request_depth(raw_body)
+                    body = json.loads((raw_body or b"{}").decode("utf-8"), object_pairs_hook=_request_object,
+                                      parse_float=_request_number, parse_constant=_invalid_json_constant)
+                except (TimeoutError, ConnectionError):
+                    self.close_connection = True
+                    self._respond(408, {"error": "Request body was not received before the connection expired"})
+                    return
+                except (ValueError, UnicodeError, RecursionError):
                     self._respond(400, {"error": "invalid JSON"})
                     return
                 try:
@@ -459,6 +522,7 @@ class RemoteControlServer(WorkbenchAPI):
             self._lease_file = self._lease = None
             raise ValueError("Workspace already has an engine. Share its connection or close the other app first") from None
         try:
+            self.code_index.start_watching()
             server = WorkspaceHTTPServer((host, port), Handler)
             self.reconcile_sessions()
             from local_coder.engine_discovery import publish_connection
@@ -471,6 +535,11 @@ class RemoteControlServer(WorkbenchAPI):
             raise
 
     def release_workspace(self):
+        try:
+            self.code_index.stop_watching()
+        except RuntimeError as exc:
+            import logging
+            logging.getLogger(__name__).error("Could not stop code index watcher cleanly: %s", exc)
         if self._connection_file is not None:
             self._connection_file.unlink(missing_ok=True)
             self._connection_file = None

@@ -53,6 +53,15 @@ class RepoMapTool(Tool):
             content = await asyncio.to_thread(self.repo_map.build, query or "", focus, budget)
             if not content:
                 content = "No source files with definitions were found."
-            return ToolResult(success=True, output=content, duration_ms=int((time.time() - start_t) * 1000))
+            files_read = {
+                line[:-1] for line in content.splitlines()
+                if line.endswith(":") and self.repo_map.index.contains_file(line[:-1])
+            }
+            return ToolResult(
+                success=True,
+                output=content,
+                data={"files_read": sorted(files_read)},
+                duration_ms=int((time.time() - start_t) * 1000),
+            )
         except Exception as e:
             return ToolResult(success=False, output=f"Error: {str(e)}", duration_ms=int((time.time() - start_t) * 1000))

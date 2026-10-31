@@ -50,6 +50,10 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/rollback", "Restore a checkpoint", args="<id>"),
     SlashCommand("/hooks", "Show configured hooks and whether they are trusted"),
     SlashCommand("/sessions", "List saved sessions"),
+    SlashCommand("/progress", "Show saved phases and task progress", args="[session-id]"),
+    SlashCommand("/learn", "Save an operator-approved project lesson", args="<lesson>"),
+    SlashCommand("/lessons", "List saved project lessons"),
+    SlashCommand("/forget", "Remove a saved project lesson", args="<lesson-id>"),
     SlashCommand("/resume", "Pick up a session's unfinished request", args="[id]"),
     SlashCommand("/new", "Start a new session for the next request"),
     SlashCommand("/help", "Show this help message"),
@@ -123,7 +127,7 @@ def build_help_table(commands: tuple[SlashCommand, ...] | None = None) -> Table:
     for c in commands:
         if c.custom and not custom_heading_done:
             table.add_row("", "")
-            table.add_row("[bold]Custom[/bold]", "[dim].local-coder/commands/[/dim]")
+            table.add_row("[bold]Skills & custom[/bold]", "[dim]built-in and Markdown prompt workflows[/dim]")
             custom_heading_done = True
         usage = f"{c.name} {c.args}".rstrip()
         if c.aliases:

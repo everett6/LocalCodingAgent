@@ -214,6 +214,12 @@ def load_config(
     verification = VerificationConfig(
         run_tests_after_changes=verification_data.get("run_tests_after_changes", True),
         max_fix_iterations=verification_data.get("max_fix_iterations", 3),
+        rollback_on_failure=verification_data.get("rollback_on_failure", False),
+        require_review=verification_data.get("require_review", True),
+        visual_url=verification_data.get("visual_url"),
+        visual_assertions=verification_data.get("visual_assertions", []),
+        visual_viewport=verification_data.get("visual_viewport"),
+        visual_timeout_seconds=verification_data.get("visual_timeout_seconds", 15),
     )
 
     # Safe by default: an absent `approval:` section (or an absent key
@@ -233,8 +239,8 @@ def load_config(
     role_models.update(routing_data.get("roles", {}) or {})
     agentic = AgenticConfig(
         role_models=role_models,
-        context_window_chars=agentic_data.get("context_window_chars", 24000),
-        compact_context_chars=agentic_data.get("compact_context_chars", 12000),
+        context_window_chars=agentic_data.get("context_window_chars", 180000),
+        compact_context_chars=agentic_data.get("compact_context_chars", 90000),
         max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
         session_cache=agentic_data.get("session_cache", False),
         repo_map_tokens=agentic_data.get("repo_map_tokens", 1024),
@@ -256,6 +262,9 @@ def load_config(
     tools = ToolSettings(
         disabled=list(tools_data.get("disabled", []) or []),
         command_timeout=tools_data.get("command_timeout"),
+        command_sandbox=tools_data.get("command_sandbox", False),
+        sandbox_runtime=tools_data.get("sandbox_runtime", "auto"),
+        sandbox_image=tools_data.get("sandbox_image", "python:3.12-slim"),
         roles=tool_roles,
     )
 
