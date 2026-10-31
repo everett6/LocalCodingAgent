@@ -63,6 +63,7 @@ class ToolRegistry:
                 ToolName.GIT_STATUS, ToolName.GIT_DIFF, ToolName.GIT_LOG, ToolName.GIT_COMMIT,
                 ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
                 ToolName.LINT, ToolName.FORMAT_CODE, ToolName.SECURITY_SCAN,
+                ToolName.VISUAL_VERIFY,
             },
             AgentRole.DEBUGGER: {
                 ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.EDIT_FILE,
@@ -192,6 +193,11 @@ class ToolRegistry:
             for tool in self._tools.values():
                 if hasattr(tool, "default_timeout"):
                     tool.default_timeout = settings.command_timeout
+        command_tool = self._tools.get(ToolName.RUN_COMMAND)
+        if command_tool is not None:
+            command_tool.sandbox_enabled = settings.command_sandbox
+            command_tool.sandbox_runtime = settings.sandbox_runtime
+            command_tool.sandbox_image = settings.sandbox_image
 
     async def execute_tool(
         self, role: AgentRole, tool_name: str, arguments: dict[str, Any]

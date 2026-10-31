@@ -50,6 +50,7 @@ class Coordinator:
         config: ProjectConfig,
         project_root: str,
         approval_callback: ApprovalCallback | None = None,
+        code_index=None,
     ):
         self.config = config
         self.project_root = project_root
@@ -72,7 +73,9 @@ class Coordinator:
             approval=config.approval,
             approval_callback=approval_callback,
             safety_harness=self.safety_harness,
+            code_index=code_index,
         )
+        self.repo_context._index = self.tool_registry.get_tool(ToolName.CODE_SEARCH).index
         self.tool_registry.apply_settings(config.tools)
         self.model_manager = ModelManager(config)
         self.tool_registry.runtime = self.runtime
@@ -129,6 +132,19 @@ class Coordinator:
                 return result
             recovered.validate_resume()
             await recovered.validate_pending_batch()
+            from local_coder.core.runtime import validate_workspace_file_fingerprints
+            fingerprints = recovered.notes.get("workspace_file_fingerprints")
+            if fingerprints is not None:
+                if not isinstance(fingerprints, dict) or not all(
+                    isinstance(path, str) and isinstance(digest, str)
+                    for path, digest in fingerprints.items()
+                ):
+                    raise ValueError("Checkpoint workspace context fingerprints are invalid")
+                await asyncio.to_thread(
+                    validate_workspace_file_fingerprints,
+                    self.project_root,
+                    fingerprints,
+                )
             from local_coder.types import ToolName
             allowed = recovered.notes.get("allowed_tools")
             if allowed is not None:
@@ -244,7 +260,11 @@ class Coordinator:
         if self.safety_harness.should_checkpoint_before_request():
             try:
                 cp = self.checkpoints.create()
-                self._emit("ORCHESTRATOR", "checkpoint_created", f"Created pre-run checkpoint: {cp.checkpoint_id}")
+                self._emit(
+                    "ORCHESTRATOR", "checkpoint_created",
+                    f"Created pre-run checkpoint: {cp.checkpoint_id}",
+                    data={"checkpoint_id": cp.checkpoint_id},
+                )
             except Exception as e:
                 self._emit("ORCHESTRATOR", "checkpoint_warning", f"Could not create pre-run checkpoint: {e}")
 
@@ -255,17 +275,23 @@ class Coordinator:
             from local_coder.workspace import Workspace
             from local_coder.types import ToolName
             Workspace(self.project_root).resolve(target_path)
+            if fix and self.config.safety_tier == SafetyTier.TIER_1_PARANOIA:
+                raise ValueError("Remediation is disabled by the read-only safety tier")
             role = AgentRole.SECURITY if mode == AgentMode.CYBERSECURITY else AgentRole.BUG_HUNTER
             # Permission changes belong to this investigation, not later reviews.
             original_permissions = set(self.tool_registry._permissions[role])
-            # Investigations are read-only unless the caller explicitly requests remediation.
+            # Investigation and fix modes both avoid arbitrary shell commands and
+            # repository-level Git mutations; fixes use the bounded file/test tools.
+            self.tool_registry._permissions[role].difference_update({
+                ToolName.RUN_COMMAND, ToolName.BUILD, ToolName.FORMAT_CODE,
+                ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT,
+            })
             if fix:
                 self.tool_registry._permissions[role].update({ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH, ToolName.RUN_TESTS})
             else:
                 self.tool_registry._permissions[role].difference_update({
                     ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.APPLY_PATCH,
-                    ToolName.RUN_COMMAND, ToolName.RUN_TESTS, ToolName.BUILD,
-                    ToolName.FORMAT_CODE, ToolName.GIT_COMMIT, ToolName.GIT_CHECKOUT,
+                    ToolName.RUN_TESTS,
                 })
             try:
                 self._emit("ORCHESTRATOR", "mode", f"Running {mode.value} investigation")
@@ -309,9 +335,12 @@ class Coordinator:
             )
         else:
             self._emit("ORCHESTRATOR", "phase", "Executing complex task plan...")
-            result = await self._resumable(
-                checkpoint, "execute", lambda: self._execute_plan(plan, checkpoint), AgentResponse,
-            )
+            if self.config.agentic.use_actor_model:
+                result = await self._execute_plan_with_actors(plan, checkpoint)
+            else:
+                result = await self._resumable(
+                    checkpoint, "execute", lambda: self._execute_plan(plan, checkpoint), AgentResponse,
+                )
 
         # Step 4: Review
         self._emit("ORCHESTRATOR", "phase", "Reviewing changes...")
@@ -367,10 +396,10 @@ class Coordinator:
         return value
 
     def _session_cache_filename(self) -> str:
-        """Stable per-project filename for the disk-backed slot cache, so
-        different projects sharing one llama-server don't collide."""
+        """Bind cached prompt state to both the project and indexed source."""
         digest = hashlib.sha256(os.path.abspath(self.project_root).encode()).hexdigest()[:16]
-        return f"local-coder-{digest}.bin"
+        index = self.repo_context._code_index()
+        return f"local-coder-{digest}-{index.generation[:16] or 'unindexed'}.bin"
 
     async def _repo_map(self, query: str, files: list[str] | None = None) -> str:
         """Ranked repo map for a task's context, or "" if it is off or fails."""
@@ -393,6 +422,8 @@ class Coordinator:
 
     async def _explore(self, request: str) -> str:
         model = await self.model_manager.get_model(AgentRole.EXPLORER)
+        architecture = await self._repo_map(request)
+        slot_filename = self._session_cache_filename()
 
         # Exploration's prefix (system prompt + repository structure) is the
         # part of the conversation most likely to be identical across
@@ -403,7 +434,7 @@ class Coordinator:
         if self.config.agentic.session_cache:
             restore = getattr(model, "restore_slot", None)
             if restore is not None:
-                await restore(self._session_cache_filename())
+                await restore(slot_filename)
 
         explorer = create_agent(
             AgentRole.EXPLORER,
@@ -417,13 +448,13 @@ class Coordinator:
             task = AgentTask(
                 role=AgentRole.EXPLORER,
                 objective=request,
-                context=TaskContext(architecture=await self._repo_map(request)),
+                context=TaskContext(architecture=architecture),
             )
             response = await explorer.execute(task)
             if self.config.agentic.session_cache:
                 save = getattr(model, "save_slot", None)
                 if save is not None:
-                    await save(self._session_cache_filename())
+                    await save(slot_filename)
             return response.summary
         return "Exploration fallback: Checked repository structure."
 
@@ -609,6 +640,88 @@ class Coordinator:
                 return 1
             seen.update(file_scope)
         return configured
+
+    async def _execute_plan_with_actors(
+        self, plan: TaskPlan, checkpoint: RunCheckpoint | None = None,
+    ) -> AgentResponse:
+        """Execute a task plan using the actor model: spawn isolated child
+        actors per plan task, route messages through mailboxes, and collect
+        results asynchronously. Falls back to DAG execution on any error."""
+        from local_coder.actors import ActorSystem, CoordinatorActor
+
+        system = ActorSystem()
+        try:
+            coordinator = system.spawn(
+                "coordinator",
+                actor_id="plan-coordinator",
+                project_root=self.project_root,
+                config=self.config,
+                model_manager=self.model_manager,
+                tool_registry=self.tool_registry,
+                dispatch=self._dispatch,
+            )
+            await coordinator.start()
+
+            # Wire approval events from the actor system to the coordinator's
+            # event handlers so a human supervisor can approve/reject.
+            def _on_actor_event(payload: dict[str, Any]) -> None:
+                self._emit(
+                    "ORCHESTRATOR",
+                    payload.get("event_type", "actor_event"),
+                    payload.get("message", ""),
+                    data=payload.get("data", {}),
+                    task_id=payload.get("task_id"),
+                )
+            system.on_event(_on_actor_event)
+
+            try:
+                reply = await coordinator.ref.ask(
+                    ActorMessage(
+                        sender="orchestrator",
+                        type="execute_plan",
+                        payload={"plan": plan.model_dump(mode="json")},
+                    ),
+                    timeout=600.0,
+                )
+
+                if reply.type == "plan_completed":
+                    data = reply.payload
+                    all_completed = data.get("all_completed", False)
+                    has_failures = data.get("has_failures", True)
+                    results = data.get("results", {})
+
+                    # Checkpoint completed task results for resume support.
+                    if checkpoint is not None:
+                        for task_id, result in results.items():
+                            if isinstance(result, dict):
+                                checkpoint.put(f"task.{task_id}", result)
+
+                    return AgentResponse(
+                        task_id="plan_execution",
+                        status=TaskStatus.COMPLETED if all_completed and not has_failures else TaskStatus.FAILED,
+                        summary=f"Actor model: {len(data.get('completed', []))} completed, {len(data.get('failed', []))} failed",
+                        files_changed=[],
+                        tests_run=[],
+                        tests_passed=not has_failures,
+                        issues=[],
+                        follow_up_required=has_failures,
+                    )
+                return AgentResponse(
+                    task_id="plan_execution",
+                    status=TaskStatus.FAILED,
+                    summary=f"Actor plan execution unexpected reply: {reply.type}",
+                    files_changed=[],
+                    tests_run=[],
+                    tests_passed=False,
+                    issues=[f"Unexpected reply type: {reply.type}"],
+                    follow_up_required=True,
+                )
+            finally:
+                await system.stop_all()
+        except Exception as exc:
+            self._emit("ORCHESTRATOR", "actor_model_error", f"Actor model execution failed: {exc}")
+            # Fall back to DAG execution.
+            return await self._execute_plan(plan, checkpoint)
 
     async def _run_dag_task(
         self, dag: TaskDAG, task: AgentTask, semaphore: asyncio.Semaphore,

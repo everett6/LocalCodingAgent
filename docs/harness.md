@@ -43,7 +43,68 @@ protocol reasoning. If the latest required exchange still exceeds the context
 budget, the task stops with an explicit error. This is transport/harness support,
 not a claim of measured model accuracy or benchmark improvement.
 
-## Lifecycle and verification
+## Sandboxed command execution
+
+Agent shell commands can optionally run in a disposable Docker or Podman
+container. Enable with `tools.command_sandbox: true`; choose
+`tools.sandbox_runtime: auto|docker|podman` and a locally available
+`tools.sandbox_image`. The default image is `python:3.12-slim`; images are not
+pulled automatically. The container has no network, a read-only root
+filesystem, dropped capabilities, no-new-privileges, bounded memory/CPU/PIDs,
+and a temporary `/tmp`. Only the project workspace is mounted, read-write,
+because coding commands need to edit it. A timeout or cancellation requests
+container removal. Missing runtimes and cleanup failures are surfaced.
+
+Before running, the tool checks that the configured image exists locally
+(`docker image inspect` / `podman image inspect`) and fails with a clear
+message if it is missing — images are never implicitly pulled.
+
+This setting currently applies only to the arbitrary shell-command tool. It
+does not sandbox the dedicated test, build, formatter, scanner, or model-server
+processes, nor does container isolation guarantee protection from container
+runtime vulnerabilities or a misconfigured daemon. Leave it disabled unless
+Docker or Podman is installed and the project has a suitable local image.
+
+## Visual verification
+
+The `visual_verify` tool renders a local page (localhost URL or `file://`
+path) in a headless Chromium browser via Playwright, takes a full-page
+screenshot, and optionally compares it against a baseline PNG. It reports a
+pass/fail verdict based on a configurable pixel-difference tolerance.
+
+Only localhost URLs and local `file://` paths are allowed; remote hosts are
+rejected. The tool does not execute arbitrary code inside the browser beyond
+the page's own scripts. It is intended for catching styling regressions,
+broken layouts, or unstyled raw text that linters miss after a frontend
+change.
+
+## Multi-agent actor model
+
+The actor framework (`local_coder.actors`) provides isolated mailbox actors
+for multi-agent delegation. A `CoordinatorActor` spawns child `CoderActor`,
+`TesterActor`, and `ReviewerActor` instances, sends them `execute_task`
+messages, and collects `task_completed`/`task_failed` replies. Actors can
+request human approval via `request_approval`, which surfaces an
+`approval_required` event to the supervisor. Each actor processes messages
+sequentially from its own mailbox, so concurrent siblings never interleave
+state.
+
+This builds on the existing DAG scheduler and event bus rather than replacing
+them: the coordinator still plans tasks with dependencies, and actors execute
+them. Human approval callbacks are honored; headless/remote runs deny
+approval-required actions unless explicitly configured.
+
+Enable actor-based plan execution with `agentic.use_actor_model: true`.
+When enabled, the Coordinator spawns an actor system for multi-task plans
+instead of using the direct DAG scheduler. Actor execution falls back to
+DAG scheduling on any error, so plans always complete through one of the
+two paths.
+
+Actors request human approval via `request_approval`, which surfaces an
+`approval_required` event. A supervisor can then call `grant_approval` or
+`deny_approval` on the actor system to unblock or reject the pending action.
+Until a decision is made, the actor stays in `WAITING_APPROVAL` state and
+does not consume additional iteration budget.
 
 Each served workspace has one OS-backed engine lease and allows one running job. A second independent engine is rejected; the desktop manager and IDE share an explicit authenticated connection. Activity and reports are retained
 in the local session journal; job failure state survives the live event ring.
@@ -55,6 +116,43 @@ Resume continues the saved agent step; it does not reconstruct an enclosing task
 An incomplete model response or interrupted tool batch is never replayed as a
 completed exchange. A checkpoint cannot undo an external side effect; always
 inspect partial workspace changes before resuming.
+
+Complete agent-round checkpoints also fingerprint readable files recorded in
+the agent's context. Resume refuses when one of those files has changed or
+disappeared, because the saved conversation would otherwise contain stale
+source. Start a new task to rebuild context against the updated workspace.
+Older checkpoints without these fingerprints remain resumable under their
+existing validation rules.
+
+Failed coding tasks can opt into workspace rollback with
+`verification.rollback_on_failure: true`. It is off by default because it can
+discard useful partial edits; cancelled tasks are not automatically rolled
+back. Before restoring, the engine requires the task's pre-run checkpoint to
+remain newest and Git `HEAD` to be unchanged. This does not undo external
+command side effects or prevent concurrent manual edits, so use the option only
+when the workspace is not being edited elsewhere during a run.
+
+## Local code context and edits
+
+The local retrieval index chunks Python with the AST and other supported source
+files at definition boundaries, then ranks chunks with dependency-free BM25.
+The RepoMap adds symbol-reference/PageRank structure. Repeated interactive
+searches refresh the index at most once per second; explicit `CodeIndex.refresh()`
+remains immediate. The remote engine also owns a native `watchfiles`/Rust
+filesystem watcher for the workspace lifetime. Batched create, update and
+delete events re-index only affected files and update the code-derived session
+cache identity; `.git`, generated/dependency directories, state files, binary
+formats, oversized files and paths outside the workspace stay excluded.
+Watcher startup failures are explicit, and the engine stops/joins the watcher
+when its workspace lease is released. CLI-only runs retain on-demand refresh.
+This does not promise a sub-200 ms latency guarantee. The current pipeline does
+not use embeddings or a learned reranker.
+
+Unified-diff edits validate all target paths and dry-run the complete patch
+before applying it. If the real patch application fails partway through, the
+tool restores affected files from its pre-apply snapshots. This protects the
+patch operation itself; it does not roll back commands or other external side
+effects. Task checkpoints remain the workspace recovery mechanism.
 
 Adapter, process lifecycle and end-to-end tests use synthetic projects and fake
 model responses. No paid Anthropic/GLM/Qwen account request is needed to run them.
@@ -68,24 +166,33 @@ do not attach source outside it. Red team tools have their own capability set,
 independent of safety-tier command approvals. Fixes and test execution remain
 separate coding/security remediation tasks.
 
-Optional HTTP observations require exact origins and an authorization/RoE
-reference. Enter a reference, never a credential. GET, HEAD and OPTIONS are
-supported without query payloads, cookies or credentials. Origins are DNS-pinned
-when the engagement is created; later address expansion is rejected. Each request
-connects to an allowed pinned IP while preserving TLS verification/SNI and Host.
-There are no redirects or environment proxies. Limits: 50 requests maximum per
+Optional HTTP observations require exact localhost/loopback origins and an
+authorization/RoE reference. Remote hosts and public IPs are rejected; enter a
+local lab reference, never a credential. GET, HEAD and OPTIONS are supported
+without query payloads, cookies or credentials. Origins are pinned when the
+engagement is created; any non-loopback DNS answer or later address expansion
+is rejected. Each request connects to an allowed pinned IP while preserving TLS verification/SNI and Host.
+There are no redirects or environment proxies. The agent cannot generate or run
+exploits, fuzzing campaigns, shell commands, persistence, credential tests,
+lateral movement, destructive checks, or remote probes. Limits: 50 requests maximum per
 engagement, a 5-second DNS check plus a 10-second HTTP exchange, and 64 KiB of response bytes hashed. Raw
 response bodies and Set-Cookie headers are not saved. A failed/interrupted attempt
 still consumes budget. Safety Tier 1 blocks engagements with active HTTP enabled.
 
-The agent maintains scope → reconnaissance → analysis → validation → report
-phases and a persistent checklist. Findings link to evidence IDs in the same
+The agent maintains an evidence-led assessment and persistent checklist.
+Findings link to evidence IDs in the same
 engagement and retain attack-path hypotheses, detection expectations and
 remediation. HTTP observations and scanner candidates stay **unverified**;
 detection outcomes stay **not_tested** because this mode does not ingest detector
 telemetry. It does not execute exploits, credential attacks, persistence or
 lateral-movement procedures. Missing security headers alone are not confirmed
 vulnerabilities.
+
+Bug-hunting investigations also map workflow states, actors, transition
+operations and source-backed guards for API, account, payment and authorization
+paths. Reports should distinguish invalid transition sequences from valid
+control sequences and propose bounded local regression tests. This is
+state-machine analysis, not a live-service probe or an exploit-generation loop.
 
 Import existing SARIF 2.1.0 or Nuclei JSONL artifacts with the engagement tools.
 Every imported location must be in scope. Imports are bounded to 1 MB and 100

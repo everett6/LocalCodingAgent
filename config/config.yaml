@@ -66,6 +66,11 @@ resources:
 # tools:
 #   disabled: [git_commit]
 #   command_timeout: 120
+#   command_sandbox: true
+#   sandbox_runtime: auto  # auto, docker, or podman
+#   sandbox_image: python:3.12-slim  # must already exist locally; no implicit image pull
+# agentic:
+#   use_actor_model: false  # spawn isolated child actors per plan task
 #   roles:
 #     reviewer: [read_file, list_files, grep, git_diff]
 

@@ -209,6 +209,7 @@ def load_config(
     verification = VerificationConfig(
         run_tests_after_changes=verification_data.get("run_tests_after_changes", True),
         max_fix_iterations=verification_data.get("max_fix_iterations", 3),
+        rollback_on_failure=verification_data.get("rollback_on_failure", False),
     )
 
     # Safe by default: an absent `approval:` section (or an absent key
@@ -233,6 +234,7 @@ def load_config(
         max_parallel_agents=agentic_data.get("max_parallel_agents", 1),
         session_cache=agentic_data.get("session_cache", False),
         repo_map_tokens=agentic_data.get("repo_map_tokens", 1024),
+        use_actor_model=agentic_data.get("use_actor_model", False),
     )
 
     fallbacks = {}
@@ -250,6 +252,9 @@ def load_config(
     tools = ToolSettings(
         disabled=list(tools_data.get("disabled", []) or []),
         command_timeout=tools_data.get("command_timeout"),
+        command_sandbox=tools_data.get("command_sandbox", False),
+        sandbox_runtime=tools_data.get("sandbox_runtime", "auto"),
+        sandbox_image=tools_data.get("sandbox_image", "python:3.12-slim"),
         roles=tool_roles,
     )
 
